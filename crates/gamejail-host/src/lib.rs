@@ -3,7 +3,8 @@
 //! Everything that reads the machine goes through a [`Root`], so the same code
 //! runs against `/` in production and against a fake tree in tests. Changes to
 //! the machine are expressed as a [`plan::Plan`] of [`plan::Step`]s and carried
-//! out by [`exec::Executor`], which can also only log them (dry run).
+//! out by [`exec::Executor`], which can also only log them (dry run). A jail
+//! VM is described by a [`vm::VmSpec`], which renders to a QEMU command line.
 
 pub mod exec;
 pub mod holders;
@@ -11,6 +12,7 @@ pub mod pci;
 pub mod plan;
 pub mod root;
 pub mod session;
+pub mod vm;
 
 pub use root::Root;
 

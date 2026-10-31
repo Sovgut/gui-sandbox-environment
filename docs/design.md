@@ -89,6 +89,12 @@ kernel; with it the guest sees the 3070 at PCIe 4.0 x16 with Vulkan.
   VM immediately.
 - A suspended VM cannot be resumed after the GPU is reclaimed: consumer GeForce
   cards do not support saving VM state with a passed-through device.
+- The jail VM has no emulated display and no network of its own by default:
+  the passed-through GPU is its screen. QEMU starts as root for the unlimited
+  memlock VFIO needs and drops to an unprivileged account once its devices are
+  open. A stop request reaches the guest as an ACPI power-down; the GPU goes
+  back to the host however QEMU ends. On the development PC a guest powers off
+  in about 3 s and the GPU is back on its host driver 2.5 s later.
 - Several jails can exist; only one runs at a time (a lock in the service).
 
 ## Network

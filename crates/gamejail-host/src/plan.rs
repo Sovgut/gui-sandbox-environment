@@ -125,13 +125,16 @@ pub enum Step {
         unit: String,
     },
     TerminateSession(String),
-    /// Waits for user processes to let go of the GPU. Leftovers are signalled
-    /// when `signal_leftovers` is set; system processes are only waited for.
-    /// With `require_free`, the step fails if users still hold it at the end.
+    /// Waits for user processes to let go of the GPU, and fails if any still
+    /// hold it at the end: unbinding the driver from a GPU with live buffers
+    /// corrupts kernel memory. Leftovers are signalled when
+    /// `signal_leftovers` is set; system processes are only waited for. With
+    /// `allow_idle_compositor`, `kwin_wayland`'s unused render-node descriptor (see
+    /// [`crate::holders::Holder::is_idle_compositor`]) does not count.
     ReleaseGpu {
         wait: Duration,
         signal_leftovers: bool,
-        require_free: bool,
+        allow_idle_compositor: bool,
     },
     UnloadModules(Vec<String>),
     LoadModules(Vec<String>),
@@ -163,18 +166,18 @@ impl fmt::Display for Step {
             Self::ReleaseGpu {
                 wait,
                 signal_leftovers,
-                require_free,
+                allow_idle_compositor,
             } => write!(
                 f,
-                "wait up to {}s for the GPU to be released{}{}",
+                "wait up to {}s for the GPU to be released{}, fail if still held{}",
                 wait.as_secs(),
                 if *signal_leftovers {
-                    ", then signal user leftovers"
+                    ", signalling user leftovers"
                 } else {
                     ""
                 },
-                if *require_free {
-                    ", fail if still held"
+                if *allow_idle_compositor {
+                    " by anything but an idle compositor"
                 } else {
                     ""
                 }
@@ -231,10 +234,8 @@ fn load_modules(driver: Option<&str>) -> Vec<String> {
 }
 
 /// The plan that hands the GPU to `vfio-pci`, and what to restore afterwards.
-/// `force` lets secondary mode proceed while user processes still hold the
-/// GPU; the kernel then treats their descriptors as an unplugged device.
 #[must_use]
-pub fn attach(snapshot: &Snapshot, force: bool) -> (Plan, Handoff) {
+pub fn attach(snapshot: &Snapshot) -> (Plan, Handoff) {
     let gpu = &snapshot.gpu;
     let mode = Mode::for_gpu(gpu);
     let host_driver = gpu.display().driver.as_deref();
@@ -256,7 +257,7 @@ pub fn attach(snapshot: &Snapshot, force: bool) -> (Plan, Handoff) {
             steps.push(Step::ReleaseGpu {
                 wait: Duration::from_secs(10),
                 signal_leftovers: true,
-                require_free: true,
+                allow_idle_compositor: false,
             });
             let unload = unload_modules(host_driver);
             if !unload.is_empty() {
@@ -264,10 +265,12 @@ pub fn attach(snapshot: &Snapshot, force: bool) -> (Plan, Handoff) {
             }
         }
         Mode::Secondary => {
+            // The desktop stays up, so applications keep running: anything
+            // rendering on this GPU has to be closed by the user first.
             steps.push(Step::ReleaseGpu {
                 wait: Duration::from_secs(2),
                 signal_leftovers: false,
-                require_free: !force,
+                allow_idle_compositor: true,
             });
         }
     }
@@ -432,7 +435,7 @@ mod tests {
     #[test]
     fn secondary_mode_leaves_the_desktop_alone() {
         let (_dir, snapshot) = rtx_dev_pc();
-        let (plan, handoff) = attach(&snapshot, false);
+        let (plan, handoff) = attach(&snapshot);
         assert_eq!(handoff.mode, Mode::Secondary);
         assert!(
             !plan
@@ -445,7 +448,7 @@ mod tests {
             Step::ReleaseGpu {
                 wait: Duration::from_secs(2),
                 signal_leftovers: false,
-                require_free: true
+                allow_idle_compositor: true
             }
         );
         assert!(rendered(&plan).contains(&"0000:0e:00.1: expect vfio-pci".to_owned()));
@@ -453,22 +456,9 @@ mod tests {
     }
 
     #[test]
-    fn force_lets_secondary_mode_proceed_while_held() {
-        let (_dir, snapshot) = rtx_dev_pc();
-        let (plan, _) = attach(&snapshot, true);
-        assert!(matches!(
-            plan.steps[0],
-            Step::ReleaseGpu {
-                require_free: false,
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn single_mode_ends_the_session_before_unloading_nvidia() {
         let (_dir, snapshot) = rtx_target();
-        let (plan, handoff) = attach(&snapshot, false);
+        let (plan, handoff) = attach(&snapshot);
         assert_eq!(handoff.mode, Mode::Single);
         let steps = rendered(&plan);
         let position = |text: &str| {
@@ -495,7 +485,7 @@ mod tests {
     #[test]
     fn detach_restores_what_attach_recorded() {
         let (_dir, snapshot) = rtx_target();
-        let (_, handoff) = attach(&snapshot, false);
+        let (_, handoff) = attach(&snapshot);
         let steps = rendered(&detach(&handoff));
         assert_eq!(steps[0], "0000:09:00.0: driver_override = (clear)");
         assert!(steps.contains(&"load nvidia nvidia_modeset nvidia_drm nvidia_uvm".to_owned()));
@@ -508,7 +498,7 @@ mod tests {
     #[test]
     fn handoff_survives_a_round_trip_through_text() {
         let (_dir, snapshot) = rtx_target();
-        let (_, handoff) = attach(&snapshot, false);
+        let (_, handoff) = attach(&snapshot);
         assert_eq!(Handoff::from_text(&handoff.to_text()).unwrap(), handoff);
     }
 }

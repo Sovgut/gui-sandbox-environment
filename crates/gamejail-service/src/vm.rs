@@ -50,9 +50,6 @@ pub struct RunArgs {
     /// user who ran sudo or pkexec.
     #[arg(long)]
     run_as: Option<String>,
-    /// In secondary mode, take the GPU while user processes still hold it.
-    #[arg(long)]
-    force: bool,
 }
 
 pub fn run(root: &Root, args: &RunArgs, dry_run: bool) -> Result<()> {
@@ -84,7 +81,7 @@ pub fn run(root: &Root, args: &RunArgs, dry_run: bool) -> Result<()> {
         run_as: args.run_as.clone().or_else(invoking_user),
     };
 
-    let attached = gpu::attach(root, args.gpu, args.force, dry_run)?;
+    let attached = gpu::attach(root, args.gpu, dry_run)?;
     let spec = spec_for(attached.functions.iter().map(|f| f.address).collect());
     let outcome = if dry_run {
         info!("dry run: {}", spec.command_line().join(" "));

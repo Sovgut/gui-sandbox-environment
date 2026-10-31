@@ -48,13 +48,9 @@ enum GpuAction {
     List,
     /// Processes holding a GPU's device nodes.
     Holders { gpu: PciAddress },
-    /// Hand a GPU to vfio-pci. In single mode this stops the desktop.
-    Attach {
-        gpu: PciAddress,
-        /// In secondary mode, proceed while user processes still hold the GPU.
-        #[arg(long)]
-        force: bool,
-    },
+    /// Hand a GPU to vfio-pci. In single mode this stops the desktop; in
+    /// secondary mode applications using the GPU have to be closed first.
+    Attach { gpu: PciAddress },
     /// Return a GPU from vfio-pci to the host.
     Detach { gpu: PciAddress },
 }
@@ -85,9 +81,9 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Gpu { action } => match action {
             GpuAction::List => gpu::list(&root),
             GpuAction::Holders { gpu } => gpu::holders(&root, *gpu),
-            GpuAction::Attach { gpu, force } => {
+            GpuAction::Attach { gpu } => {
                 require_root(cli.dry_run)?;
-                gpu::attach(&root, *gpu, *force, cli.dry_run).map(drop)
+                gpu::attach(&root, *gpu, cli.dry_run).map(drop)
             }
             GpuAction::Detach { gpu } => {
                 require_root(cli.dry_run)?;

@@ -63,14 +63,14 @@ fn handoff_path(gpu: PciAddress) -> PathBuf {
 
 /// Hands the GPU to vfio-pci and returns it as it was before, so callers know
 /// every function that moved. A failed attach returns the GPU to the host.
-pub fn attach(root: &Root, gpu: PciAddress, force: bool, dry_run: bool) -> Result<Gpu> {
+pub fn attach(root: &Root, gpu: PciAddress, dry_run: bool) -> Result<Gpu> {
     let system = HostSystem;
     let snapshot = exec::snapshot(root, &system, gpu)?;
     let gpu = snapshot.gpu.display().address;
     if snapshot.gpu.display().driver.as_deref() == Some(VFIO_PCI) {
         bail!("{gpu} is already on {VFIO_PCI}");
     }
-    let (attach_plan, handoff) = plan::attach(&snapshot, force);
+    let (attach_plan, handoff) = plan::attach(&snapshot);
     info!("attaching {gpu} in {} mode", handoff.mode);
 
     if !dry_run {

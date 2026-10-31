@@ -18,12 +18,29 @@ pub struct Holder {
     pub comm: String,
     /// The process's cgroup, which names the unit that would restart it.
     pub cgroup: String,
+    /// The GPU's nodes this process has open.
+    pub nodes: Vec<PathBuf>,
 }
 
 impl Holder {
     #[must_use]
     pub fn is_user(&self) -> bool {
         self.uid >= FIRST_USER_UID
+    }
+
+    /// `kwin_wayland` pinned to another GPU, holding only a render node of this one.
+    /// Mesa's EGL device probe opens that node and never uses or closes it,
+    /// so unbinding the driver underneath it is harmless. Any other holder
+    /// may have buffers on the GPU, and unbinding the driver from a GPU with
+    /// live buffers corrupts kernel memory.
+    #[must_use]
+    pub fn is_idle_compositor(&self) -> bool {
+        self.comm == "kwin_wayland"
+            && !self.nodes.is_empty()
+            && self.nodes.iter().all(|n| {
+                n.file_name()
+                    .is_some_and(|f| f.to_string_lossy().starts_with("renderD"))
+            })
     }
 }
 
@@ -61,7 +78,8 @@ pub fn scan(root: &Root, nodes: &[PathBuf]) -> Vec<Holder> {
         .filter_map(|p| p.parse::<u32>().ok())
     {
         let proc_dir = PathBuf::from("/proc").join(pid.to_string());
-        if holds_any(root, &proc_dir, nodes) {
+        let held = held_nodes(root, &proc_dir, nodes);
+        if !held.is_empty() {
             let uid = std::fs::metadata(root.path(&proc_dir)).map_or(0, |m| m.uid());
             holders.push(Holder {
                 pid,
@@ -71,6 +89,7 @@ pub fn scan(root: &Root, nodes: &[PathBuf]) -> Vec<Holder> {
                     .read_opt(proc_dir.join("cgroup"))
                     .map(|c| c.trim_start_matches("0::").to_owned())
                     .unwrap_or_default(),
+                nodes: held,
             });
         }
     }
@@ -78,13 +97,18 @@ pub fn scan(root: &Root, nodes: &[PathBuf]) -> Vec<Holder> {
     holders
 }
 
-fn holds_any(root: &Root, proc_dir: &Path, nodes: &[PathBuf]) -> bool {
+fn held_nodes(root: &Root, proc_dir: &Path, nodes: &[PathBuf]) -> Vec<PathBuf> {
     let Ok(fds) = std::fs::read_dir(root.path(proc_dir.join("fd"))) else {
-        return false;
+        return Vec::new();
     };
-    fds.filter_map(std::result::Result::ok)
+    let mut held: Vec<PathBuf> = fds
+        .filter_map(std::result::Result::ok)
         .filter_map(|fd| std::fs::read_link(fd.path()).ok())
-        .any(|target| nodes.contains(&target))
+        .filter(|target| nodes.contains(target))
+        .collect();
+    held.sort();
+    held.dedup();
+    held
 }
 
 #[cfg(test)]
@@ -124,6 +148,27 @@ mod tests {
         assert_eq!(pids, [100, 300]);
         assert_eq!(holders[0].comm, "kwin_wayland");
         assert_eq!(holders[0].cgroup, "/user.slice/app.slice/test.scope");
+        assert_eq!(holders[0].nodes, [PathBuf::from("/dev/dri/renderD129")]);
+    }
+
+    #[test]
+    fn only_kwin_with_just_a_render_node_counts_as_idle() {
+        let (_dir, root) = fixture::dev_pc();
+        fake_process(&root, 100, "kwin_wayland", &["/dev/dri/renderD129"]);
+        fake_process(
+            &root,
+            101,
+            "kwin_wayland",
+            &["/dev/dri/card0", "/dev/dri/renderD129"],
+        );
+        fake_process(&root, 200, "zed-editor", &["/dev/dri/renderD129"]);
+
+        let rtx = crate::pci::Gpu::read(&root, "0e:00".parse().unwrap()).unwrap();
+        let idle: Vec<(u32, bool)> = scan(&root, &device_nodes(&root, &rtx))
+            .iter()
+            .map(|h| (h.pid, h.is_idle_compositor()))
+            .collect();
+        assert_eq!(idle, [(100, true), (101, false), (200, false)]);
     }
 
     #[test]

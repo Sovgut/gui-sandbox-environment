@@ -106,8 +106,8 @@ impl Executor<'_> {
             Step::ReleaseGpu {
                 wait,
                 signal_leftovers,
-                require_free,
-            } => self.release(gpu, *wait, *signal_leftovers, *require_free),
+                allow_idle_compositor,
+            } => self.release(gpu, *wait, *signal_leftovers, *allow_idle_compositor),
             Step::UnloadModules(modules) => self.modprobe(&["-r"], modules),
             Step::LoadModules(modules) => self.modprobe(&["-a"], modules),
             Step::SetOverride { function, driver } => self.root.write(
@@ -159,10 +159,19 @@ impl Executor<'_> {
         }
     }
 
-    fn user_holders(&self, gpu: PciAddress) -> Vec<Holder> {
+    /// User processes holding the GPU, leaving out an idle compositor when
+    /// that is allowed.
+    fn user_holders(&self, gpu: PciAddress, allow_idle_compositor: bool) -> Vec<Holder> {
         self.holders(gpu)
             .into_iter()
             .filter(Holder::is_user)
+            .filter(|h| {
+                let idle = allow_idle_compositor && h.is_idle_compositor();
+                if idle {
+                    info!("{} {} holds only an unused render node", h.pid, h.comm);
+                }
+                !idle
+            })
             .collect()
     }
 
@@ -171,9 +180,10 @@ impl Executor<'_> {
         gpu: PciAddress,
         wait: Duration,
         signal: bool,
-        require_free: bool,
+        allow_idle_compositor: bool,
     ) -> Result<()> {
-        let mut users = wait_until_empty(wait, || self.user_holders(gpu));
+        let users_now = || self.user_holders(gpu, allow_idle_compositor);
+        let mut users = wait_until_empty(wait, users_now);
         if signal {
             for sig in ["TERM", "KILL"] {
                 if users.is_empty() {
@@ -191,7 +201,7 @@ impl Executor<'_> {
                         warn!("{e}");
                     }
                 }
-                users = wait_until_empty(Duration::from_secs(3), || self.user_holders(gpu));
+                users = wait_until_empty(Duration::from_secs(3), users_now);
             }
         }
         let system_holders = wait_until_empty(Duration::from_secs(5), || {
@@ -206,10 +216,14 @@ impl Executor<'_> {
                 holder.pid, holder.comm, holder.uid, holder.cgroup
             );
         }
-        if require_free && !users.is_empty() {
+        if !users.is_empty() {
+            let names: Vec<String> = users
+                .iter()
+                .map(|h| format!("{} ({})", h.comm, h.pid))
+                .collect();
             return Err(Error::Step(format!(
-                "{} user processes still hold the GPU",
-                users.len()
+                "the GPU is in use by {}; close it and try again",
+                names.join(", ")
             )));
         }
         Ok(())
@@ -344,33 +358,55 @@ mod tests {
         assert_eq!(error, "0000:0e:00.0 is on nouveau, expected vfio-pci");
     }
 
-    #[test]
-    fn release_fails_while_a_user_holds_the_gpu_and_signals_nothing_unless_asked() {
-        let (_dir, root) = fixture::dev_pc();
-        let proc_fd = root.path("/proc/4242/fd");
+    fn fake_holder(root: &Root, pid: u32, comm: &str, node: &str) {
+        let proc_fd = root.path(format!("/proc/{pid}/fd"));
         fs::create_dir_all(&proc_fd).unwrap();
-        fs::write(root.path("/proc/4242/comm"), "kwin_wayland\n").unwrap();
-        symlink("/dev/dri/renderD129", proc_fd.join("7")).unwrap();
+        fs::write(root.path(format!("/proc/{pid}/comm")), format!("{comm}\n")).unwrap();
+        symlink(node, proc_fd.join("7")).unwrap();
+    }
 
-        let recorder = Recorder::default();
+    fn release(root: &Root, recorder: &Recorder) -> Result<()> {
         let executor = Executor {
-            root: &root,
-            system: &recorder,
+            root,
+            system: recorder,
             dry_run: false,
         };
-        let plan = Plan {
+        executor.run(&Plan {
             gpu: "0e:00".parse().unwrap(),
             steps: vec![Step::ReleaseGpu {
                 wait: Duration::ZERO,
                 signal_leftovers: false,
-                require_free: true,
+                allow_idle_compositor: true,
             }],
-        };
-        // The fixture is owned by the test user, so the process counts as a
-        // user process only when the tests run as a regular user.
-        let result = executor.run(&plan);
-        if fs::metadata(root.path("/proc/4242")).unwrap().uid() >= holders::FIRST_USER_UID {
-            assert!(result.is_err());
+        })
+    }
+
+    /// The fixture is owned by the test user, so its processes count as user
+    /// processes only when the tests run as a regular user.
+    fn runs_as_user(root: &Root) -> bool {
+        fs::metadata(root.path("/proc")).unwrap().uid() >= holders::FIRST_USER_UID
+    }
+
+    #[test]
+    fn an_idle_compositor_does_not_block_the_release() {
+        let (_dir, root) = fixture::dev_pc();
+        fake_holder(&root, 4242, "kwin_wayland", "/dev/dri/renderD129");
+        assert!(release(&root, &Recorder::default()).is_ok());
+    }
+
+    #[test]
+    fn an_application_on_the_gpu_blocks_the_release_and_is_not_signalled() {
+        let (_dir, root) = fixture::dev_pc();
+        fake_holder(&root, 4242, "kwin_wayland", "/dev/dri/renderD129");
+        fake_holder(&root, 4343, "zed-editor", "/dev/dri/renderD129");
+        let recorder = Recorder::default();
+        let result = release(&root, &recorder);
+        if runs_as_user(&root) {
+            let error = result.unwrap_err().to_string();
+            assert_eq!(
+                error,
+                "the GPU is in use by zed-editor (4343); close it and try again"
+            );
         }
         assert!(
             recorder
@@ -387,7 +423,7 @@ mod tests {
         let recorder = Recorder::default();
         let snapshot = snapshot(&root, &recorder, "0e:00".parse().unwrap()).unwrap();
         recorder.calls.borrow_mut().clear();
-        let (plan, _) = plan::attach(&snapshot, true);
+        let (plan, _) = plan::attach(&snapshot);
         Executor {
             root: &root,
             system: &recorder,

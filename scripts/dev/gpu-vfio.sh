@@ -7,7 +7,9 @@
 #   gpu-vfio.sh check  [slot]   list processes holding the GPU's DRM nodes
 #   gpu-vfio.sh attach [slot]   bind to vfio-pci, hand /dev/vfio/<group> to the caller
 #                               (refuses while anything holds the GPU; FORCE=1 unbinds
-#                               anyway and leaves the holders to the driver's hot-unplug)
+#                               anyway, which is safe only for KWin's unused render-node
+#                               descriptor: unbinding under an application's live
+#                               buffers corrupts kernel memory)
 #   gpu-vfio.sh detach [slot]   return to the host drivers
 #
 # slot defaults to 0000:0e:00 (the RTX 3070 on the development PC).

@@ -67,9 +67,15 @@ back silently to the desktop GPU (Mesa ignores a `DRI_PRIME` that matches no
 device). The app shows that the GPU is in a jail.
 
 KWin still keeps one render-node descriptor of the other GPU, left by Mesa's
-EGL probe. Unbinding the GPU with that descriptor open is harmless: the kernel
-marks the device unplugged and KWin carries on (`FORCE=1` in
-`scripts/dev/gpu-vfio.sh`).
+EGL probe and never used. Unbinding the GPU with that descriptor open is
+harmless: the kernel marks the device unplugged and KWin carries on. Any other
+holder may have buffers on the GPU, and unbinding the driver underneath live
+buffers corrupts kernel memory: with nouveau, `nouveau_ttm_fini` warns about
+leaked resources, the application then trips a list-corruption `BUG` the next
+time it touches them, and the next unbind hangs until a reboot. Secondary mode
+therefore tolerates exactly KWin with nothing but a render node open, and any
+other holder (an editor or browser rendering on the GPU, a game) makes the
+switch fail with its name until it is closed.
 
 ### Guest GPU driver
 

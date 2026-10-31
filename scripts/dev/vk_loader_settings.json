@@ -1,0 +1,12 @@
+{
+  "file_format_version": "1.0.1",
+  "settings_array": [
+    {
+      "app_keys": ["/usr/bin/kwin_wayland"],
+      "additional_drivers_use_exclusively": true,
+      "additional_drivers": [
+        { "path": "/usr/share/vulkan/icd.d/intel_icd.x86_64.json" }
+      ]
+    }
+  ]
+}

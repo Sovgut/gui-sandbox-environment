@@ -1,0 +1,7 @@
+# Stable name for the GPU that drives the desktop on the development PC (Intel
+# Arc A380 at 0000:07:00.0). KWin is limited to it through
+# KWIN_DRM_DEVICES=/dev/dri/desktop-card, so it never opens the RTX 3070 and the
+# 3070 can be handed to vfio-pci while the desktop runs. cardN numbers change
+# with probe order and by-path names contain ':', which KWin uses as its list
+# separator, so neither can be used directly.
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", KERNELS=="0000:07:00.0", SYMLINK+="dri/desktop-card"

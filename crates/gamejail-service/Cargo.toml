@@ -1,0 +1,16 @@
+[package]
+name = "gamejail-service"
+description = "Root service of gamejail: switches the GPU between the host and a jail and runs the jail VM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gamejail-host = { path = "../gamejail-host" }
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

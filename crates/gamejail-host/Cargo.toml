@@ -1,0 +1,16 @@
+[package]
+name = "gamejail-host"
+description = "Host-side model of gamejail: PCI GPUs, their users, and the plans that move a GPU between the host and a jail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

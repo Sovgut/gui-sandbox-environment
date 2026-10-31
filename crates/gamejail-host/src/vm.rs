@@ -40,10 +40,10 @@ pub struct VmSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Network {
     None,
-    /// QEMU user networking with SSH forwarded to `127.0.0.1:<ssh_port>`.
-    /// Development only: the guest reaches the host and the LAN through it.
-    DevUserNet {
-        ssh_port: u16,
+    /// A virtio card backed by the passt instance listening on `socket`;
+    /// see [`crate::net`] for what the jail can reach through it.
+    Passt {
+        socket: PathBuf,
     },
 }
 
@@ -93,11 +93,16 @@ impl VmSpec {
         for function in &self.passthrough {
             push(&["-device", &format!("vfio-pci,host={function}")]);
         }
-        match self.network {
+        match &self.network {
             Network::None => push(&["-nic", "none"]),
-            Network::DevUserNet { ssh_port } => push(&[
-                "-nic",
-                &format!("user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:{ssh_port}-:22"),
+            Network::Passt { socket } => push(&[
+                "-netdev",
+                &format!(
+                    "stream,id=net0,server=off,addr.type=unix,addr.path={}",
+                    socket.display()
+                ),
+                "-device",
+                "virtio-net-pci,netdev=net0",
             ]),
         }
         match self.vnc_display {
@@ -177,15 +182,25 @@ mod tests {
     }
 
     #[test]
-    fn development_options_add_vnc_and_ssh_forwarding() {
+    fn network_card_is_backed_by_passt() {
+        let mut jail = spec();
+        jail.network = Network::Passt {
+            socket: "/run/gamejail/proto.passt".into(),
+        };
+        let args = jail.command_line();
+        assert_eq!(after(&args, "-nic"), Vec::<&str>::new());
+        assert_eq!(
+            after(&args, "-netdev"),
+            ["stream,id=net0,server=off,addr.type=unix,addr.path=/run/gamejail/proto.passt"]
+        );
+        assert!(after(&args, "-device").contains(&"virtio-net-pci,netdev=net0"));
+    }
+
+    #[test]
+    fn development_display_is_vnc_on_loopback() {
         let mut dev = spec();
-        dev.network = Network::DevUserNet { ssh_port: 2222 };
         dev.vnc_display = Some(1);
         let args = dev.command_line();
-        assert_eq!(
-            after(&args, "-nic"),
-            ["user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2222-:22"]
-        );
         assert_eq!(after(&args, "-display"), ["vnc=127.0.0.1:1"]);
         assert!(after(&args, "-device").contains(&"virtio-vga"));
     }

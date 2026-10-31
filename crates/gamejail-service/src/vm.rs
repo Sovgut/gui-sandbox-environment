@@ -18,7 +18,7 @@ use gamejail_host::pci::PciAddress;
 use gamejail_host::vm::{Network, OVMF_VARS_TEMPLATE, VmSpec};
 use tracing::{error, info, warn};
 
-use crate::{STATE_DIR, gpu, state_path};
+use crate::{STATE_DIR, gpu, net, state_path};
 
 /// How long a guest gets to shut down after a power-down request before QEMU
 /// is killed.
@@ -39,10 +39,14 @@ pub struct RunArgs {
     memory_mib: u32,
     #[arg(long, default_value_t = 8)]
     cpus: u16,
-    /// Development only: QEMU user networking with SSH on 127.0.0.1:PORT.
-    /// The guest reaches the host and the LAN through it.
+    /// Development only: forward 127.0.0.1:PORT on the host to the guest's
+    /// SSH port.
     #[arg(long, value_name = "PORT")]
     dev_ssh_port: Option<u16>,
+    /// Start with the internet off; `net internet on` turns it on while the
+    /// jail runs.
+    #[arg(long)]
+    offline: bool,
     /// Development only: an emulated display on VNC 127.0.0.1:5900+N.
     #[arg(long, value_name = "N")]
     dev_vnc: Option<u16>,
@@ -64,36 +68,52 @@ pub fn run(root: &Root, args: &RunArgs, dry_run: bool) -> Result<()> {
         .iter()
         .map(|p| fs::canonicalize(p).with_context(|| format!("disk {}", p.display())))
         .collect::<Result<Vec<_>>>()?;
-    let spec_for = |passthrough: Vec<PciAddress>| VmSpec {
+    let attached = gpu::attach(root, args.gpu, dry_run)?;
+    let spec_for = |socket: PathBuf| VmSpec {
         name: name.clone(),
         disk: disk.clone(),
         read_only_disks: read_only_disks.clone(),
         firmware_vars: dir.join("OVMF_VARS.qcow2"),
         memory_mib: args.memory_mib,
         cpus: args.cpus,
-        passthrough,
-        network: args
-            .dev_ssh_port
-            .map_or(Network::None, |ssh_port| Network::DevUserNet { ssh_port }),
+        passthrough: attached.functions.iter().map(|f| f.address).collect(),
+        network: Network::Passt { socket },
         vnc_display: args.dev_vnc,
         monitor_socket: state_path(&format!("{name}.monitor")),
         serial_log: dir.join("console.log"),
         run_as: args.run_as.clone().or_else(invoking_user),
     };
 
-    let attached = gpu::attach(root, args.gpu, dry_run)?;
-    let spec = spec_for(attached.functions.iter().map(|f| f.address).collect());
     let outcome = if dry_run {
+        net::apply(!args.offline, true)?;
+        let spec = spec_for(PathBuf::from(net::SOCKET_DIR).join(format!("{name}.passt")));
         info!("dry run: {}", spec.command_line().join(" "));
         Ok(())
     } else {
-        run_qemu(&spec)
+        run_jail(&name, args, spec_for)
     };
     let returned = gpu::detach(root, attached.display().address, dry_run);
     if let Err(e) = &returned {
         error!("returning the GPU failed: {e:#}");
     }
     outcome.and(returned)
+}
+
+/// Brings up the jail network, runs the VM, and takes the network down again.
+fn run_jail(name: &str, args: &RunArgs, spec_for: impl Fn(PathBuf) -> VmSpec) -> Result<()> {
+    net::apply(!args.offline, false)?;
+    let outcome = net::start_passt(name, args.dev_ssh_port).and_then(|(passt, mut child)| {
+        let outcome = run_qemu(&spec_for(passt.socket));
+        // passt exits with its one guest; this only covers a QEMU that never
+        // connected.
+        child.kill().ok();
+        child.wait().ok();
+        outcome
+    });
+    if let Err(e) = net::remove(false) {
+        error!("removing the jail network rules failed: {e:#}");
+    }
+    outcome
 }
 
 fn run_qemu(spec: &VmSpec) -> Result<()> {

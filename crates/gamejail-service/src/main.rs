@@ -4,6 +4,7 @@
 //! the service grows its socket interface.
 
 mod gpu;
+mod net;
 mod vm;
 
 use std::fs;
@@ -40,6 +41,30 @@ enum Command {
         #[command(subcommand)]
         action: VmAction,
     },
+    /// The jail network rules.
+    Net {
+        #[command(subcommand)]
+        action: NetAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum NetAction {
+    /// Turn the running jail's internet on or off.
+    Internet {
+        #[arg(value_enum)]
+        state: Switch,
+    },
+    /// Remove the jail network rules.
+    Remove,
+    /// Print the rules installed while a jail runs with internet on.
+    Rules,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -95,6 +120,17 @@ fn run(cli: &Cli) -> Result<()> {
                 require_root(cli.dry_run)?;
                 vm::run(&root, args, cli.dry_run)
             }
+        },
+        Command::Net { action } => match action {
+            NetAction::Internet { state } => {
+                require_root(cli.dry_run)?;
+                net::apply(matches!(state, Switch::On), cli.dry_run)
+            }
+            NetAction::Remove => {
+                require_root(cli.dry_run)?;
+                net::remove(cli.dry_run)
+            }
+            NetAction::Rules => net::print_rules(),
         },
     }
 }

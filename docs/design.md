@@ -105,10 +105,32 @@ kernel; with it the guest sees the 3070 at PCIe 4.0 x16 with Vulkan.
 
 ## Network
 
-- The VM sits on its own bridge/tap. Host nftables allow the internet and drop
-  every private and local range: RFC1918, `100.64.0.0/10`, link-local,
-  multicast, IPv6 ULA and link-local, and the host itself.
-- The internet toggle in the app flips one nftables rule.
+- The guest's network card is backed by passt, a user-space network stack
+  that turns the guest's traffic into ordinary sockets of the passt process.
+  The host needs no bridge, no forwarding and no NAT, so nothing depends on
+  firewalld, which is active on both machines and drops forwarded traffic.
+- passt runs as the system account `gamejail-net`
+  (`dist/sysusers.d/gamejail.conf`), one instance per jail, IPv4 only, with
+  `--one-off` (it exits with its guest), `--no-map-gw` (the gateway does not
+  lead to the host) and no inbound ports. The guest gets the host's own
+  address from passt, so to the jail the host's address is itself.
+- Host nftables (`table inet gamejail`, output hook) filter only that
+  account's traffic: every address of this host (`fib daddr type local`),
+  RFC1918, `100.64.0.0/10`, loopback, link-local, multicast, reserved ranges
+  and their IPv6 counterparts are dropped; the rest of the internet is
+  allowed. Replies on connections the host itself opened into passt (the
+  development SSH forward) pass; the jail cannot open such a connection.
+- DNS goes to public resolvers (1.1.1.1, 9.9.9.9), never to the host's
+  resolver on loopback.
+- The internet toggle is one drop rule, applied live
+  (`gamejail-service net internet on|off`).
+- passt's socket lives in `/tmp/gamejail-net`, a root directory with mode
+  0700: SELinux lets `passt_t` create sockets in `tmp_t` but not in `/run`,
+  and passt binds it as root before dropping privileges, without
+  `dac_override`.
+- Measured from inside the prototype jail: DNS and HTTPS work; the router,
+  other LAN hosts and link-local addresses are unreachable; turning the
+  internet off cuts HTTPS and DNS at once and turning it on restores them.
 
 ## Guest system
 

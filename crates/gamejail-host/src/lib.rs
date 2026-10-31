@@ -8,6 +8,7 @@
 
 pub mod exec;
 pub mod holders;
+pub mod net;
 pub mod pci;
 pub mod plan;
 pub mod root;

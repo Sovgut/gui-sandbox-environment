@@ -12,6 +12,7 @@ pub mod net;
 pub mod pci;
 pub mod plan;
 pub mod root;
+pub mod seed;
 pub mod session;
 pub mod vm;
 

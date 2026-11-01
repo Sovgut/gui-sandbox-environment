@@ -90,7 +90,7 @@ pub fn run(root: &Root, args: &RunArgs, dry_run: bool) -> Result<()> {
         info!("dry run: {}", spec.command_line().join(" "));
         Ok(())
     } else {
-        run_jail(&name, args, spec_for)
+        run_networked(&name, !args.offline, args.dev_ssh_port, spec_for)
     };
     let returned = gpu::detach(root, attached.display().address, dry_run);
     if let Err(e) = &returned {
@@ -99,10 +99,16 @@ pub fn run(root: &Root, args: &RunArgs, dry_run: bool) -> Result<()> {
     outcome.and(returned)
 }
 
-/// Brings up the jail network, runs the VM, and takes the network down again.
-fn run_jail(name: &str, args: &RunArgs, spec_for: impl Fn(PathBuf) -> VmSpec) -> Result<()> {
-    net::apply(!args.offline, false)?;
-    let outcome = net::start_passt(name, args.dev_ssh_port).and_then(|(passt, mut child)| {
+/// Brings up the jail network, runs the VM `spec_for` describes once passt's
+/// socket exists, and takes the network down again.
+pub fn run_networked(
+    name: &str,
+    internet: bool,
+    dev_ssh_port: Option<u16>,
+    spec_for: impl Fn(PathBuf) -> VmSpec,
+) -> Result<()> {
+    net::apply(internet, false)?;
+    let outcome = net::start_passt(name, dev_ssh_port).and_then(|(passt, mut child)| {
         let outcome = run_qemu(&spec_for(passt.socket));
         // passt exits with its one guest; this only covers a QEMU that never
         // connected.
@@ -182,7 +188,7 @@ fn request_powerdown(monitor: &Path) {
 }
 
 /// The user behind sudo or pkexec, by name, for QEMU's `-run-with user=`.
-fn invoking_user() -> Option<String> {
+pub fn invoking_user() -> Option<String> {
     let uid = env::var("PKEXEC_UID")
         .or_else(|_| env::var("SUDO_UID"))
         .ok()?;

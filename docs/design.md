@@ -134,8 +134,19 @@ kernel; with it the guest sees the 3070 at PCIe 4.0 x16 with Vulkan.
 
 ## Guest system
 
-- Fedora built from a declarative recipe (kickstart or mkosi), lightweight
-  Wayland session, `akmod-nvidia` from RPM Fusion.
+- Fedora, built from the Fedora Cloud image by `guest/base/provision.sh`,
+  which cloud-init runs once in a build VM without a GPU and with the jail
+  network (`gamejail-service image build-base`). The seed is a FAT volume
+  written by the service itself, so the host needs no mkfs or mtools. The
+  guest reports its verdict on the serial console; a passing build is
+  flattened into one compressed qcow2 with no backing file. On the
+  development PC a build takes about 5 minutes, two of them for the driver.
+- `akmod-nvidia` from RPM Fusion, built for the newest installed kernel since
+  the build VM runs an older one; the build fails if the module is missing.
+- LXQt on labwc (Wayland) with Xwayland for games. greetd starts it as
+  `friend` without a password, on boot and after a logout.
+- Release images have no SSH server and no account that can become root;
+  development builds keep a `dev` account with an SSH key.
 - Two users:
   - `friend` owns the login session, the compositor, PipeWire and trusted apps
     such as Discord. Home is `0700`.

@@ -4,6 +4,7 @@
 //! the service grows its socket interface.
 
 mod gpu;
+mod image;
 mod net;
 mod vm;
 
@@ -46,6 +47,18 @@ enum Command {
         #[command(subcommand)]
         action: NetAction,
     },
+    /// Jail images.
+    Image {
+        #[command(subcommand)]
+        action: ImageAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImageAction {
+    /// Build the base image every jail shares: NVIDIA driver, desktop and the
+    /// `friend` and `jail` accounts, in a VM without a GPU.
+    BuildBase(image::BuildBaseArgs),
 }
 
 #[derive(Subcommand)]
@@ -119,6 +132,12 @@ fn run(cli: &Cli) -> Result<()> {
             VmAction::Run(args) => {
                 require_root(cli.dry_run)?;
                 vm::run(&root, args, cli.dry_run)
+            }
+        },
+        Command::Image { action } => match action {
+            ImageAction::BuildBase(args) => {
+                require_root(cli.dry_run)?;
+                image::build_base(args, cli.dry_run)
             }
         },
         Command::Net { action } => match action {

@@ -179,6 +179,46 @@ fi
 
 step "flatpak"
 flatpak remote-add --system --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+# Fedora leaves system Flatpak deployments as var_lib_t, which a confined user
+# may not execute. Deployed files are hardlinks to objects in the repository
+# and share their inode, so the repository gets the same label, and whatever
+# installs Flatpaks relabels afterwards.
+mkdir -p /var/lib/flatpak/app /var/lib/flatpak/repo /var/lib/flatpak/runtime
+semanage fcontext -a -t bin_t '/var/lib/flatpak/(app|repo|runtime)(/.*)?'
+restorecon -R /var/lib/flatpak
+
+step "sandboxes"
+# Flatpak and Steam's pressure-vessel run programs under bwrap, which `jail`
+# may use as it creates its own user namespace. Inside that namespace bwrap
+# brings up loopback, caps nested user namespaces and bind-mounts home
+# directories. Each of these needs CAP_NET_ADMIN, CAP_SYS_RESOURCE or
+# CAP_SYS_ADMIN, which `jail` holds only over namespaces it created, so the
+# rules below reach nothing outside them.
+cat > /tmp/gamejail_sandboxes.cil <<'EOF'
+(allow user_t self (netlink_route_socket (nlmsg_write)))
+(allow user_t sysctl_t (file (open write)))
+(allow user_t user_home_dir_t (dir (mounton)))
+(allow user_t user_home_content_type (dir (mounton)))
+(allow user_t user_home_content_type (file (mounton)))
+EOF
+semodule -i /tmp/gamejail_sandboxes.cil
+rm /tmp/gamejail_sandboxes.cil
+
+# Proton synchronises Windows threads through /dev/ntsync, and the sandboxes
+# bind it in. The policy leaves it the generic device_t, which `jail` may not
+# touch, so it gets a type of its own that `jail` may use. The device is meant
+# for unprivileged users (mode 0666). tmpfiles restores the label at boot in
+# case the module loads before udev labels devices.
+cat > /tmp/gamejail_ntsync.cil <<'EOF'
+(type gamejail_ntsync_device_t)
+(roletype object_r gamejail_ntsync_device_t)
+(typeattributeset device_node (gamejail_ntsync_device_t))
+(allow user_t gamejail_ntsync_device_t (chr_file (getattr open read write ioctl)))
+EOF
+semodule -i /tmp/gamejail_ntsync.cil
+rm /tmp/gamejail_ntsync.cil
+semanage fcontext -a -t gamejail_ntsync_device_t /dev/ntsync
+echo 'z /dev/ntsync - - - -' > /etc/tmpfiles.d/gamejail-ntsync.conf
 
 step "cleanup"
 if [ "${GAMEJAIL_DEV:-0}" != 1 ]; then

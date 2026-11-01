@@ -188,6 +188,29 @@ kernel; with it the guest sees the 3070 at PCIe 4.0 x16 with Vulkan.
   desktop's sound server; recording from the default source and from a sink
   monitor, and setting a volume, fail with "Access denied"; `friend` keeps
   both.
+- Flatpak and Steam's pressure-vessel sandbox their programs with bwrap, which
+  `jail` runs in a user namespace of its own. The base image grants `user_t`
+  what bwrap needs there and nothing that reaches past it: writing to a
+  route netlink socket (loopback in its network namespace), opening sysctls
+  for writing (`user.max_user_namespaces` of its namespace), and mounting on
+  its own home directories. Each operation also needs a capability that
+  `jail` holds only over namespaces it created; the host-wide sysctls stay
+  root-owned and closed. `/dev/ntsync`, which Proton uses and the sandboxes
+  bind in, gets a type of its own that `jail` may read, write and `ioctl`;
+  the policy otherwise leaves it the generic `device_t`. System Flatpaks under
+  `/var/lib/flatpak/{app,repo,runtime}` are labelled `bin_t`, since Fedora
+  leaves them `var_lib_t`, which a confined user may not execute. Deployed
+  files are hardlinks to repository objects, so they take no label from their
+  directory; the preset build relabels after installing.
+- Measured in a jail booted from the games preset: Steam (with its webhelper
+  under pressure-vessel), Lutris, the Epic Games Launcher, Heroic, ProtonPlus
+  and Faugus run as `user_t`; Vulkan sees the RTX 3070 both natively and inside
+  Flatpak, GL renders on it, and `vkcube` presents through `:1`. On the
+  development PC the VM's display is an emulated `virtio-vga`, so the
+  compositor runs there and cannot import the 3070's buffers: Wayland clients
+  rendering on the 3070 fail (GTK 4 apps such as ProtonPlus and Faugus exit
+  with a protocol error unless `GSK_RENDERER=cairo`). That path only exists,
+  and is still to be confirmed, on a single-GPU machine.
 - Nobody inside the guest has `sudo`. A root exploit inside the guest still
   defeats the `friend`/`jail` split; the VM boundary is the hard one.
 

@@ -86,10 +86,12 @@ kernel; with it the guest sees the 3070 at PCIe 4.0 x16 with Vulkan.
 
 - **KVM/QEMU VM with VFIO passthrough of the whole 3070** (GPU and its HDMI
   audio function). Native performance; the guest has its own kernel.
-- **Host and jail never run at the same time on screen.** Starting a jail ends
-  the host graphical session, unbinds the NVIDIA driver, binds `vfio-pci` and
-  boots the VM, which then owns the monitor. Shutting the jail down reverses
-  this and brings the desktop back. A switch takes roughly 20-40 seconds.
+- **On a single-GPU machine host and jail never run on screen at the same
+  time.** Starting a jail ends the host graphical session, unbinds the NVIDIA
+  driver, binds `vfio-pci` and boots the VM, which then owns the monitor.
+  Shutting the jail down reverses this and brings the desktop back. A switch
+  takes roughly 20-40 seconds. With a second GPU the jail is shown in a window
+  instead (see "Jail screen").
 - **Emergency exit hotkey** (for example `Ctrl+Alt+Pause`) is read by the host
   service from evdev, so the guest can neither fake nor block it. It kills the
   VM immediately.
@@ -102,6 +104,40 @@ kernel; with it the guest sees the 3070 at PCIe 4.0 x16 with Vulkan.
   back to the host however QEMU ends. On the development PC a guest powers off
   in about 3 s and the GPU is back on its host driver 2.5 s later.
 - Several jails can exist; only one runs at a time (a lock in the service).
+
+## Jail screen
+
+The app shows the running jail according to the switch mode:
+
+- **secondary**: the jail's screen is shown in the app window next to the host
+  desktop. A "Full screen" button spreads it over the monitor. Keyboard and
+  mouse go to the jail while its view has focus.
+- **single**: in place of "Full screen" the app has an "Enter" button. It
+  performs the switch: the host desktop goes away and the jail owns the
+  monitor. Shutting the jail down or the emergency hotkey brings the desktop
+  back.
+
+In secondary mode the passed-through GPU usually has no monitor. The guest
+compositor still runs on it, with a virtual output, so games and the desktop
+render on one GPU and the VM needs no emulated display. Frames reach the host
+as raw pixels, the way Looking Glass carries them:
+
+- Inside the guest a process of `friend` captures the output through labwc's
+  screen capture protocol, which `jail` cannot reach, and writes the frames into
+  shared memory between the VM and the host (ivshmem).
+- The host app maps that memory and only reads pixels from it. The host runs
+  no video decoder and parses no format of the guest's choosing, which keeps
+  the surface a hostile guest can reach as small as raw pixels allow.
+- Input goes the other way through QEMU into the VM's virtual keyboard and
+  mouse. The guest gets no other channel back to the host.
+
+Streaming compressed video (NVENC, as Moonlight does) would cost less
+bandwidth, but it puts a video decoder on the host to parse data produced by
+the untrusted guest, so it is not used.
+
+Development runs can add an emulated `virtio-vga` with VNC (`--dev-vnc`) to
+look into a jail without the app; the guest compositor then runs on that
+display instead of the passed-through GPU.
 
 ## Network
 
@@ -304,7 +340,8 @@ lists what passed and what was rejected and why.
 1. **gamejail-service** (Rust, root, systemd): VM lifecycle, GPU driver
    switching, nftables, emergency hotkey, check that nothing holds the GPU
    before a switch, file bridge host side, image builds.
-2. **gamejail** (Rust, gpui, AppImage): jail list, start/stop/reset, presets
+2. **gamejail** (Rust, gpui, AppImage): jail list, start/stop/reset, the jail
+   screen (a window with "Full screen", or "Enter" on one GPU), presets
    editor, file queue, internet toggle, background apps list, transfer reports.
    Talks to the service over a local socket guarded by polkit.
 3. **Host background layer**: xpra, GPU-less launch wrappers, PipeWire with

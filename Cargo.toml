@@ -32,4 +32,6 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 
 [patch.crates-io]
-xattr = { path = "vendor/xattr" }
+gpui-pre = { path = "vendor/gpui-pre" }
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+gpui-component = { path = "vendor/gpui-component" }

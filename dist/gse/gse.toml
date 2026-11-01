@@ -8,3 +8,7 @@ screen_mode = "2560x1440@60"
 
 memory_mib = 12288
 cpus = 8
+
+# The Fedora release base images are built from. Left out, it is the
+# release this version of gse is made for.
+# fedora_release = 45

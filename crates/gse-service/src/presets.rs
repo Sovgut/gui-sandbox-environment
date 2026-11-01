@@ -2,7 +2,8 @@
 //! directory, in the format of `gse_host::preset`. Clients see and send them
 //! as [`gse_protocol::Preset`]; everything they send is checked here before
 //! it reaches a file, since the generated provisioning script runs as root
-//! in the build VM.
+//! in the build VM. No preset is called [`BASE_IMAGE`]: a build of the base
+//! image goes by that name.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -12,11 +13,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use gse_host::preset::{App, Preset as HostPreset, Source};
-use gse_protocol::{AppSource, Preset, PresetApp, valid_name};
+use gse_protocol::{AppSource, BASE_IMAGE, Preset, PresetApp, valid_name};
 use tracing::warn;
 
-/// The preset a fresh service starts with.
-const BUILT_IN: (&str, &str) = ("launchers", include_str!("../../../presets/launchers.toml"));
+/// The presets a fresh service starts with.
+const BUILT_IN: [(&str, &str); 2] = [
+    ("launchers", include_str!("../../../presets/launchers.toml")),
+    ("desktop", include_str!("../../../presets/desktop.toml")),
+];
 
 /// The most applications one preset holds.
 const MAX_APPS: usize = 64;
@@ -25,6 +29,11 @@ const MAX_TEXT: usize = 256;
 
 fn path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.toml"))
+}
+
+/// Whether `name` can name a preset.
+fn preset_name(name: &str) -> bool {
+    valid_name(name) && name != BASE_IMAGE
 }
 
 /// The names of the preset files in `dir`, sorted.
@@ -39,7 +48,7 @@ fn names(dir: &Path) -> Vec<String> {
                 .then(|| path.file_stem()?.to_str().map(str::to_owned))
                 .flatten()
         })
-        .filter(|n| valid_name(n))
+        .filter(|n| preset_name(n))
         .collect();
     names.sort();
     names
@@ -47,22 +56,38 @@ fn names(dir: &Path) -> Vec<String> {
 
 /// Whether `dir` holds the preset `name`.
 pub fn exists(dir: &Path, name: &str) -> bool {
-    valid_name(name) && path(dir, name).is_file()
+    preset_name(name) && path(dir, name).is_file()
 }
 
-/// Puts the built-in preset into `dir` when it holds no preset at all.
+/// The built-in presets, to start new ones from.
+pub fn templates() -> Vec<Preset> {
+    BUILT_IN
+        .iter()
+        .filter_map(|(name, text)| match HostPreset::parse(text) {
+            Ok(preset) => Some(to_protocol(&preset)),
+            Err(e) => {
+                warn!("the built-in preset '{name}': {e:#}");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Puts the built-in presets into `dir` when it holds no preset at all, so
+/// a preset the user deleted stays deleted.
 pub fn seed(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir)?;
     if names(dir).is_empty() {
-        let (name, text) = BUILT_IN;
-        write_atomically(&path(dir, name), text.as_bytes())?;
+        for (name, text) in BUILT_IN {
+            write_atomically(&path(dir, name), text.as_bytes())?;
+        }
     }
     Ok(())
 }
 
 /// Reads the preset `name`.
 pub fn load(dir: &Path, name: &str) -> Result<HostPreset> {
-    if !valid_name(name) {
+    if !preset_name(name) {
         bail!("no preset '{name}'");
     }
     let text = fs::read_to_string(path(dir, name)).map_err(|e| missing(name, e))?;
@@ -103,8 +128,23 @@ pub fn save(dir: &Path, preset: &Preset) -> Result<()> {
     write_atomically(&path(dir, &preset.name), (header + &text).as_bytes())
 }
 
+/// Gives the preset `name` the name `to`: the new file first, then the old
+/// one goes.
+pub fn rename(dir: &Path, name: &str, to: &str) -> Result<()> {
+    if !preset_name(to) {
+        bail!("'{to}' cannot name a preset");
+    }
+    if exists(dir, to) {
+        bail!("a preset '{to}' exists");
+    }
+    let mut preset = to_protocol(&load(dir, name)?);
+    to.clone_into(&mut preset.name);
+    save(dir, &preset)?;
+    delete(dir, name)
+}
+
 pub fn delete(dir: &Path, name: &str) -> Result<()> {
-    if !valid_name(name) {
+    if !preset_name(name) {
         bail!("no preset '{name}'");
     }
     fs::remove_file(path(dir, name)).map_err(|e| missing(name, e))
@@ -219,6 +259,9 @@ fn validate(preset: &Preset) -> Result<()> {
     if !valid_name(&preset.name) {
         bail!("preset names are 1-32 lowercase letters, digits and hyphens");
     }
+    if preset.name == BASE_IMAGE {
+        bail!("'{BASE_IMAGE}' is the base image's name; give the preset another");
+    }
     if preset.apps.len() > MAX_APPS {
         bail!("a preset holds at most {MAX_APPS} apps");
     }
@@ -293,15 +336,16 @@ mod tests {
     }
 
     #[test]
-    fn the_built_in_preset_seeds_an_empty_directory_only() {
+    fn the_built_in_presets_seed_an_empty_directory_only() {
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path()).unwrap();
         let presets = list(dir.path());
-        assert_eq!(presets.len(), 1);
-        assert_eq!(presets[0].name, "launchers");
-        assert!(presets[0].apps.iter().any(|a| a.trusted));
+        let names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["desktop", "launchers"]);
+        assert!(presets[1].apps.iter().any(|a| a.trusted));
 
         delete(dir.path(), "launchers").unwrap();
+        delete(dir.path(), "desktop").unwrap();
         let mine = Preset {
             name: "mine".into(),
             apps: vec![flatpak("Heroic", "com.heroicgameslauncher.hgl")],
@@ -309,6 +353,33 @@ mod tests {
         save(dir.path(), &mine).unwrap();
         seed(dir.path()).unwrap();
         assert_eq!(list(dir.path()), [mine]);
+    }
+
+    #[test]
+    fn every_built_in_preset_is_a_template() {
+        let names: Vec<String> = templates().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["launchers", "desktop"]);
+    }
+
+    #[test]
+    fn a_renamed_preset_keeps_its_apps_under_the_new_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = Preset {
+            name: "mine".into(),
+            apps: vec![flatpak("Heroic", "com.heroicgameslauncher.hgl")],
+        };
+        save(dir.path(), &mine).unwrap();
+        rename(dir.path(), "mine", "games").unwrap();
+        assert_eq!(
+            list(dir.path()),
+            [Preset {
+                name: "games".into(),
+                ..mine.clone()
+            }]
+        );
+        save(dir.path(), &mine).unwrap();
+        assert!(rename(dir.path(), "mine", "games").is_err());
+        assert!(rename(dir.path(), "mine", "base").is_err());
     }
 
     #[test]
@@ -348,6 +419,24 @@ mod tests {
         assert_eq!(list(dir.path()), []);
         assert!(delete(dir.path(), "games").is_err());
         assert!(load(dir.path(), "../games").is_err());
+    }
+
+    #[test]
+    fn no_preset_takes_the_base_image_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = Preset {
+            name: BASE_IMAGE.into(),
+            apps: vec![flatpak("Heroic", "com.heroicgameslauncher.hgl")],
+        };
+        assert!(save(dir.path(), &base).is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        // A file put there by hand is no preset either.
+        fs::write(path(dir.path(), BASE_IMAGE), "name = \"base\"\n").unwrap();
+        assert_eq!(list(dir.path()), []);
+        assert!(!exists(dir.path(), BASE_IMAGE));
+        assert!(load(dir.path(), BASE_IMAGE).is_err());
+        assert!(delete(dir.path(), BASE_IMAGE).is_err());
     }
 
     #[test]

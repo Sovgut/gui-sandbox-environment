@@ -1,11 +1,14 @@
 //! gse's root service.
 //!
-//! `daemon` serves the app over a socket; the other commands are the same
-//! operations run directly from a terminal, for development and repair.
+//! `daemon` serves the app over a socket. `install` and `uninstall` put gse
+//! on the machine and take it off again; the app runs them through polkit.
+//! The other commands are the same operations run directly from a terminal,
+//! for development and repair.
 
 mod agent;
 mod checks;
 mod daemon;
+mod fedora;
 mod gpu;
 mod image;
 mod net;
@@ -41,6 +44,13 @@ struct Cli {
 enum Command {
     /// Serve clients on the service socket.
     Daemon,
+    /// Put gse on this machine, or update it: the service and guest
+    /// programs from the directory this program runs from, the systemd unit,
+    /// the polkit action, the network account and, unless there are
+    /// settings already, the default settings; then (re)start the service.
+    /// Each step is reported on stdout as `step <id>`, `warning <id> <text>`
+    /// and `done <id>` or `failed <id> <reason>` lines.
+    Install,
     /// Remove everything gse put on this machine: the service, its settings,
     /// images and environments, the network rules and account.
     Uninstall,
@@ -133,6 +143,10 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Daemon => {
             require_root(false)?;
             daemon::serve(root)
+        }
+        Command::Install => {
+            require_root(cli.dry_run)?;
+            setup::install(cli.dry_run)
         }
         Command::Uninstall => {
             require_root(cli.dry_run)?;

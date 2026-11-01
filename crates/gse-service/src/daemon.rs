@@ -23,18 +23,34 @@ use gse_host::Root;
 use gse_host::pci::PciAddress;
 use gse_host::preset::Preset as HostPreset;
 use gse_protocol::{
-    Build, Environment, Event, JournalEntry, MAX_LINE, Reply, Request, Running, SOCKET,
-    ScreenAccess, ScreenMode, Settings, Stage, receive, send, valid_name,
+    BASE_IMAGE, BaseImage, Build, Environment, Event, JournalEntry, MAX_LINE, Reply, Request,
+    Running, SOCKET, ScreenAccess, ScreenMode, Settings, Stage, receive, send, valid_name,
 };
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
 use crate::agent::Agent;
-use crate::{checks, gpu, image, net, presets, vm};
+use crate::{checks, fedora, gpu, image, net, presets, vm};
 
 /// The polkit action every client needs.
 pub const ACTION: &str = "io.github.sovgut.gse.manage";
-const CONFIG: &str = "/etc/gse/gse.toml";
+/// The fingerprint a base image built by this service has, from its guest
+/// program; none when the program is missing.
+fn guest_fingerprint() -> Option<&'static str> {
+    static FINGERPRINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    FINGERPRINT
+        .get_or_init(|| {
+            image::guest_program(None)
+                .ok()
+                .map(|guest| image::base_fingerprint(&guest))
+        })
+        .as_deref()
+}
+
+/// How a start's journal line begins; the time a sandbox last played is
+/// read back from it.
+const STARTING: &str = "Starting for";
+pub const CONFIG: &str = "/etc/gse/gse.toml";
 const DATA: &str = "/var/lib/gse";
 /// The size past which an environment's journal drops its older lines,
 /// keeping at most [`JOURNAL_KEEP`] of the latest within half that size.
@@ -58,6 +74,10 @@ pub struct Config {
     pub memory_mib: u32,
     #[serde(default = "default_cpus")]
     pub cpus: u16,
+    /// The Fedora release base images are built from; without it, the one
+    /// the base provisioning script is made for ([`fedora::RELEASE`]).
+    #[serde(default)]
+    pub fedora_release: Option<u32>,
     /// Development only: forward 127.0.0.1:PORT to each environment's SSH
     /// port. Only development images run an SSH server.
     #[serde(default)]
@@ -89,8 +109,19 @@ impl Config {
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
+    /// The Fedora release base images are built from.
+    pub fn fedora_release(&self) -> u32 {
+        self.fedora_release.unwrap_or(fedora::RELEASE)
+    }
+
     /// The file [`Config::load`] reads back as `self`.
     fn to_toml(&self) -> String {
+        let fedora = self
+            .fedora_release
+            .map(|release| {
+                format!("\n# The Fedora release base images are built from.\nfedora_release = {release}\n")
+            })
+            .unwrap_or_default();
         let dev = self
             .dev_ssh_port
             .map(|port| format!("\n# Development only.\ndev_ssh_port = {port}\n"))
@@ -106,7 +137,7 @@ impl Config {
              internet = {}\n\
              \n\
              memory_mib = {}\n\
-             cpus = {}\n{dev}",
+             cpus = {}\n{fedora}{dev}",
             self.gpu,
             self.screen_mode.escape_default(),
             self.internet,
@@ -178,8 +209,9 @@ fn validate(settings: &Settings, gpus: &[gse_protocol::Gpu]) -> Result<(PciAddre
 /// build on; `images/<image>.qcow2`; `environments/<name>/` with the name
 /// of the environment's image, its `settings.toml` and `journal`, and once
 /// it has started, its disk, firmware variables and serial log;
-/// `presets/<preset>.toml`; and `builds/`, where an image is built
-/// before it replaces the one in `images/`.
+/// `presets/<preset>.toml`; `builds/`, where an image or the base image is
+/// built before it replaces the one in use; and `cache/`, with the Fedora
+/// Cloud image the base image is built from.
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
@@ -205,6 +237,10 @@ impl Store {
 
     fn builds_dir(&self) -> PathBuf {
         self.root.join("builds")
+    }
+
+    fn cache_dir(&self) -> PathBuf {
+        self.root.join("cache")
     }
 
     fn base(&self) -> PathBuf {
@@ -287,6 +323,45 @@ impl Store {
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_secs())
+    }
+
+    /// When `name` last started, by its journal.
+    fn last_started(&self, name: &str) -> Option<u64> {
+        let journal = fs::read_to_string(self.dir(name).join("journal")).ok()?;
+        journal.lines().rev().find_map(|line| {
+            serde_json::from_str::<JournalEntry>(line)
+                .ok()
+                .filter(|e| e.text.starts_with(STARTING))
+                .map(|e| e.time)
+        })
+    }
+
+    /// Makes `name` an environment of the image `image`, renamed: its record
+    /// keeps the time it was made, and its disk is pointed at the image
+    /// under the new name.
+    fn rename_image_of(&self, name: &str, image: &str) -> Result<()> {
+        let record = self.dir(name).join("image");
+        let made = fs::metadata(&record).and_then(|m| m.modified()).ok();
+        fs::write(&record, format!("{image}\n"))?;
+        if let Some(made) = made {
+            fs::File::options()
+                .write(true)
+                .open(&record)?
+                .set_modified(made)?;
+        }
+        let disk = self.disk(name);
+        if disk.exists() {
+            let status = Command::new("qemu-img")
+                .args(["rebase", "-u", "-F", "qcow2", "-b"])
+                .arg(self.image(image))
+                .arg(&disk)
+                .status()
+                .context("starting qemu-img")?;
+            if !status.success() {
+                bail!("qemu-img rebase of '{name}' failed ({status})");
+            }
+        }
+        Ok(())
     }
 
     fn image_of(&self, name: &str) -> Result<String> {
@@ -418,6 +493,10 @@ impl Store {
     fn replace_image(&self, image: &str, built: &Path) -> Result<Vec<String>> {
         fs::rename(built, self.image(image))
             .with_context(|| format!("putting the image '{image}' in place"))?;
+        // Which base image it stands on, so a newer base names it stale.
+        let base = fs::read_to_string(self.base_fingerprint_path()).unwrap_or_default();
+        fs::write(self.on_base_path(image), base)
+            .with_context(|| format!("recording the base of the image '{image}'"))?;
         let mut reset = Vec::new();
         for (name, _) in self
             .environments()
@@ -430,6 +509,60 @@ impl Store {
             }
         }
         Ok(reset)
+    }
+
+    /// Puts the built base image in place, with the fingerprint of what it
+    /// was built from beside it. Images built on the old one stand on their
+    /// own and keep working; [`Store::stale_images`] names them.
+    fn replace_base(&self, built: &Path, fingerprint: &str) -> Result<()> {
+        fs::rename(built, self.base()).context("putting the base image in place")?;
+        fs::write(self.base_fingerprint_path(), format!("{fingerprint}\n"))
+            .context("writing the base image's fingerprint")
+    }
+
+    fn base_fingerprint_path(&self) -> PathBuf {
+        self.root.join("base.fingerprint")
+    }
+
+    /// The record of the base image the image `image` was built on.
+    fn on_base_path(&self, image: &str) -> PathBuf {
+        self.images_dir().join(format!("{image}.base"))
+    }
+
+    /// The images built on another base image than the one in place, by
+    /// the fingerprints recorded at their builds; none while the base image
+    /// has no fingerprint.
+    fn stale_images(&self) -> Vec<String> {
+        let Ok(base) = fs::read_to_string(self.base_fingerprint_path()) else {
+            return Vec::new();
+        };
+        self.images()
+            .into_iter()
+            .filter(|image| {
+                fs::read_to_string(self.on_base_path(image)).ok().as_deref() != Some(base.as_str())
+            })
+            .collect()
+    }
+
+    /// The base image: when it was built, and whether it was built from
+    /// `fingerprint`.
+    fn base_image(&self, fingerprint: Option<&str>) -> Option<BaseImage> {
+        let built = fs::metadata(self.base())
+            .and_then(|m| m.modified())
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let recorded = fs::read_to_string(self.base_fingerprint_path()).ok();
+        Some(BaseImage {
+            built,
+            current: match (recorded, fingerprint) {
+                (Some(recorded), Some(fingerprint)) => recorded.trim() == fingerprint,
+                // Without the guest program to compare with, the base image
+                // is taken as it is.
+                (_, None) => true,
+                (None, Some(_)) => false,
+            },
+        })
     }
 }
 
@@ -445,6 +578,7 @@ struct Current {
 
 /// The image build in progress, if any.
 struct Building {
+    /// The preset, or [`BASE_IMAGE`] for the base image.
     preset: String,
     steps: Vec<String>,
     stop: Arc<AtomicBool>,
@@ -515,6 +649,7 @@ impl Service {
                 Environment {
                     image_ready: shared.store.image(&image).exists(),
                     created: shared.store.created(&name),
+                    last_started: shared.store.last_started(&name),
                     settings: shared.store.settings(&name, &defaults),
                     name,
                     image,
@@ -522,6 +657,52 @@ impl Service {
                 }
             })
             .collect()
+    }
+
+    /// Gives the preset `name` the name `to`: its file, its image, and the
+    /// environments made from it, whose disks are pointed at the image under
+    /// its new name.
+    fn rename_preset(&self, name: &str, to: &str) -> Result<()> {
+        let shared = self.lock();
+        if let Some(current) = &shared.current {
+            bail!(
+                "'{}' is running; sets are renamed once it stops",
+                current.name
+            );
+        }
+        if let Some(build) = &shared.build {
+            bail!(
+                "'{}' is building; sets are renamed once it ends",
+                build.preset
+            );
+        }
+        let store = shared.store.clone();
+        if store.image(to).exists() {
+            bail!("an image '{to}' exists");
+        }
+        presets::rename(&store.presets_dir(), name, to)?;
+        if store.image(name).exists() {
+            fs::rename(store.image(name), store.image(to))
+                .with_context(|| format!("renaming the image of '{name}'"))?;
+            fs::rename(store.on_base_path(name), store.on_base_path(to)).ok();
+        }
+        let users: Vec<String> = store
+            .environments()
+            .into_iter()
+            .filter(|(_, image)| image == name)
+            .map(|(environment, _)| environment)
+            .collect();
+        drop(shared);
+        for environment in &users {
+            store.rename_image_of(environment, to)?;
+            self.log(
+                environment,
+                format!("Its set of apps {name} is now called {to}"),
+            );
+        }
+        self.broadcast(&Event::PresetsChanged);
+        self.broadcast(&Event::Changed);
+        Ok(())
     }
 
     /// Starts `name` for `owner`; progress goes to `progress` and to every
@@ -572,7 +753,7 @@ impl Service {
         self.log(
             name,
             format!(
-                "Starting for {} on GPU {}, screen {}, internet {}",
+                "{STARTING} {} on GPU {}, screen {}, internet {}",
                 launch.owner.name,
                 launch.gpu,
                 launch.screen_mode,
@@ -680,11 +861,75 @@ impl Service {
         if let Some(build) = self.lock().build.as_mut() {
             build.steps.push(step.clone());
         }
+        self.build_progress(preset, step, report);
+    }
+
+    /// Tells the watchers and `report` how far the build of `preset` is,
+    /// such as `download 40%`, without recording it as a step.
+    fn build_progress(&self, preset: &str, step: String, report: &Sender<BuildUpdate>) {
         self.broadcast(&Event::Build {
             preset: preset.to_owned(),
             step: step.clone(),
         });
         report.send(BuildUpdate::Step(step)).ok();
+    }
+
+    /// Makes `name` the image build in progress and returns the flag that
+    /// stops it. Images build only while no environment runs, one at a
+    /// time.
+    fn claim_build(&self, name: &str) -> Result<Arc<AtomicBool>> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut shared = self.lock();
+        if let Some(current) = &shared.current {
+            bail!("'{}' is running; images build once it stops", current.name);
+        }
+        if let Some(build) = &shared.build {
+            bail!("the image '{}' is building", build.preset);
+        }
+        shared.build = Some(Building {
+            preset: name.to_owned(),
+            steps: Vec::new(),
+            stop: Arc::clone(&stop),
+        });
+        Ok(stop)
+    }
+
+    /// A sender for the steps the build VM of `name` reports, which pass
+    /// them on as steps of the build, and the thread that does it; the
+    /// thread ends once every sender is gone.
+    fn forward_steps(
+        &self,
+        name: &str,
+        report: &Sender<BuildUpdate>,
+    ) -> (Sender<String>, thread::JoinHandle<()>) {
+        let (steps, reached) = mpsc::channel();
+        let (service, name, report) = (self.clone(), name.to_owned(), report.clone());
+        let forwarder = thread::spawn(move || {
+            for step in reached {
+                service.build_step(&name, step, &report);
+            }
+        });
+        (steps, forwarder)
+    }
+
+    /// Ends the build of `name` with `outcome`, which the watchers and
+    /// `report` learn; another build may start then.
+    fn finish_build(&self, name: &str, outcome: Result<()>, report: &Sender<BuildUpdate>) {
+        let error = outcome.err().map(|e| format!("{e:#}"));
+        if let Some(e) = &error {
+            error!("building the image '{name}': {e}");
+        } else {
+            info!("the image '{name}' is ready");
+        }
+        self.lock().build = None;
+        self.broadcast(&Event::Changed);
+        self.broadcast(&Event::BuildFinished {
+            preset: name.to_owned(),
+            error: error.clone(),
+        });
+        report
+            .send(BuildUpdate::Finished(error.map_or(Ok(()), Err)))
+            .ok();
     }
 
     /// Starts building the image of preset `name` for `peer` on a thread of
@@ -698,36 +943,14 @@ impl Service {
         }
         let appimages = open_appimages(&preset, peer.uid)?;
         let owner = vm::Owner::from_uid(peer.uid)?;
-        let stop = Arc::new(AtomicBool::new(false));
-        {
-            let mut shared = self.lock();
-            if let Some(current) = &shared.current {
-                bail!("'{}' is running; images build once it stops", current.name);
-            }
-            if let Some(build) = &shared.build {
-                bail!("the image '{}' is building", build.preset);
-            }
-            shared.build = Some(Building {
-                preset: name.to_owned(),
-                steps: Vec::new(),
-                stop: Arc::clone(&stop),
-            });
-        }
+        let stop = self.claim_build(name)?;
         info!("building the image of preset '{name}' for {}", owner.name);
 
         let service = self.clone();
         let name = name.to_owned();
         thread::spawn(move || {
             service.build_step(&name, "prepare".into(), &report);
-            let (steps, reached) = mpsc::channel();
-            let forwarder = {
-                let (service, name, report) = (service.clone(), name.clone(), report.clone());
-                thread::spawn(move || {
-                    for step in reached {
-                        service.build_step(&name, step, &report);
-                    }
-                })
-            };
+            let (steps, forwarder) = service.forward_steps(&name, &report);
             let job = image::Job {
                 stop: &stop,
                 run_as: Some(owner.name),
@@ -745,21 +968,60 @@ impl Service {
                     format!("The image {name} is new; the next start begins from it"),
                 );
             }
-            let error = outcome.err().map(|e| format!("{e:#}"));
-            if let Some(e) = &error {
-                error!("building the image of preset '{name}': {e}");
-            } else {
-                info!("the image of preset '{name}' is ready");
-            }
-            service.lock().build = None;
-            service.broadcast(&Event::Changed);
-            service.broadcast(&Event::BuildFinished {
-                preset: name,
-                error: error.clone(),
+            service.finish_build(&name, outcome.map(drop), &report);
+        });
+        Ok(())
+    }
+
+    /// Starts building the base image for `peer` on a thread of its own:
+    /// the Fedora Cloud image of the configured release is fetched,
+    /// provisioned in a build VM and put in place of the old base image.
+    /// Its steps and its end go to `report` and to every watcher, under the
+    /// name [`BASE_IMAGE`].
+    fn start_base_build(&self, peer: Peer, report: Sender<BuildUpdate>) -> Result<()> {
+        let guest = image::guest_program(None)?;
+        let owner = vm::Owner::from_uid(peer.uid)?;
+        let (store, release, dev) = {
+            let shared = self.lock();
+            let dev = shared.config.dev_ssh_port.is_some();
+            (shared.store.clone(), shared.config.fedora_release(), dev)
+        };
+        let dev_key = dev.then(image::working_tree_dev_key).flatten();
+        let stop = self.claim_build(BASE_IMAGE)?;
+        info!(
+            "building the base image from Fedora {release} for {}",
+            owner.name
+        );
+
+        let service = self.clone();
+        thread::spawn(move || {
+            service.build_step(BASE_IMAGE, "prepare".into(), &report);
+            let mut on_download = |download: fedora::Download| match download {
+                fedora::Download::Started => {
+                    service.build_step(BASE_IMAGE, "download".into(), &report);
+                }
+                fedora::Download::Percent(percent) => {
+                    let progress = format!("download {percent}%");
+                    service.build_progress(BASE_IMAGE, progress, &report);
+                }
+            };
+            let fetched = fedora::fetch(&store.cache_dir(), release, &stop, &mut on_download);
+            let outcome = fetched.and_then(|from| {
+                let (steps, forwarder) = service.forward_steps(BASE_IMAGE, &report);
+                let job = image::Job {
+                    stop: &stop,
+                    run_as: Some(owner.name),
+                    steps: Some(steps),
+                };
+                let out = store.builds_dir().join(format!("{BASE_IMAGE}.qcow2"));
+                fs::remove_file(&out).ok();
+                let fingerprint = image::base_fingerprint(&guest);
+                let built = image::build_base_image(&from, &out, guest, dev_key.as_deref(), &job, false);
+                drop(job);
+                forwarder.join().ok();
+                built.and_then(|()| store.replace_base(&out, &fingerprint))
             });
-            report
-                .send(BuildUpdate::Finished(error.map_or(Ok(()), Err)))
-                .ok();
+            service.finish_build(BASE_IMAGE, outcome, &report);
         });
         Ok(())
     }
@@ -769,14 +1031,15 @@ impl Service {
     fn build_and_report(&self, name: &str, peer: Peer, out: &mut UnixStream) -> Result<()> {
         let (tx, rx) = mpsc::channel();
         self.start_build(name, peer, tx)?;
-        for update in rx {
-            match update {
-                BuildUpdate::Step(step) => send(out, &Reply::BuildStep { step })?,
-                BuildUpdate::Finished(Ok(())) => return Ok(()),
-                BuildUpdate::Finished(Err(reason)) => bail!(reason),
-            }
-        }
-        bail!("the build of '{name}' ended without a verdict")
+        report_build(name, &rx, out)
+    }
+
+    /// Builds the base image and reports each step to `out` until the
+    /// build ends; a failed build ends with the reason.
+    fn build_base_and_report(&self, peer: Peer, out: &mut UnixStream) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.start_base_build(peer, tx)?;
+        report_build(BASE_IMAGE, &rx, out)
     }
 
     /// Stops the running environment at once, if `peer` owns it.
@@ -929,7 +1192,8 @@ impl Service {
         Ok(())
     }
 
-    /// The requests about presets and their image builds.
+    /// The requests about presets and image builds, the base image's
+    /// included.
     fn handle_preset(&self, request: Request, peer: Peer, out: &mut UnixStream) -> Result<()> {
         match request {
             Request::Presets => {
@@ -939,8 +1203,18 @@ impl Service {
                     preset: b.preset.clone(),
                     steps: b.steps.clone(),
                 });
+                let base = shared.store.base_image(guest_fingerprint());
+                let stale = shared.store.stale_images();
                 drop(shared);
-                send(out, &Reply::Presets { presets, build })?;
+                send(
+                    out,
+                    &Reply::Presets {
+                        presets,
+                        build,
+                        base,
+                        stale,
+                    },
+                )?;
             }
             Request::SavePreset { preset } => {
                 let dir = self.lock().store.presets_dir();
@@ -956,7 +1230,15 @@ impl Service {
                 drop(shared);
                 self.broadcast(&Event::PresetsChanged);
             }
+            Request::RenamePreset { name, to } => self.rename_preset(&name, &to)?,
+            Request::PresetTemplates => send(
+                out,
+                &Reply::PresetTemplates {
+                    templates: presets::templates(),
+                },
+            )?,
             Request::BuildPreset { name } => self.build_and_report(&name, peer, out)?,
+            Request::BuildBase => self.build_base_and_report(peer, out)?,
             Request::StopBuild => {
                 let shared = self.lock();
                 let build = shared.build.as_ref().context("no image is building")?;
@@ -977,7 +1259,7 @@ impl Service {
                     .store
                     .create(&name, &image, &shared.config.settings())?;
                 drop(shared);
-                self.log(&name, format!("Created from the preset {image}"));
+                self.log(&name, format!("Created from the set of apps {image}"));
                 self.broadcast(&Event::Changed);
             }
             Request::Reset { name } => {
@@ -1069,7 +1351,10 @@ impl Service {
             request @ (Request::Presets
             | Request::SavePreset { .. }
             | Request::DeletePreset { .. }
+            | Request::RenamePreset { .. }
+            | Request::PresetTemplates
             | Request::BuildPreset { .. }
+            | Request::BuildBase
             | Request::StopBuild) => self.handle_preset(request, peer, out)?,
             Request::Watch => {
                 let (tx, rx) = mpsc::channel();
@@ -1270,6 +1555,19 @@ fn watch(events: &Receiver<Event>, out: &mut UnixStream) -> Result<()> {
     Ok(())
 }
 
+/// Sends each step of the build of `name` that `updates` brings to `out`
+/// until the build ends; a failed build ends with the reason.
+fn report_build(name: &str, updates: &Receiver<BuildUpdate>, out: &mut UnixStream) -> Result<()> {
+    for update in updates {
+        match update {
+            BuildUpdate::Step(step) => send(out, &Reply::BuildStep { step })?,
+            BuildUpdate::Finished(Ok(())) => return Ok(()),
+            BuildUpdate::Finished(Err(reason)) => bail!(reason),
+        }
+    }
+    bail!("the build of '{name}' ended without a verdict")
+}
+
 /// The process on the other end of a connection.
 #[derive(Debug, Clone, Copy)]
 struct Peer {
@@ -1343,10 +1641,12 @@ pub fn serve(root: Root) -> Result<()> {
     fs::create_dir_all(store.images_dir())?;
     fs::create_dir_all(store.environments_dir())?;
     fs::create_dir_all(store.builds_dir())?;
-    // A build the service did not live to finish leaves its partial image.
+    // A build the service did not live to finish leaves its partial image,
+    // and maybe a partial download.
     for leftover in fs::read_dir(store.builds_dir())?.flatten() {
         fs::remove_file(leftover.path()).ok();
     }
+    fedora::remove_partial(&store.cache_dir());
     presets::seed(&store.presets_dir())?;
     let socket = Path::new(SOCKET);
     fs::create_dir_all(socket.parent().context("socket path")?)?;
@@ -1402,7 +1702,11 @@ mod tests {
         let config: Config = toml::from_str("gpu = \"0000:0e:00.0\"\n").unwrap();
         assert_eq!(config.gpu.to_string(), "0000:0e:00.0");
         assert_eq!(config.screen_mode, "2560x1440@60");
+        assert_eq!(config.fedora_release(), fedora::RELEASE);
         assert!(toml::from_str::<Config>("gpu = \"0000:0e:00.0\"\nmystery = 1\n").is_err());
+        let older: Config =
+            toml::from_str("gpu = \"0000:0e:00.0\"\nfedora_release = 44\n").unwrap();
+        assert_eq!(older.fedora_release(), 44);
     }
 
     #[test]
@@ -1415,8 +1719,25 @@ mod tests {
             internet: false,
             memory_mib: 4096,
             cpus: 2,
+            fedora_release: Some(44),
             dev_ssh_port: Some(2222),
         };
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), config);
+        // A release left to the default stays out of the file, so it moves
+        // with the provisioning script.
+        let plain = Config {
+            fedora_release: None,
+            dev_ssh_port: None,
+            ..config.clone()
+        };
+        plain.save(&path).unwrap();
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("fedora_release")
+        );
+        assert_eq!(Config::load(&path).unwrap(), plain);
         config.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), config);
         assert_eq!(
@@ -1607,6 +1928,23 @@ mod tests {
         ))
         .unwrap();
         assert!(open_appimages(&directory, 0).is_err());
+    }
+
+    #[test]
+    fn a_new_base_image_takes_the_place_of_the_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        fs::create_dir_all(store.builds_dir()).unwrap();
+        fs::write(store.base(), "old").unwrap();
+        let built = store.builds_dir().join("base.qcow2");
+        fs::write(&built, "new").unwrap();
+        store.replace_base(&built, "abc").unwrap();
+        assert_eq!(fs::read_to_string(store.base()).unwrap(), "new");
+        assert!(!built.exists());
+        assert!(store.replace_base(&built, "abc").is_err());
+        assert_eq!(fs::read_to_string(store.base()).unwrap(), "new");
+        assert!(store.base_image(Some("abc")).unwrap().current);
+        assert!(!store.base_image(Some("other")).unwrap().current);
     }
 
     #[test]

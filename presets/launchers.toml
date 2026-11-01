@@ -1,6 +1,6 @@
-# Game launchers and the tools around them. Everything runs as `guest` except
-# Discord, which runs as `sandbox` so it stays out of reach of what the
-# launchers start.
+# Game launchers and the tools around them, with a browser for the sign-ins
+# and links they open. Everything runs as `guest` except Discord, which runs
+# as `sandbox` so it stays out of reach of what the launchers start.
 name = "launchers"
 
 [[app]]
@@ -32,8 +32,8 @@ name = "Faugus Launcher"
 flatpak = "io.github.Faugus.faugus-launcher"
 
 [[app]]
-name = "Epic Games Launcher"
-appimage = "/home/sovhut/AppImages/epic_games_launcher.appimage"
+name = "Firefox"
+flatpak = "org.mozilla.firefox"
 
 [[app]]
 name = "Discord"

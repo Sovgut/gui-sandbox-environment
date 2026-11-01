@@ -14,7 +14,8 @@
 //! the presets images are built from, [`Request::SavePreset`] and
 //! [`Request::DeletePreset`] change them, and [`Request::BuildPreset`]
 //! builds a preset's image, sending [`Reply::BuildStep`] lines as the build
-//! goes.
+//! goes. [`Request::BuildBase`] builds the base image those images are
+//! built on the same way, under the name [`BASE_IMAGE`].
 
 use std::fmt;
 use std::io::{self, BufRead, Write};
@@ -29,7 +30,12 @@ pub const SOCKET: &str = "/run/gse/service.sock";
 /// The protocol's version: a client and a service speak to each other only
 /// when theirs match ([`Request::Hello`]). It changes with every change to
 /// the messages.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
+
+/// The name a build of the base image goes by wherever a preset's name
+/// would stand: in [`Event::Build`], [`Event::BuildFinished`] and
+/// [`Build`]. No preset may take it.
+pub const BASE_IMAGE: &str = "base";
 
 /// The longest line either side accepts; anything longer ends the
 /// connection.
@@ -140,6 +146,14 @@ pub enum Request {
     DeletePreset {
         name: String,
     },
+    /// The presets the service ships with, to start new presets from.
+    PresetTemplates,
+    /// Give the preset `name` the name `to`, with its image and every
+    /// environment made from it. Nothing may be running or building.
+    RenamePreset {
+        name: String,
+        to: String,
+    },
     /// Build the image `images/<name>` from the base image and the preset
     /// `name`, replacing the old image once the build succeeds; the build's
     /// steps follow until it ends. Environments created from the old image
@@ -147,6 +161,16 @@ pub enum Request {
     BuildPreset {
         name: String,
     },
+    /// Build the base image every preset image is built on, replacing the
+    /// old one once the build succeeds; the build's steps follow until it
+    /// ends. The service fetches the Fedora Cloud image of the release its
+    /// settings name (`fedora_release`, by default the one the base image's
+    /// provisioning script is made for) and checks it against Fedora's
+    /// checksum, reporting `download` and then `download <percent>%` while
+    /// it downloads; a verified copy from an earlier build is used without
+    /// a download. The build goes by the name [`BASE_IMAGE`]. Images built
+    /// on the old base image keep working. Nothing may be running.
+    BuildBase,
     /// Stop the image build in progress; the old image stays.
     StopBuild,
 }
@@ -198,9 +222,20 @@ pub enum Reply {
     Presets {
         presets: Vec<Preset>,
         build: Option<Build>,
+        /// The base image every preset image is built on; absent while
+        /// there is none.
+        #[serde(default)]
+        base: Option<BaseImage>,
+        /// The presets whose images were built on an older base image.
+        #[serde(default)]
+        stale: Vec<String>,
     },
-    /// The image build reached `step`, a name its provisioning script
-    /// reports.
+    PresetTemplates {
+        templates: Vec<Preset>,
+    },
+    /// The image build reached `step`: `prepare` as it begins, then the
+    /// names its provisioning script reports, and `flatten` once the build
+    /// VM passed. A base image build reports its download before those.
     BuildStep {
         step: String,
     },
@@ -224,6 +259,10 @@ pub struct Environment {
     /// When it was created, in seconds since the Unix epoch.
     #[serde(default)]
     pub created: u64,
+    /// When it last started, in seconds since the Unix epoch; never when
+    /// absent.
+    #[serde(default)]
+    pub last_started: Option<u64>,
     /// What it gets at its next start.
     pub settings: Settings,
     /// Present while this environment runs.
@@ -284,13 +323,15 @@ pub enum Event {
     SettingsChanged,
     /// The set of presets or one of them changed.
     PresetsChanged,
-    /// The image build of `preset` reached `step`.
+    /// The image build of `preset`, or of the base image when that is
+    /// [`BASE_IMAGE`], reached `step` (see [`Reply::BuildStep`]).
     Build {
         preset: String,
         step: String,
     },
-    /// The image build of `preset` ended; `error` says why when it did not
-    /// produce an image.
+    /// The image build of `preset`, or of the base image when that is
+    /// [`BASE_IMAGE`], ended; `error` says why when it did not produce an
+    /// image.
     BuildFinished {
         preset: String,
         error: Option<String>,
@@ -459,11 +500,24 @@ pub enum AppSource {
     Appimage { path: PathBuf },
 }
 
+/// The base image, as the service sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaseImage {
+    /// When it was built, in seconds since the Unix epoch.
+    pub built: u64,
+    /// Whether it holds the guest program and provisioning of this service;
+    /// an older one lacks what the service now puts into images, and the
+    /// preset images built on it lack it too.
+    pub current: bool,
+}
+
 /// An image build in progress.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Build {
+    /// The preset, or [`BASE_IMAGE`] for the base image.
     pub preset: String,
-    /// The steps reported so far, oldest first.
+    /// The steps reported so far, oldest first; how far a download has
+    /// come (`download <percent>%`) is not kept.
     pub steps: Vec<String>,
 }
 
@@ -724,6 +778,75 @@ mod tests {
     }
 
     #[test]
+    fn the_base_image_state_round_trips() {
+        let reply = Reply::Presets {
+            presets: Vec::new(),
+            build: None,
+            base: Some(BaseImage {
+                built: 1,
+                current: false,
+            }),
+            stale: vec!["launchers".into()],
+        };
+        let mut wire = Vec::new();
+        send(&mut wire, &reply).unwrap();
+        assert_eq!(receive::<Reply>(&mut wire.as_slice()).unwrap(), Some(reply));
+        // A service without the field answers without it.
+        let old = b"{\"reply\":\"presets\",\"presets\":[],\"build\":null}\n";
+        assert!(matches!(
+            receive::<Reply>(&mut old.as_slice()).unwrap(),
+            Some(Reply::Presets { base: None, .. })
+        ));
+    }
+
+    #[test]
+    fn every_request_round_trips() {
+        for request in [
+            Request::Processes { name: "x".into() },
+            Request::EndProcess {
+                name: "x".into(),
+                pid: 7,
+                force: true,
+            },
+            Request::SendFiles {
+                name: "x".into(),
+                paths: vec!["/home/me/save.dat".into()],
+            },
+            Request::TakeFiles { name: "x".into() },
+            Request::Rename {
+                name: "x".into(),
+                to: "y".into(),
+            },
+            Request::Journal { name: "x".into() },
+            Request::SetEnvironmentSettings {
+                name: "x".into(),
+                settings: Settings {
+                    gpu: "0000:0e:00.0".into(),
+                    screen_mode: "1920x1080@60".into(),
+                    internet: true,
+                },
+            },
+            Request::Presets,
+            Request::PresetTemplates,
+            Request::DeletePreset { name: "x".into() },
+            Request::RenamePreset {
+                name: "x".into(),
+                to: "y".into(),
+            },
+            Request::BuildPreset { name: "x".into() },
+            Request::BuildBase,
+            Request::StopBuild,
+        ] {
+            let mut wire = Vec::new();
+            send(&mut wire, &request).unwrap();
+            assert_eq!(
+                receive::<Request>(&mut wire.as_slice()).unwrap(),
+                Some(request)
+            );
+        }
+    }
+
+    #[test]
     fn presets_round_trip() {
         let preset = Preset {
             name: "launchers".into(),
@@ -781,51 +904,35 @@ mod tests {
                 preset: "launchers".into(),
                 steps: vec!["packages".into()],
             }),
+            base: None,
+            stale: Vec::new(),
         };
         send(&mut wire, &reply).unwrap();
         assert!(wire.starts_with(b"{\"reply\":\"presets\","));
         assert_eq!(receive::<Reply>(&mut wire.as_slice()).unwrap(), Some(reply));
-
-        for request in [
-            Request::Processes { name: "x".into() },
-            Request::EndProcess {
-                name: "x".into(),
-                pid: 7,
-                force: true,
-            },
-            Request::SendFiles {
-                name: "x".into(),
-                paths: vec!["/home/me/save.dat".into()],
-            },
-            Request::TakeFiles { name: "x".into() },
-            Request::Rename {
-                name: "x".into(),
-                to: "y".into(),
-            },
-            Request::Journal { name: "x".into() },
-            Request::SetEnvironmentSettings {
-                name: "x".into(),
-                settings: Settings {
-                    gpu: "0000:0e:00.0".into(),
-                    screen_mode: "1920x1080@60".into(),
-                    internet: true,
-                },
-            },
-            Request::Presets,
-            Request::DeletePreset { name: "x".into() },
-            Request::BuildPreset { name: "x".into() },
-            Request::StopBuild,
-        ] {
-            let mut wire = Vec::new();
-            send(&mut wire, &request).unwrap();
-            assert_eq!(
-                receive::<Request>(&mut wire.as_slice()).unwrap(),
-                Some(request)
-            );
-        }
         let mut wire = Vec::new();
         send(&mut wire, &Request::BuildPreset { name: "x".into() }).unwrap();
         assert_eq!(wire, b"{\"request\":\"build-preset\",\"name\":\"x\"}\n");
+    }
+
+    #[test]
+    fn the_base_image_build_reports_under_its_own_name() {
+        let mut wire = Vec::new();
+        send(&mut wire, &Request::BuildBase).unwrap();
+        assert_eq!(wire, b"{\"request\":\"build-base\"}\n");
+        // The name would pass for a preset's; the service refuses presets
+        // of that name.
+        assert!(valid_name(BASE_IMAGE));
+        let event = Event::BuildFinished {
+            preset: BASE_IMAGE.into(),
+            error: None,
+        };
+        let mut wire = Vec::new();
+        send(&mut wire, &Reply::Event { event }).unwrap();
+        assert_eq!(
+            wire,
+            b"{\"reply\":\"event\",\"event\":{\"event\":\"build-finished\",\"preset\":\"base\",\"error\":null}}\n"
+        );
     }
 
     #[test]

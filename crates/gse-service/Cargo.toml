@@ -20,6 +20,7 @@ serde_json.workspace = true
 base64 = "0.22"
 sha2 = "0.10"
 toml.workspace = true
+ureq = "2"
 
 [dev-dependencies]
 tempfile.workspace = true

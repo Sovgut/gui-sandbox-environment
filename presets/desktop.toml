@@ -1,0 +1,7 @@
+# Just the desktop, its file manager and a browser: for one program brought
+# in through the Inbox. Everything runs as `guest`.
+name = "desktop"
+
+[[app]]
+name = "Firefox"
+flatpak = "org.mozilla.firefox"

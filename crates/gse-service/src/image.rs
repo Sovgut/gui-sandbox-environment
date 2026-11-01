@@ -91,19 +91,97 @@ pub fn build_base(args: &BuildBaseArgs, stop: &AtomicBool, dry_run: bool) -> Res
         .as_ref()
         .map(|p| fs::read_to_string(p).with_context(|| format!("key {}", p.display())))
         .transpose()?;
-    let guest_bin = match &args.guest_bin {
-        Some(path) => path.clone(),
-        None => std::env::current_exe()?.with_file_name(GUEST_BIN),
-    };
-    let guest =
-        fs::read(&guest_bin).with_context(|| format!("guest binary {}", guest_bin.display()))?;
-    let user_data = seed::cloud_config(seed::BASE_PROVISION, key.as_deref());
-    build(
+    let guest = guest_program(args.guest_bin.as_deref())?;
+    build_base_image(
         &args.from,
         &args.out,
+        guest,
+        key.as_deref(),
+        &Job::invoked(stop),
+        dry_run,
+    )
+}
+
+/// The `gse-guest` program a base image gets: the file at `path`, by
+/// default the one next to this program (see [`working_tree_guest`] for a
+/// development build).
+pub fn guest_program(path: Option<&Path>) -> Result<Vec<u8>> {
+    let path = if let Some(path) = path {
+        path.to_owned()
+    } else {
+        let beside = std::env::current_exe()?.with_file_name(GUEST_BIN);
+        if beside.exists() {
+            beside
+        } else {
+            working_tree_guest().unwrap_or(beside)
+        }
+    };
+    fs::read(&path).with_context(|| format!("guest binary {}", path.display()))
+}
+
+/// A development build of the service, run from a copy outside the working
+/// tree, takes the guest program from the tree it was built in: the
+/// release build, else the debug one. A release build of the service never
+/// looks there.
+fn working_tree_guest() -> Option<std::path::PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+    ["release", "debug"]
+        .iter()
+        .map(|profile| target.join(profile).join(GUEST_BIN))
+        .find(|path| path.exists())
+}
+
+/// The public key a development build of the service puts into the base
+/// images it builds when the machine forwards a dev SSH port: the one the
+/// working tree keeps for its test VM. A release build never looks there.
+pub fn working_tree_dev_key() -> Option<String> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let key = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.working/vm/proto/id_ed25519.pub");
+    fs::read_to_string(key).ok()
+}
+
+/// What makes a base image what it is: the guest program `guest` and the
+/// provisioning script, as a short hex digest. A base image built from
+/// another pair lacks what this service puts into images.
+pub fn base_fingerprint(guest: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(guest);
+    hasher.update(seed::BASE_PROVISION.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .take(16)
+        .fold(String::new(), |mut hex, b| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+            hex
+        })
+}
+
+/// Builds the base image `out` from the Fedora Cloud image `from`, with
+/// `guest` as the guest-side program. With `dev_ssh_key`, the image keeps
+/// SSH and a `dev` account with that key.
+pub fn build_base_image(
+    from: &Path,
+    out: &Path,
+    guest: Vec<u8>,
+    dev_ssh_key: Option<&str>,
+    job: &Job<'_>,
+    dry_run: bool,
+) -> Result<()> {
+    let user_data = seed::cloud_config(seed::BASE_PROVISION, dev_ssh_key);
+    build(
+        from,
+        out,
         &user_data,
         &[(GUEST_BIN.to_owned(), guest)],
-        &Job::invoked(stop),
+        job,
         dry_run,
     )
 }
@@ -259,13 +337,7 @@ fn build(
             work.display()
         );
     }
-    info!("flattening into {}", out.display());
-    run(
-        "qemu-img",
-        &["convert", "-c", "-O", "qcow2"],
-        &[&overlay, &out],
-        &[],
-    )?;
+    flatten(&overlay, &out, &work, job.stop)?;
     give_to_invoking_user(&out);
     fs::remove_dir_all(&work)?;
     info!("{} is ready", out.display());
@@ -290,6 +362,49 @@ fn run(program: &str, before: &[&str], paths: &[&Path], after: &[&str]) -> Resul
         bail!("{program} failed ({status})");
     }
     Ok(())
+}
+
+/// Flattens the built `overlay` into the image `out`; a stop ends it and
+/// leaves no image, the build's files kept in `work`.
+fn flatten(overlay: &Path, out: &Path, work: &Path, stop: &AtomicBool) -> Result<()> {
+    info!("flattening into {}", out.display());
+    let flattened = run_stoppable(
+        "qemu-img",
+        &["convert", "-c", "-O", "qcow2"],
+        &[overlay, out],
+        stop,
+    );
+    if stop.load(Ordering::SeqCst) {
+        fs::remove_file(out).ok();
+        bail!(
+            "the build was stopped; its files are kept in {}",
+            work.display()
+        );
+    }
+    flattened
+}
+
+/// Runs `program` like [`run`], killing it when `stop` is set.
+fn run_stoppable(program: &str, before: &[&str], paths: &[&Path], stop: &AtomicBool) -> Result<()> {
+    let mut child = Command::new(program)
+        .args(before)
+        .args(paths)
+        .spawn()
+        .with_context(|| format!("starting {program}"))?;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                bail!("{program} failed ({status})");
+            }
+            return Ok(());
+        }
+        if stop.load(Ordering::SeqCst) {
+            child.kill().ok();
+            child.wait().ok();
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 fn now() -> u64 {

@@ -190,7 +190,9 @@ look into an environment without the app.
 - DNS goes to public resolvers (1.1.1.1, 9.9.9.9), never to the host's
   resolver on loopback.
 - The internet toggle is one drop rule, applied live
-  (`gse-service net internet on|off`).
+  (`gse-service net internet on|off`). Whether a sandbox reaches the
+  internet is one of its settings: it starts that way, and a change to a
+  running sandbox applies at once.
 - passt's socket lives in `/tmp/gse-net`, a root directory with mode
   0700: SELinux lets `passt_t` create sockets in `tmp_t` but not in `/run`,
   and passt binds it as root before dropping privileges, without
@@ -300,14 +302,31 @@ voice activation does.
 
 ## Presets and reset
 
-- A preset is a TOML file listing applications (`presets/launchers.toml`,
-  format in `crates/gse-host/src/preset.rs`). Each comes from exactly one
+- A preset is a TOML file listing applications (format in
+  `crates/gse-host/src/preset.rs`). Each comes from exactly one
   source: Fedora/RPM Fusion packages (`dnf`, with a `command`), a Flathub ID
   (`flatpak`) or a local AppImage (`appimage`). Applications run as `guest`
   unless marked `trusted`, which makes them run as `sandbox`.
+- The service keeps the presets in `/var/lib/gse/presets/<name>.toml` and
+  puts the built-in `launchers` preset (`presets/launchers.toml`) there when
+  the directory is empty. The Presets part of the app's settings lists them
+  with their applications, sources and trusted marks and whether an image
+  built from each exists, and creates, edits, deletes and builds them; presets
+  are edited nowhere else. The service checks
+  every name, package, Flathub ID, desktop file and command it is sent before
+  writing a preset, since they end up in a script that runs as root in the
+  build VM.
 - Each preset is built into a read-only golden image on top of the base image
   in a temporary VM without a GPU, before any untrusted code runs
-  (`gse-service image build-preset`). The base image keeps cloud-init
+  (`gse-service image build-preset`, or the service at the app's request).
+  The service builds from `/var/lib/gse/base.qcow2` in `/var/lib/gse/builds`
+  and moves the result to `/var/lib/gse/images/<preset>.qcow2` only once the
+  build passes; it reports each provisioning step to the app as it reaches
+  the console, can stop a build, and builds only while no environment runs.
+  An overlay cannot outlive a change of the image under it, so a rebuilt
+  image resets the environments created from it; the app asks first. The
+  service reads a preset's AppImages as root, and only those the user who
+  asked for the build could read. The base image keeps cloud-init
   with only the NoCloud datasource: an environment boots without a seed volume and
   cloud-init stays idle, a preset build attaches one carrying the generated
   script and the AppImages. Building does not require switching away from the
@@ -320,9 +339,12 @@ voice activation does.
   `~/.local/share/applications`, overriding the package's own entry: `guest`
   applications start through `gse-guest run` and carry "(guest)" in their
   name, so clicking one never starts it as `sandbox`.
-- An environment is a qcow2 overlay on its preset's golden image. **Reset deletes the
+- An environment is a qcow2 overlay on its preset's golden image. It can be
+  created before that image exists, while it builds or before it was ever
+  built; it then waits, the app says why, and it starts once the image is
+  there. The overlay is made at its first start. **Reset deletes the
   overlay**: everything, including Discord login and downloaded games, is gone,
-  and the preset's software is there again in seconds.
+  and the next start begins from the preset's image again.
 - A golden image ages; the app offers a rebuild with updates and reminds when an
   image is older than about two weeks.
 - The base layer of every preset (NVIDIA driver, session, users, SELinux, audio
@@ -336,66 +358,208 @@ libraries). Data lives in `~/.local/share/com.epicgames.eglv2` and
 GE-Proton from GitHub and checks its SHA-512; `EGL_PROTON_PIN` overrides the
 version. A preset installs it as an `appimage` entry.
 
-## File bridge
+## Guest agent and file bridge
 
-- Transport is **AF_VSOCK**, not TCP/IP: the guest has no IP route to the host,
-  and vsock exposes exactly one port with no access to the host network stack.
-- **The host always initiates**; the guest agent only answers.
-- The agent runs as `guest` and only sees `~/Inbox` and `~/Outbox` of `guest`.
-- Inbound: files queued in the app before start are pushed into `~/Inbox` after
-  boot.
-- Outbound: on a normal shutdown the host pulls `~/Outbox` before power-off.
-  After an emergency exit, a disposable extractor VM (no network, no GPU, environment
-  disk read-only) pulls `~/Outbox` from the stopped disk. The host never mounts
-  an environment filesystem itself.
-- Protocol: length-prefixed frames with hard caps on frame size, file count and
-  total size, per-step timeouts, version handshake; `List`, `Pull`, `Push`
-  with a SHA-256 per file. Paths are relative to `Inbox`/`Outbox` only.
+- The host talks to an agent inside the environment over one
+  **virtio-serial port** (`io.github.sovgut.gse.agent`), not TCP/IP: the
+  guest has no IP route to the host, the port reaches nothing but the
+  service, and it needs no host kernel module or address the way vsock
+  does. QEMU serves the host end on a socket only root reaches
+  (`/run/gse/<name>.agent`).
+- **The host always initiates**; the agent only answers. The protocol is
+  JSON lines (`gse_protocol::agent`): every call carries an id its answers
+  repeat, lines are capped, a file travels in base64 chunks of 32 KiB with
+  its size and SHA-256, and listings and files have hard limits.
+- The agent runs as **root** (`gse-agent.service`), since the port's device
+  node belongs to root: a program of `guest` cannot open it and pose as the
+  agent. It lists the processes of `guest` by the unit that started them
+  (each menu entry starts a transient unit titled after the program), asks
+  one to quit or kills it (through a pidfd, after checking its owner), or
+  kills a program with everything it started (through its cgroup).
+- Files go into `~/Inbox` and come out of `~/Outbox` of `guest`. `guest` owns
+  both folders and can swap anything in them at any moment, so every path
+  below them is opened with `openat2` refusing symbolic links and leaving
+  the folder, new files and folders are handed to `guest`, an existing name
+  gets a number instead of being replaced, and a file only leaves when it
+  is a regular file with a single link that `guest` owns.
+- The sandbox's desktop has **Inbox** and **Outbox** shortcuts. `sandbox`
+  cannot look into `guest`'s home, so they open a file manager as `guest`,
+  where files of `guest`'s programs can be moved into the Outbox.
+- Inbound: files and folders of the host, chosen in the app, which the
+  service reads only when the user asking could read them; they arrive as
+  they are, a folder with what it holds. They are not packed into an
+  archive: unpacking one would be the agent's work, as root, on data from
+  outside.
+- Outbound: the Outbox comes out file by file past the checks below. The
+  service hands a file to the app only once its start passed, and the app,
+  as the user, puts what came whole into one zip archive in the received
+  files folder (`~/GSE` unless app settings name another). The host never
+  mounts an environment's filesystem.
 - The host treats every byte from the agent as hostile, since malware can
-  replace the agent in the overlay. Receiving runs in a separate process under
-  bubblewrap and seccomp, without network, into a `noexec` quarantine.
+  replace the agent in the overlay. Still to come: receiving in a separate
+  process under bubblewrap and seccomp, ClamAV, per-game allowlists, and
+  an extractor VM (no network, no GPU, the disk read-only) that empties the
+  Outbox of an environment that was stopped in an emergency.
 
 ### Checks on outbound files
 
-Saves only travel environment -> vault -> new environment and are never opened on the host.
-The checks exist so that a reset really cleans: malware dropped into a save
-folder must not ride into the next environment.
+Outbound files are mostly saves on their way to the next environment. The
+checks exist so that a reset really cleans: malware dropped into a save
+folder must not ride into the next environment or onto the host.
 
 1. Paths: no `..`, absolute paths, symlinks, hardlinks or device files.
-2. Limits: size, file count, depth.
-3. Type by content: executables (PE, ELF, scripts, `.lnk`, `.desktop`),
-   macro documents and nested archives are rejected.
-4. Per-game allowlist of paths and formats from the preset.
-5. ClamAV with signatures refreshed before the scan.
+2. Limits: 4 GiB a file, 8 GiB and 1000 files a take, 16 levels deep.
+3. Type by content and name: programs (ELF, PE), scripts, Windows and
+   desktop shortcuts, Office documents and installers that can carry
+   macros, and archives are refused (`crates/gse-service/src/checks.rs`).
+4. To come: a per-game allowlist of paths and formats from the preset.
+5. To come: ClamAV with signatures refreshed before the scan.
 
-Accepted files are stored as one archive per export in a vault outside `$HOME`,
-mounted `noexec`, so file managers and indexers have nothing to parse. A report
-lists what passed and what was rejected and why.
+What passes lands in one zip archive per take, which the app never opens;
+the app shows what passed and what was refused and why.
 
 ## Components
 
 1. **gse-service** (Rust, root, systemd): VM lifecycle, GPU driver
    switching, nftables, emergency hotkey, check that nothing holds the GPU
    before a switch, file bridge host side, image builds.
-2. **gse** (Rust, gpui, AppImage): environment list, start/stop/reset, the environment
-   screen (a window with "Full screen", or "Enter" on one GPU), presets
-   editor, file queue, internet toggle, background apps list, transfer reports.
-   Talks to the service over a local socket guarded by polkit. Every long
-   operation reports its progress to the app as it goes: an image build its
-   provisioning steps (the `=== <step>` lines and the `GSE-BUILD` verdict on
-   the build VM's serial console), an environment start the GPU switch, the
-   boot and the `GSE-READY` line, so the app shows where the preparation is
-   instead of a bare wait.
+2. **gse** (Rust, gpui, AppImage): the app, described under "The app". It
+   talks to the service over a local socket guarded by polkit.
 3. **Host background layer**: xpra, GPU-less launch wrappers, PipeWire with
    lingering.
-4. **Guest image recipe** and **guest agent** (Rust, vsock).
-5. **One-time installer**: service, polkit rule, IOMMU kernel parameters,
-   QEMU/libvirt, OVMF, ClamAV. An AppImage alone cannot do this part.
+4. **Guest image recipe** and **guest agent** (Rust, virtio-serial).
+5. **Setup from the app**: gse ships as one AppImage carrying the app,
+   `gse-service`, the systemd unit, the polkit action, the sysusers entry and
+   the default settings. No step needs a terminal:
+   - On first start the app sees that the machine is not prepared and shows
+     what will be installed and why. One polkit prompt runs the bundled
+     `gse-service install`, which puts the service under `/usr/local` (on
+     Fedora Atomic systems such as Bazzite `/usr` is read-only and
+     `/usr/local` is the writable `/var/usrlocal`) and its settings under
+     `/etc/gse`, creates `gse-net`, enables the service, checks IOMMU and
+     VFIO, and reports each step to the app.
+   - A newer AppImage finds an older installed service through the
+     protocol handshake and updates it the same way.
+   - App settings, General, has "Remove everything": it runs
+     `gse-service uninstall` through polkit, which stops any environment,
+     the service, and removes its unit, the polkit action, `gse-net`,
+     `/etc/gse`, `/var/lib/gse` (images and environments), the nftables
+     table, the state and sockets and the service's program; the app then
+     deletes its own settings and, if asked, the received files folder,
+     and closes. Nothing of gse stays on the system but the AppImage file.
+     Still to come: removing any kernel parameter setup that install
+     added.
+   The development machine runs the same unit with a drop-in
+   (`scripts/dev/systemd/`) that starts the working tree's build.
+
+## The app
+
+The app calls environments sandboxes. One window:
+
+- **Left**: a search over the sandboxes' names and presets with a button
+  beside it that steps the order through newest first, by name and by
+  preset (names with numbers in natural order); the sandboxes with their
+  state (stopped, a start's stage, running, waiting for their image);
+  "Add sandbox" and the gear of app settings.
+- Actions that need no words are icons with a tooltip: settings, enter
+  (play), stop, reset, delete, the file moves.
+- **Right**, for the selected sandbox: its name and state; "Sandbox
+  settings" and "Enter", which starts it and opens its screen (a window
+  with "Full screen" when another GPU drives the desktop; on one GPU the
+  monitor switches to it), and Stop while it runs; the steps of a
+  start as a line (prepare, switch the GPU, boot, desktop), done steps
+  solid, the current one pulsing, the rest dashed; why it cannot start,
+  when that is so; and its journal. The journal's filter is a regular
+  expression over each line with its date and time, and `@` words keep a
+  time or a span of it (`@14:05`, `@14:00..14:30`, `@2026-11-01`).
+- **Add sandbox** opens a dialog with a preset already picked (one with a
+  ready image first): pick another (ready, building or not built; a long
+  list scrolls), name the sandbox (a name is suggested), or go to the
+  presets editor with "Create preset". With no preset at all it opens the
+  presets editor straight away.
+- **Sandbox settings** is a dialog with that sandbox's own settings: its
+  name (while it is stopped); the GPU, picked from the host's GPUs with their driver, monitor and switch
+  mode; the screen's resolution and frame rate (on a GPU that drives the
+  monitor, the monitor's own); and the internet. The GPU and the screen
+  apply from the next start, the internet at once. Reset and Delete are
+  there too, each asking a second time.
+- The **files** button beside it, while the sandbox runs, opens a dialog
+  with the Outbox and the Inbox: "Take files" puts what passes the checks
+  into a zip archive in the received files folder, "Choose files" and
+  "Choose a folder" send files of this computer in (see "Guest agent and
+  file bridge").
+- While a sandbox runs, its pane lists the programs of `guest` by the menu
+  entry that started them in a table with its memory and CPU time,
+  refreshed every few seconds; each process can be asked to quit or
+  killed, and a program killed with everything it started, without a
+  restart.
+- A click on a journal line copies it; a button beside the filter copies
+  every line the filter keeps.
+- **App settings** hold the presets editor; the settings new sandboxes
+  start with (`/etc/gse/gse.toml`); and, under General, the received files
+  folder (kept per user in `~/.config/gse/app.toml`) and "Remove
+  everything". Each sandbox keeps a copy of the start settings of its own
+  in `/var/lib/gse/environments/<name>/settings.toml`. The app keeps its
+  own Vulkan drawing off every GPU these settings name and picks those
+  GPUs when it starts, so a new one needs an app restart, which the app
+  offers.
+- Every long operation reports its progress as it goes: an image build
+  its provisioning steps (the `=== <step>` lines and the `GSE-BUILD`
+  verdict on the build VM's serial console), a start the GPU switch, the
+  boot and the `GSE-READY` line, so the app shows where it is instead of a
+  bare wait.
+- The **journal** of a sandbox is kept by the service in
+  `/var/lib/gse/environments/<name>/journal`: its creation, starts with
+  their settings, each stage, settings and internet changes, stops and
+  why, resets and new images. Lines from the guest agent will be marked
+  as the guest's, since malware can write them.
+
+### What outlives the window
+
+The service runs sandboxes and builds, not the app, so closing the window
+stops neither.
+
+- Closing the window while a sandbox runs asks: stop it and close, keep it
+  running, or cancel. A kept sandbox goes on holding its GPU, sound and
+  network; the app shows it as running when it opens again.
+- An image build goes on without the window. The app shows its steps so
+  far when it opens again, from the service's record of the build.
+- A restart of the service (the app offers one when its protocol is older)
+  stops a running sandbox and an image build first. A build the service
+  did not live to finish leaves nothing behind: the service clears
+  `/var/lib/gse/builds` when it starts, and the preset is shown as not
+  built.
+- A host shutdown stops the service, which kills QEMU like any stop.
+- Still to come: stopping a user's sandbox when their session ends (its
+  sound goes to that session), and releasing keys the guest still holds
+  pressed when the app goes away without letting them go.
+
+## Releases and updates
+
+- A release is a GitHub release of the project, made by the workflow
+  `.github/workflows/release.yml` when a tag `v<version>` matching the
+  workspace version is pushed. It builds the AppImage
+  (`scripts/release/build-appimage.sh`: the app, the service, the guest
+  binary the service puts into images, and the files setup installs) on
+  Ubuntu 24.04, so it runs on any newer glibc.
+- The workflow signs the AppImage with an ed25519 key, the secret
+  `GSE_SIGNING_KEY`, and attaches `gse-x86_64.AppImage` and its raw
+  signature `gse-x86_64.AppImage.sig`. The private key lives only there and
+  with its owner; the app holds the public half.
+- While the app runs as an AppImage it looks for a newer release when it
+  starts and every six hours, and says so above the sandbox. "Install and
+  restart" downloads it, checks the signature, replaces the AppImage file
+  and starts the new one; an update that does not check out is never
+  installed, since the AppImage carries the service that runs as root. A
+  running sandbox keeps running. App settings, General, show the version
+  and look on demand.
+- Still to come: the new AppImage updating the installed service it
+  carries, through the install it runs on first start.
 
 ## Open questions
 
-- How the one-time installer gets QEMU, OVMF, ClamAV and the service onto
-  Bazzite: layered packages, a system extension, or a container.
+- How setup gets QEMU, OVMF, passt and ClamAV onto Bazzite: inside the
+  AppImage, as layered packages (which need a reboot), or a container.
 
 - A game library disk that survives reset (per environment, off by default) or full
   re-download after each reset.

@@ -110,6 +110,7 @@ install -d -o jail -g jail /home/jail/.config /home/jail/.config/systemd \
 cat > /home/jail/.config/environment.d/gamejail.conf <<'EOF'
 WAYLAND_DISPLAY=/run/gamejail/display/wayland-0
 DISPLAY=:1
+PULSE_SERVER=unix:/run/gamejail/display/pulse
 EOF
 cat > "$units/gamejail-xwayland.service" <<'EOF'
 [Unit]
@@ -137,6 +138,30 @@ EOF
 ln -s ../gamejail-xwayland.service ../gamejail-launch.service "$units/default.target.wants/"
 chown -R jail:jail /home/jail/.config
 
+# Sound for `jail` comes from the desktop's sound server through a second
+# PulseAudio socket beside the display. Its clients are "restricted", which
+# WirePlumber turns into read-only access, and they may not record (no
+# microphone, no monitor of what others play) or change any volume. `jail`
+# has no other way to PipeWire.
+mkdir -p /etc/pipewire/pipewire-pulse.conf.d
+cat > /etc/pipewire/pipewire-pulse.conf.d/gamejail.conf <<'EOF'
+pulse.properties = {
+    server.address = [
+        "unix:native"
+        { address = "unix:/run/gamejail/display/pulse" client.access = "restricted" }
+    ]
+}
+
+pulse.rules = [
+    {
+        matches = [ { pipewire.client.access = "restricted" } ]
+        actions = {
+            quirks = [ block-record-stream block-source-volume block-sink-volume ]
+        }
+    }
+]
+EOF
+
 # The desktop opens the restricted display and the launch relay when
 # `friend` logs in.
 install -d -o friend -g friend /home/friend/.config/autostart
@@ -149,7 +174,7 @@ EOF
 chown friend:friend /home/friend/.config/autostart/gamejail-desktop.desktop
 
 if [ "${GAMEJAIL_DEV:-0}" = 1 ]; then
-    dnf -y install grim wl-clipboard wayland-utils xdpyinfo
+    dnf -y install grim wl-clipboard wayland-utils xdpyinfo pulseaudio-utils
 fi
 
 step "flatpak"

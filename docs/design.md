@@ -175,8 +175,19 @@ kernel; with it the guest sees the 3070 at PCIe 4.0 x16 with Vulkan.
     `jail` runs as `user_u:user_r:user_t:s0`, opens windows, gets no
     privileged protocol (`grim` and `wl-paste` fail), reaches `:1`, and cannot
     list `/home/friend`.
-- PipeWire belongs to `friend`. `jail` gets a separate socket that allows
-  playback only, so a game cannot record the microphone or voice chat.
+- PipeWire belongs to `friend`. `jail` reaches it only through a second
+  PulseAudio socket of `friend`'s `pipewire-pulse`,
+  `/run/gamejail/display/pulse` (`PULSE_SERVER` in the jail account's
+  environment, configured in `/etc/pipewire/pipewire-pulse.conf.d/`). Its
+  clients carry `pipewire.client.access = "restricted"`, which WirePlumber
+  turns into read-only access, and a `pulse.rules` entry matching that
+  property applies `block-record-stream`, `block-source-volume` and
+  `block-sink-volume`. A game can play sound but cannot record the
+  microphone or a monitor of what others play (voice chat), nor change any
+  volume. Measured from a booted image: playback from `jail` reaches the
+  desktop's sound server; recording from the default source and from a sink
+  monitor, and setting a volume, fail with "Access denied"; `friend` keeps
+  both.
 - Nobody inside the guest has `sudo`. A root exploit inside the guest still
   defeats the `friend`/`jail` split; the VM boundary is the hard one.
 

@@ -12,7 +12,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 futures = "0.3"
-gpui = { path = "../../vendor/gpui" }
+gpui = { package = "gpui-pre", version = "=0.3.10" }
+gpui-kit = "0.8.1"
 gse-protocol = { path = "../gse-protocol" }
 gse-screen = { path = "../gse-screen" }
 image = "0.25"
@@ -22,7 +23,7 @@ ed25519-dalek = "2"
 semver = "1"
 serde.workspace = true
 ureq = { version = "2", features = ["json"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 smallvec = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 toml.workspace = true

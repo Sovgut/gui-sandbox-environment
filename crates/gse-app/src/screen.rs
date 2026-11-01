@@ -19,10 +19,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use gpui::{
-    Bounds, Context, Corners, FocusHandle, InteractiveElement as _, IntoElement, MouseButton,
+    App, Bounds, Context, Corners, FocusHandle, InteractiveElement as _, IntoElement, MouseButton,
     MouseDownEvent, MouseMotionEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    RawKeyEvent, Render, RenderImage, ScrollDelta, ScrollWheelEvent, Styled, Window, canvas, div,
-    point, prelude::FluentBuilder as _, px, size,
+    RawKeyEvent, Render, RenderImage, ScrollDelta, ScrollEvent, Styled, Window, canvas, div, point,
+    prelude::FluentBuilder as _, px, size,
 };
 use gse_protocol::ScreenAccess;
 use gse_screen::Reader;
@@ -37,6 +37,7 @@ const KEY_RIGHT_CTRL: u32 = 97;
 const KEY_LEFT_ALT: u32 = 56;
 const KEY_RIGHT_ALT: u32 = 100;
 const KEY_G: u32 = 34;
+const KEY_F: u32 = 33;
 
 pub struct Screen {
     reader: Reader,
@@ -92,8 +93,8 @@ impl Screen {
         }
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.focus, cx);
     }
 
     pub fn captured(&self) -> bool {
@@ -167,6 +168,13 @@ impl Screen {
             }
             return true;
         }
+        // Full screen hides the bar, so this is the way out of it.
+        if event.code == KEY_F && ctrl && alt {
+            if event.pressed {
+                window.toggle_fullscreen();
+            }
+            return true;
+        }
         if event.pressed {
             self.held.insert(event.code);
         } else {
@@ -202,6 +210,22 @@ impl Screen {
         };
         let outcome = self.input.button(name, down);
         self.sent(outcome);
+    }
+
+    /// A wheel turn, sent as one click of the wheel up or down.
+    fn scrolled(&mut self, event: &ScrollEvent) {
+        let dy = match event.delta {
+            ScrollDelta::Lines(lines) => lines.y,
+            ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
+        };
+        if dy != 0.0 {
+            let name = if dy > 0.0 { "wheel-up" } else { "wheel-down" };
+            let outcome = self
+                .input
+                .button(name, true)
+                .and_then(|()| self.input.button(name, false));
+            self.sent(outcome);
+        }
     }
 
     fn released(&mut self, event: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
@@ -264,7 +288,7 @@ impl Render for Screen {
                 );
                 painted.set(Some(area));
                 window
-                    .paint_image(area, Corners::default(), image, 0, false)
+                    .paint_image(area, area, Corners::default(), image, 0, false)
                     .ok();
                 let screen = screen.clone();
                 window.on_mouse_event(move |event: &MouseMotionEvent, phase, _, cx| {
@@ -281,6 +305,9 @@ impl Render for Screen {
             .track_focus(&self.focus)
             .size_full()
             .bg(gpui::black())
+            // The guest draws its own pointer into the frame, in the shape
+            // its programs ask for; the host's would be a second one.
+            .when(self.image.is_some(), |view| view.cursor(gpui::CursorStyle::Hidden))
             .child(view)
             .on_mouse_move(cx.listener(|screen, event: &MouseMoveEvent, _, _| {
                 if screen.captured {
@@ -291,27 +318,14 @@ impl Render for Screen {
                     screen.sent(outcome);
                 }
             }))
-            .on_any_mouse_down(cx.listener(|screen, event: &MouseDownEvent, window, _| {
-                screen.focus(window);
+            .on_any_mouse_down(cx.listener(|screen, event: &MouseDownEvent, window, cx| {
+                screen.focus(window, cx);
                 screen.button(event.button, true);
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::released))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::released))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::released))
-            .on_scroll_wheel(cx.listener(|screen, event: &ScrollWheelEvent, _, _| {
-                let dy = match event.delta {
-                    ScrollDelta::Lines(lines) => lines.y,
-                    ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
-                };
-                if dy != 0.0 {
-                    let name = if dy > 0.0 { "wheel-up" } else { "wheel-down" };
-                    let outcome = screen
-                        .input
-                        .button(name, true)
-                        .and_then(|()| screen.input.button(name, false));
-                    screen.sent(outcome);
-                }
-            }))
+            .on_scroll(cx.listener(|screen, event: &ScrollEvent, _, _| screen.scrolled(event)))
             .when(self.image.is_none(), |view| {
                 view.child(
                     div()

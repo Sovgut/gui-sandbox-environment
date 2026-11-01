@@ -174,7 +174,7 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         self.is_selecting = true;
         if event.modifiers.shift {
             self.select_to(self.index_for_mouse_position(event.position), cx);
@@ -557,8 +557,15 @@ impl Element for TextElement {
         let Some(line) = prepaint.line.take() else {
             return;
         };
-        line.paint(bounds.origin, window.line_height(), window, cx)
-            .ok();
+        line.paint(
+            bounds.origin,
+            window.line_height(),
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        )
+        .ok();
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()
         {

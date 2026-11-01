@@ -1,39 +1,50 @@
 //! The gse app: the sandboxes in a list on the left, the selected one's
-//! state, start and journal on the right, and app settings with the presets
-//! and what new sandboxes start with. Everything goes through the gse
-//! service; the app itself needs no privileges.
+//! cover, facts and tabs on the right, its screen in place of everything
+//! else while it plays, and app settings with the sets of apps and what new
+//! sandboxes start with. Everything goes through the gse service; the app
+//! itself needs no privileges.
 
 mod client;
 mod config;
+mod devservice;
+mod flathub;
 mod gpu;
 mod icons;
 mod input;
 mod journal;
+mod onboarding;
 mod presets;
+mod preview;
 mod programs;
 mod sandbox;
 mod screen;
 mod settings;
+mod setup;
+mod shell;
 mod text_input;
 mod transfer;
 mod ui;
 mod update;
+mod windowbar;
 
 use std::collections::BTreeMap;
 
 use futures::StreamExt as _;
 use gpui::{
-    App, Application, Bounds, Context, Div, Entity, FontWeight, Hsla, IntoElement, ParentElement,
-    Render, SharedString, Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, size,
+    App, Bounds, Context, Div, Entity, FontWeight, IntoElement, ParentElement, Render,
+    SharedString, Styled, TitlebarOptions, Window, WindowBounds, WindowDecorations, WindowOptions,
+    div, prelude::*, px, size,
 };
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::TitleBar;
+use gpui_kit::component::button::ButtonVariants as _;
 use gse_protocol::{
     Environment, Event, Gpu, GuestApp, GuestFiles, JournalEntry, Request, Settings, Stage,
 };
 
 use crate::icons::Icon;
 use crate::text_input::TextInput;
-use crate::ui::{Kind, Theme, badge, button, icon_button, segment, segments};
+use crate::ui::{Kind, Theme, badge, button, icon_button};
 
 fn stage_text(stage: Stage) -> &'static str {
     match stage {
@@ -42,13 +53,6 @@ fn stage_text(stage: Stage) -> &'static str {
         Stage::Booting => "Booting",
         Stage::Ready => "Running",
         Stage::Stopping => "Stopping",
-    }
-}
-
-fn stage_color(stage: Stage) -> Hsla {
-    match stage {
-        Stage::Ready => Theme::good(),
-        _ => Theme::warning(),
     }
 }
 
@@ -89,7 +93,7 @@ impl SortBy {
         match self {
             Self::Created => "newest first",
             Self::Name => "by name",
-            Self::Preset => "by preset",
+            Self::Preset => "by set of apps",
         }
     }
 }
@@ -127,6 +131,7 @@ enum AppTab {
     General,
     Presets,
     Defaults,
+    Updates,
 }
 
 /// A destructive action waiting for a second click.
@@ -142,6 +147,8 @@ enum Modal {
     Add {
         preset: Option<String>,
         name: Entity<TextInput>,
+        /// Whether the settings it starts with are unfolded.
+        details: bool,
     },
     /// A sandbox's settings, with its name as edited.
     SandboxSettings {
@@ -152,6 +159,17 @@ enum Modal {
     Transfer { name: String },
     /// The window is closing while a sandbox runs.
     Close,
+    /// Removing everything, asked first: keep the taken files or not, the
+    /// word that confirms it, and what would go once measured.
+    RemoveAll {
+        keep: bool,
+        confirm: Entity<TextInput>,
+        sizes: Option<transfer::Sizes>,
+    },
+    /// Playing `to` while `from` runs: one has to stop first.
+    Switch { from: String, to: String },
+    /// Playing `name` hands it the GPU that drives the monitor.
+    SingleGpu { name: String },
 }
 
 /// A message for the user: an error stays until dismissed.
@@ -159,7 +177,13 @@ enum Modal {
 struct Status {
     text: SharedString,
     error: bool,
+    /// When it was said; a message that is no error goes after
+    /// [`TOAST_FOR`].
+    at: std::time::Instant,
 }
+
+/// How long a message that is no error stays in sight.
+const TOAST_FOR: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The app's one window. Its flags are separate facts of the view, not
 /// one state spread over several.
@@ -209,12 +233,6 @@ struct Home {
     moved: Option<transfer::Moved>,
     app_config: config::AppConfig,
     update: update::State,
-    /// "Remove everything" waits for its second click.
-    remove_confirm: bool,
-    /// Whether removing everything takes the received files folder too.
-    remove_received: bool,
-    /// The received files folder as edited in app settings.
-    received_input: Entity<TextInput>,
     modal: Option<Modal>,
     /// The user chose to close the window although a sandbox runs.
     closing: bool,
@@ -224,32 +242,38 @@ struct Home {
     open_when_ready: Option<String>,
     /// Failed attempts at opening the screen in a row.
     screen_attempts: u32,
+    /// The sidebar shows only covers; it does so by itself while a screen
+    /// is open.
+    sidebar_collapsed: bool,
+    /// The tab under the selected sandbox's cover.
+    tab: shell::PanelTab,
+    files_scroll: gpui::ScrollHandle,
+    /// The welcome tour, while it runs.
+    tour: Option<onboarding::Tour>,
+    /// Preparing the computer, while it is not ready for sandboxes.
+    setup: Option<setup::Setup>,
+    /// How far back the journal shows, and whether its menu is open.
+    journal_period: journal::Period,
+    period_open: bool,
+    /// The sandbox whose screen a preview shows, drawn without a screen.
+    preview_screen: Option<String>,
+    /// How round each corner of the window is now; what the app paints in
+    /// a corner follows it.
+    corners: gpui::Corners<gpui::Pixels>,
+    /// When the app last looked for updates.
+    update_checked: Option<chrono::DateTime<chrono::Local>>,
+    /// The settings menu that is open, by its id.
+    open_menu: Option<SharedString>,
+    /// Putting a development build of the service in place.
+    dev_install: devservice::Install,
 }
 
 impl Home {
     fn new(cx: &mut Context<Self>) -> Self {
-        let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        client::watch(tx);
-        cx.spawn(async move |this, cx| {
-            while let Some(event) = rx.next().await {
-                let alive = this.update(cx, |home, cx| {
-                    // The journal grows line by line; nothing else changed.
-                    if let Some(Event::Journal { name, entry }) = &event {
-                        home.journal_event(name, entry);
-                        cx.notify();
-                        return;
-                    }
-                    if let Some(event) = &event {
-                        home.note(event);
-                    }
-                    Self::reload(cx);
-                });
-                if alive.is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
+        let preview = preview::state().is_some();
+        if !preview {
+            Self::follow_service(cx);
+        }
         let processes_filter =
             cx.new(|cx| TextInput::new("Regex: program, process, command, PID", cx));
         cx.observe(&processes_filter, |_, _, cx| cx.notify())
@@ -258,32 +282,19 @@ impl Home {
             cx.new(|cx| TextInput::new("Regex, @14:05, @14:00..14:30, @2026-11-01", cx));
         cx.observe(&journal_filter, |_, _, cx| cx.notify()).detach();
         let app_config = config::AppConfig::load();
-        let received_input = cx.new(|cx| {
-            let mut input = TextInput::new("~/GSE", cx);
-            input.set_text(app_config.received.display().to_string(), cx);
-            input
+        let setup = setup::needed().map(|step| setup::Setup {
+            step,
+            running: false,
+            warnings: Vec::new(),
+            failed: None,
         });
-        cx.observe(&received_input, |_, _, cx| cx.notify()).detach();
+        // The tour follows preparing, which starts it when it ends.
+        let tour = (!app_config.tour_done && setup.is_none()).then_some(onboarding::Tour::Welcome);
         let sandbox_search = cx.new(|cx| TextInput::new("Search sandboxes", cx));
         cx.observe(&sandbox_search, |_, _, cx| cx.notify()).detach();
-        cx.spawn(async move |this, cx| {
-            loop {
-                if this.update(cx, Self::check_updates).is_err() {
-                    break;
-                }
-                cx.background_executor().timer(update::CHECK_EVERY).await;
-            }
-        })
-        .detach();
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(programs::PROCESS_POLL).await;
-                if this.update(cx, Home::poll_processes).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
+        if !preview {
+            Self::keep_checking(cx);
+        }
         let home = Self {
             page: Page::Sandbox,
             app_tab: AppTab::Presets,
@@ -315,23 +326,108 @@ impl Home {
             moved: None,
             app_config,
             update: update::State::Idle,
-            remove_confirm: false,
-            remove_received: false,
-            received_input,
             modal: None,
             closing: false,
             screen: None,
             open_when_ready: None,
             screen_attempts: 0,
+            sidebar_collapsed: false,
+            tab: shell::PanelTab::Activity,
+            files_scroll: gpui::ScrollHandle::new(),
+            tour,
+            setup,
+            journal_period: journal::Period::Everything,
+            period_open: false,
+            open_menu: None,
+            update_checked: None,
+            dev_install: devservice::Install::Idle,
+            corners: gpui::Corners::default(),
+            preview_screen: None,
         };
-        Self::reload(cx);
+        if !preview {
+            Self::reload(cx);
+        }
         home
+    }
+
+    /// Checks for updates now and then, and reloads the programs of the
+    /// sandbox in sight.
+    fn keep_checking(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                if this
+                    .update(cx, |home, cx| home.check_updates(false, cx))
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor().timer(update::CHECK_EVERY).await;
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                let alive = this.update(cx, |home, cx| {
+                    if home
+                        .status
+                        .as_ref()
+                        .is_some_and(|s| !s.error && s.at.elapsed() >= TOAST_FOR)
+                    {
+                        home.status = None;
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(programs::PROCESS_POLL).await;
+                if this.update(cx, Home::poll_processes).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Follows the service's events, reloading what they change.
+    fn follow_service(cx: &mut Context<Self>) {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        client::watch(tx);
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = rx.next().await {
+                let alive = this.update(cx, |home, cx| {
+                    // The journal grows line by line; nothing else changed.
+                    if let Some(Event::Journal { name, entry }) = &event {
+                        home.journal_event(name, entry);
+                        cx.notify();
+                        return;
+                    }
+                    if let Some(event) = &event {
+                        home.note(event);
+                    }
+                    Self::reload(cx);
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn say(&mut self, text: impl Into<SharedString>, error: bool) {
         self.status = Some(Status {
             text: text.into(),
             error,
+            at: std::time::Instant::now(),
         });
     }
 
@@ -483,8 +579,11 @@ impl Home {
         match screen::Connection::open(&access) {
             Ok(connection) => {
                 let entity = cx.new(|cx| screen::Screen::new(connection, cx));
-                entity.update(cx, |screen, _| screen.focus(window));
+                entity.update(cx, |screen, cx| screen.focus(window, cx));
                 self.screen = Some((name.to_owned(), entity));
+                self.sidebar_collapsed = true;
+                self.page = Page::Sandbox;
+                self.selected = Some(name.to_owned());
                 self.screen_attempts = 0;
             }
             // Right after a start the service may not have handed the input
@@ -512,6 +611,7 @@ impl Home {
     /// Leaves the screen: keys go back to the app and the pointer is free.
     fn close_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.screen.take().is_some() {
+            self.sidebar_collapsed = false;
             window
                 .set_raw_key_handler(None::<fn(&gpui::RawKeyEvent, &mut Window, &mut App) -> bool>);
             window.set_pointer_lock(false);
@@ -522,77 +622,140 @@ impl Home {
         cx.notify();
     }
 
-    /// The screen view: a slim bar over the environment's screen.
+    /// A sandbox at play: a bar with its controls over its screen, and its
+    /// What the mouse does now over the screen, and the keys that change it.
+    fn screen_hint(captured: bool) -> Div {
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .justify_center()
+            .gap_1p5()
+            .text_sm()
+            .text_color(Theme::muted())
+            .child(if captured {
+                "Mouse held by the sandbox \u{b7}"
+            } else {
+                "Click into the screen to play \u{b7}"
+            })
+            .child(ui::key("Ctrl Alt G"))
+            .child(if captured {
+                "frees it"
+            } else {
+                "grabs or frees the mouse"
+            })
+    }
+
+    /// programs beside it.
     fn screen_view(
         &self,
         name: &str,
-        screen: &Entity<screen::Screen>,
+        screen: gpui::AnyElement,
+        captured: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        let captured = screen.read(cx).captured();
         let full = window.is_fullscreen();
         let stop_key = format!("{name}/stop");
         let stopping = self.busy.contains_key(&stop_key);
+        let internet = self
+            .environments
+            .iter()
+            .find(|e| e.name == name)
+            .is_some_and(|e| e.settings.internet);
+        let (files, toggle) = (name.to_owned(), name.to_owned());
+        let hint = Self::screen_hint(captured);
         let bar = div()
             .flex()
+            .flex_1()
             .items_center()
             .gap_3()
-            .px_4()
-            .py_2()
-            .bg(Theme::surface())
-            .border_b_1()
-            .border_color(Theme::border())
-            .child(button(
-                "screen-back",
-                "Back",
-                Kind::Ghost,
-                true,
-                cx.listener(|home, _, window, cx| home.close_screen(window, cx)),
-            ))
+            .pl_2()
             .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(name.to_owned()),
+                windowbar::not_dragging().child(
+                    gpui_kit::component::button::Button::new("screen-back")
+                        .ghost()
+                        .small()
+                        .icon(gpui_kit::component::IconName::ChevronLeft)
+                        .tooltip("Back to the sandbox's page")
+                        .on_click(cx.listener(|home, _, window, cx| home.close_screen(window, cx))),
+                ),
             )
+            .child(div().font_weight(FontWeight::BOLD).child(name.to_owned()))
+            .child(badge("Running", Theme::good()))
+            .child(hint)
             .child(
-                div()
-                    .flex_1()
-                    .text_sm()
-                    .text_color(Theme::muted())
-                    .child(if captured {
-                        "Mouse captured. Ctrl+Alt+G releases it."
-                    } else {
-                        "Click into the screen to type. Ctrl+Alt+G captures the mouse for games."
-                    }),
-            )
-            .child(button(
-                "screen-full",
-                if full {
-                    "Leave full screen"
-                } else {
-                    "Full screen"
-                },
-                Kind::Secondary,
-                true,
-                cx.listener(|_, _, window, _| window.toggle_fullscreen()),
-            ))
-            .child(button(
-                "screen-stop",
-                if stopping { "Stopping..." } else { "Stop" },
-                Kind::Danger,
-                !stopping,
-                cx.listener(move |home, _, _, cx| {
-                    home.request(stop_key.clone(), "Stopping", Request::Stop, cx);
-                }),
-            ));
+                windowbar::not_dragging()
+                    .gap_3()
+                    .child(
+                        gpui_kit::component::switch::Switch::new("screen-internet")
+                            .checked(internet)
+                            .label("Internet")
+                            .on_change(cx.listener(move |home, on: &bool, _, cx| {
+                                home.set_internet(&toggle, *on, cx);
+                            })),
+                    )
+                    .child(icon_button(
+                        "screen-files",
+                        Icon::Transfer,
+                        "Files: take them out, send them in",
+                        Kind::Secondary,
+                        true,
+                        cx.listener(move |home, _, _, cx| home.open_transfer(&files, cx)),
+                    ))
+                    .child(icon_button(
+                        "screen-full",
+                        Icon::Fullscreen,
+                        if full {
+                            "Leave full screen (Ctrl Alt F)"
+                        } else {
+                            "Full screen (Ctrl Alt F)"
+                        },
+                        Kind::Secondary,
+                        true,
+                        cx.listener(|home, _, window, cx| {
+                            if !window.is_fullscreen() {
+                                home.say("Ctrl Alt F leaves full screen", false);
+                                cx.notify();
+                            }
+                            window.toggle_fullscreen();
+                        }),
+                    ))
+                    .child(
+                        button(
+                            "screen-stop",
+                            if stopping { "Stopping..." } else { "Stop" },
+                            Kind::Danger,
+                            !stopping,
+                            cx.listener(move |home, _, _, cx| {
+                                home.request(stop_key.clone(), "Stopping", Request::Stop, cx);
+                            }),
+                        )
+                        .icon(ui::kit_icon(Icon::Stop)),
+                    ),
+            );
         div()
             .flex()
             .flex_col()
-            .size_full()
-            .child(bar)
-            .child(div().flex_1().min_h_0().child(screen.clone()))
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .when(!full, |view| {
+                view.child(
+                    Self::window_bar(Some(bar.into_any_element()), window, cx)
+                        .border_b_1()
+                        .border_color(Theme::border()),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(div().flex_1().min_w_0().child(screen))
+                    .when(!full, |row| row.child(self.programs_aside(name, cx))),
+            )
     }
 
     /// Whether the window may close now; with a sandbox running, the close
@@ -604,76 +767,6 @@ impl Home {
         self.modal = Some(Modal::Close);
         cx.notify();
         false
-    }
-
-    /// The state badge of a sandbox in the list and its pane.
-    /// What a sandbox is doing, in words and as a colour.
-    fn state(&self, environment: &Environment) -> (&'static str, Hsla) {
-        let doing = self.busy.get(&environment.name).copied();
-        match (&environment.running, doing) {
-            (Some(running), _) => (stage_text(running.stage), stage_color(running.stage)),
-            (None, Some(doing)) => (doing, Theme::accent()),
-            (None, None) if !environment.image_ready => {
-                if self.building(&environment.image) {
-                    ("Image building", Theme::warning())
-                } else {
-                    ("No image", Theme::subtle())
-                }
-            }
-            (None, None) => ("Stopped", Theme::subtle()),
-        }
-    }
-
-    /// The state of a sandbox as a badge.
-    fn state_badge(&self, environment: &Environment) -> Div {
-        let (text, color) = self.state(environment);
-        badge(text, color)
-    }
-
-    fn sidebar_row(&self, environment: &Environment, cx: &mut Context<Self>) -> impl IntoElement {
-        let name = environment.name.clone();
-        let selected =
-            self.page == Page::Sandbox && self.selected.as_deref() == Some(name.as_str());
-        div()
-            .id(SharedString::from(format!("row-{name}")))
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .cursor_pointer()
-            .map(|row| {
-                if selected {
-                    row.bg(Theme::accent().opacity(0.14))
-                } else {
-                    row.hover(|s| s.bg(Theme::raised()))
-                }
-            })
-            .on_click(cx.listener(move |home, _, _, cx| home.select(&name, cx)))
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .child(environment.name.clone()),
-            )
-            .children({
-                // A sandbox doing nothing shows no dot.
-                let (text, color) = self.state(environment);
-                let idle = environment.running.is_none()
-                    && !self.busy.contains_key(&environment.name)
-                    && !self.building(&environment.image);
-                (!idle).then(|| {
-                    div()
-                        .id(SharedString::from(format!("state-{}", environment.name)))
-                        .flex_none()
-                        .p_1()
-                        .child(div().size_2().rounded_full().bg(color))
-                        .tooltip(ui::tooltip(text.into()))
-                })
-            })
     }
 
     /// The sandboxes the search finds, in the chosen order.
@@ -702,237 +795,291 @@ impl Home {
         listed
     }
 
-    /// The search field and the sort button above the list.
-    fn search_bar(&self, cx: &mut Context<Self>) -> Div {
-        let sort = self.sort;
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .p_2()
-            .border_b_1()
-            .border_color(Theme::border())
-            .child(div().flex_1().min_w_0().child(self.sandbox_search.clone()))
-            .child(icon_button(
-                "sort",
-                sort.icon(),
-                format!("Sorted {}; click for {}", sort.text(), sort.next().text()),
-                Kind::Ghost,
-                true,
-                cx.listener(move |home, _, _, cx| {
-                    home.sort = sort.next();
-                    cx.notify();
-                }),
-            ))
+    /// Opens app settings, leaving a sandbox's screen.
+    fn open_app_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_screen(window, cx);
+        self.page = Page::AppSettings;
+        self.confirm = None;
+        cx.notify();
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> Div {
-        let search = self.search_bar(cx);
-        let mut list = div()
-            .id("sandboxes")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .gap_0p5()
-            .p_1()
-            .overflow_y_scroll();
-        if self.connected.is_none() {
-            list = list.child(
-                div()
-                    .p_3()
-                    .text_sm()
-                    .text_color(Theme::muted())
-                    .child("Loading..."),
-            );
-        } else if self.environments.is_empty() && self.connected == Some(true) {
-            list = list.child(
-                div()
-                    .p_3()
-                    .text_sm()
-                    .text_color(Theme::muted())
-                    .child("No sandboxes yet."),
-            );
-        }
-        let listed = self.listed(cx);
-        if listed.is_empty() && !self.environments.is_empty() {
-            list = list.child(
-                div()
-                    .p_3()
-                    .text_sm()
-                    .text_color(Theme::muted())
-                    .child("No sandbox matches."),
-            );
-        }
-        for environment in listed {
-            list = list.child(self.sidebar_row(environment, cx));
-        }
-        let settings_open = self.page == Page::AppSettings;
-        div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w(px(260.))
-            .h_full()
-            .bg(Theme::surface())
-            .border_r_1()
-            .border_color(Theme::border())
-            .child(search)
-            .child(list)
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .p_3()
-                    .border_t_1()
-                    .border_color(Theme::border())
-                    .child(
-                        button(
-                            "add-sandbox",
-                            "Add sandbox",
-                            Kind::Primary,
-                            self.connected == Some(true),
-                            cx.listener(|home, _, _, cx| home.open_add(cx)),
-                        )
-                        .flex_1(),
-                    )
-                    .child(icon_button(
-                        "app-settings",
-                        Icon::Settings,
-                        "App settings: presets and what new sandboxes start with",
-                        if settings_open {
-                            Kind::Primary
-                        } else {
-                            Kind::Secondary
-                        },
-                        true,
-                        cx.listener(|home, _, _, cx| {
-                            home.page = Page::AppSettings;
-                            home.confirm = None;
-                            cx.notify();
-                        }),
-                    )),
-            )
-    }
-
-    fn app_settings_view(&self, cx: &mut Context<Self>) -> Div {
-        let tab = |id: &'static str, label: &'static str, tab: AppTab, cx: &mut Context<Self>| {
-            segment(
-                id,
-                label,
-                self.app_tab == tab,
-                true,
-                cx.listener(move |home, _, _, cx| {
+    /// The menu of app settings, in place of the sandbox list.
+    fn settings_nav(&self, cx: &mut Context<Self>) -> Div {
+        let item = |id: &'static str, label: &'static str, tab: AppTab, cx: &mut Context<Self>| {
+            let chosen = self.app_tab == tab;
+            div()
+                .id(id)
+                .px_3()
+                .py_2()
+                .rounded(px(9.))
+                .text_sm()
+                .cursor_pointer()
+                .map(|i| {
+                    if chosen {
+                        i.bg(Theme::selected()).font_weight(FontWeight::SEMIBOLD)
+                    } else {
+                        i.text_color(Theme::secondary_text())
+                            .hover(|i| i.bg(Theme::raised()))
+                    }
+                })
+                .on_click(cx.listener(move |home, _, _, cx| {
                     home.app_tab = tab;
                     cx.notify();
-                }),
-            )
+                }))
+                .child(label)
         };
         div()
             .flex()
             .flex_col()
-            .gap_4()
+            .flex_none()
+            .gap_0p5()
+            .w(px(shell::SIDEBAR_WIDTH))
+            .h_full()
+            .px_2()
+            .bg(Theme::sidebar())
+            .rounded_tl(self.corners.top_left)
+            .rounded_bl(self.corners.bottom_left)
+            .border_r_1()
+            .border_color(Theme::border())
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .gap_2()
+                    .h(px(shell::BAR_HEIGHT))
+                    .px_1()
                     .child(
-                        div()
-                            .text_xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("App settings"),
+                        gpui_kit::component::button::Button::new("settings-back")
+                            .ghost()
+                            .small()
+                            .icon(gpui_kit::component::IconName::ChevronLeft)
+                            .tooltip("Back to sandboxes")
+                            .on_click(cx.listener(|home, _, _, cx| {
+                                home.page = Page::Sandbox;
+                                cx.notify();
+                            })),
                     )
-                    .child(
-                        segments()
-                            .child(tab("tab-presets", "Presets", AppTab::Presets, cx))
-                            .child(tab("tab-defaults", "New sandboxes", AppTab::Defaults, cx))
-                            .child(tab("tab-general", "General", AppTab::General, cx)),
-                    ),
+                    .child(div().font_weight(FontWeight::BOLD).child("Settings")),
+            )
+            .child(item("nav-general", "General", AppTab::General, cx))
+            .child(item("nav-presets", "Sets of apps", AppTab::Presets, cx))
+            .child(item("nav-defaults", "New sandboxes", AppTab::Defaults, cx))
+            .child(item(
+                "nav-updates",
+                "About and updates",
+                AppTab::Updates,
+                cx,
+            ))
+    }
+
+    fn app_settings_view(&self, cx: &mut Context<Self>) -> Div {
+        let title = match self.app_tab {
+            AppTab::General => "General",
+            AppTab::Presets => "Sets of apps",
+            AppTab::Defaults => "New sandboxes",
+            AppTab::Updates => "About and updates",
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(
+                div()
+                    .text_size(px(26.))
+                    .font_weight(FontWeight::BOLD)
+                    .child(title),
             )
             .child(match self.app_tab {
                 AppTab::Presets => self.presets_view(cx),
                 AppTab::Defaults => self.defaults_view(cx),
                 AppTab::General => self.general_view(cx),
+                AppTab::Updates => self.updates_card(cx),
             })
     }
 
-    fn footer(&self, cx: &mut Context<Self>) -> Div {
-        let (dot, connection) = match self.connected {
-            None => (Theme::subtle(), "Connecting to the service..."),
-            Some(true) => (Theme::good(), "Service connected"),
-            Some(false) => (Theme::danger(), "Service unavailable"),
-        };
-        let message = self.status.as_ref().filter(|s| !s.error).map(|status| {
+    /// A message that is no error, at the bottom right until dismissed.
+    fn toast(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let status = self.status.as_ref().filter(|s| !s.error)?;
+        let dismiss = cx.listener(|home, _, _, cx| {
+            home.status = None;
+            cx.notify();
+        });
+        Some(
             div()
+                .id("toast")
+                .absolute()
+                .right(px(24.))
+                .bottom(px(24.))
                 .flex()
-                .items_center()
-                .gap_2()
-                .min_w_0()
+                .items_start()
+                .gap_3()
+                .w(px(380.))
+                .p_3p5()
+                .rounded(px(12.))
+                .bg(Theme::popover())
+                .border_1()
+                .border_color(Theme::line())
+                .shadow_lg()
+                .occlude()
+                .cursor_pointer()
+                .on_click(dismiss)
+                .child(
+                    gpui_kit::component::Icon::new(gpui_kit::component::IconName::CircleCheck)
+                        .size(px(18.))
+                        .text_color(Theme::good()),
+                )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
                         .text_sm()
-                        .text_color(Theme::muted())
-                        .truncate()
+                        .font_weight(FontWeight::SEMIBOLD)
                         .child(status.text.clone()),
                 )
-                .child(button(
-                    "dismiss-message",
-                    "Clear",
-                    Kind::Ghost,
-                    true,
-                    cx.listener(|home, _, _, cx| {
-                        home.status = None;
-                        cx.notify();
-                    }),
-                ))
-        });
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .gap_4()
-            .h(px(36.))
-            .px_4()
-            .bg(Theme::surface())
-            .border_t_1()
-            .border_color(Theme::border())
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .text_sm()
-                    .text_color(Theme::muted())
-                    .child(div().size_2().rounded_full().bg(dot))
-                    .child(connection),
-            )
-            .children(message)
+                .child(
+                    gpui_kit::component::Icon::new(gpui_kit::component::IconName::Close)
+                        .size(px(14.))
+                        .text_color(Theme::muted()),
+                ),
+        )
     }
 
-    /// Notices above the right side: the service's version, an error from
-    /// the last request, a GPU change the app has to restart for.
-    fn notices(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let mut notices = div().flex().flex_col().gap_3();
-        let mut any = false;
-        if let Some(update) = self.update_notice(cx) {
-            any = true;
-            notices = notices.child(update);
+    /// The build in progress, wherever the user is but on the page of the
+    /// sets, which shows it in full.
+    fn build_notice(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let build = self.presets.build.as_ref()?;
+        if self.page == Page::AppSettings && self.app_tab == AppTab::Presets {
+            return None;
         }
+        let step = self
+            .build_steps(&build.preset)
+            .and_then(|(steps, reached)| steps.get(reached).copied());
+        let percent = self.build_percent(&build.preset).unwrap_or(0);
+        let detail = match step {
+            Some(step) => format!(
+                "{step} \u{b7} {percent}%. No sandbox starts until it is done; closing the app does not stop it."
+            ),
+            None => {
+                "No sandbox starts until it is done; closing the app does not stop it.".to_owned()
+            }
+        };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2p5()
+                .px_4()
+                .py_3()
+                .rounded(px(12.))
+                .bg(Theme::warning().opacity(0.1))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(
+                                    format!(
+                                        "{} is being built",
+                                        presets::build_name(&build.preset)
+                                    ),
+                                ))
+                                .child(div().text_sm().text_color(Theme::muted()).child(detail)),
+                        )
+                        .child(button(
+                            "build-show",
+                            "Show",
+                            Kind::Secondary,
+                            true,
+                            cx.listener(|home, _, window, cx| {
+                                home.open_app_settings(window, cx);
+                                home.app_tab = AppTab::Presets;
+                            }),
+                        )),
+                )
+                .child(
+                    div().h(px(4.)).rounded_full().bg(Theme::selected()).child(
+                        div()
+                            .h_full()
+                            .rounded_full()
+                            .bg(Theme::warning())
+                            .w(gpui::relative(f32::from(percent) / 100.)),
+                    ),
+                ),
+        )
+    }
+
+    /// The notice that the sandbox system or sets want rebuilding; not
+    /// while a build runs, which is the update or has to end first.
+    fn outdated_notice(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.anything_outdated()
+            || self.presets.build.is_some()
+            || self.busy.contains_key("everything")
+        {
+            return None;
+        }
+        Some(
+            ui::notice(
+                Theme::warning(),
+                if self.base_outdated() {
+                    "The sandbox system is out of date"
+                } else {
+                    "Sets of apps are out of date"
+                },
+                "They lack what this version of GSE puts into sandboxes. Updating \
+                 rebuilds what is out of date and resets the sandboxes made from it; it \
+                 takes a while and needs no sandbox running.",
+            )
+            .child(button(
+                "update-everything",
+                "Update everything",
+                Kind::Primary,
+                !self.any_running() && self.presets.build.is_none(),
+                cx.listener(|home, _, _, cx| home.update_everything(cx)),
+            )),
+        )
+    }
+
+    /// The notice of a service that does not match this app.
+    fn service_notice(&self, cx: &mut Context<Self>) -> Option<Div> {
         match self.service {
-            client::Match::Same => {}
+            client::Match::Same => None,
             client::Match::ServiceNewer => {
-                any = true;
-                notices = notices.child(ui::notice(
+                Some(ui::notice(
                     Theme::warning(),
                     "This app is out of date",
                     "The gse service is newer than this app. Install the current version of the app.",
-                ));
+                ))
+            }
+            client::Match::ServiceOlder if setup::carries_service() => {
+                Some(
+                    ui::notice(
+                        Theme::warning(),
+                        "The service needs an update",
+                        "The gse service is older than this app. Updating installs the one this \
+                         app carries and asks for your password; a running sandbox and an image \
+                         build are stopped first.",
+                    )
+                    .child(button(
+                        "update-service",
+                        if self.restarting {
+                            "Updating..."
+                        } else {
+                            "Update service"
+                        },
+                        Kind::Primary,
+                        !self.restarting,
+                        cx.listener(|home, _, _, cx| home.update_service(cx)),
+                    )),
+                )
             }
             client::Match::ServiceOlder => {
-                any = true;
-                notices = notices.child(
+                Some(
                     ui::notice(
                         Theme::warning(),
                         "The service needs a restart",
@@ -953,8 +1100,31 @@ impl Home {
                             home.request("service".into(), "", Request::Restart, cx);
                         }),
                     )),
-                );
+                )
             }
+        }
+    }
+
+    /// Notices above the right side: the service's version, an error from
+    /// the last request, a GPU change the app has to restart for.
+    fn notices(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let mut notices = div().flex().flex_col().gap_3();
+        let mut any = false;
+        if let Some(update) = self.update_notice(cx) {
+            any = true;
+            notices = notices.child(update);
+        }
+        if let Some(building) = self.build_notice(cx) {
+            any = true;
+            notices = notices.child(building);
+        }
+        if let Some(outdated) = self.outdated_notice(cx) {
+            any = true;
+            notices = notices.child(outdated);
+        }
+        if let Some(service) = self.service_notice(cx) {
+            any = true;
+            notices = notices.child(service);
         }
         if let Some(status) = self.status.as_ref().filter(|s| s.error) {
             any = true;
@@ -1019,84 +1189,140 @@ impl Render for Home {
         {
             self.close_screen(window, cx);
         }
+        self.corners = gpui_kit::component::window_corner_radius(window);
         let root = div()
             .relative()
+            .flex()
             .size_full()
             .bg(Theme::background())
-            .text_color(Theme::text());
+            .text_color(Theme::text())
+            .rounded_tl(self.corners.top_left)
+            .rounded_tr(self.corners.top_right)
+            .rounded_bl(self.corners.bottom_left)
+            .rounded_br(self.corners.bottom_right);
+        if let Some(page) = self.setup_page(window, cx) {
+            return root.child(page);
+        }
+        if let Some(page) = self.tour_page(window, cx) {
+            return root.child(page).children(self.modal_view(cx));
+        }
         if let Some((name, screen)) = self.screen.clone() {
+            let captured = screen.read(cx).captured();
             return root
-                .child(self.screen_view(&name, &screen, window, cx))
+                .child(self.sidebar(window.is_fullscreen(), cx))
+                .child(self.screen_view(&name, screen.into_any_element(), captured, window, cx))
+                .children(self.toast(cx))
                 .children(self.modal_view(cx));
         }
-        let content = match self.page {
-            Page::AppSettings => div()
-                .id("app-settings-page")
-                .flex_1()
-                .min_w_0()
-                .overflow_y_scroll()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_4()
-                        .w_full()
-                        .max_w(px(920.))
-                        .mx_auto()
-                        .px_4()
-                        .py_4()
-                        .children(self.notices(cx))
-                        .child(self.app_settings_view(cx)),
-                )
-                .into_any_element(),
-            Page::Sandbox => div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .gap_3()
-                .px_4()
-                .pt_3()
-                .pb_3()
-                .children(self.notices(cx))
-                .child(self.sandbox_pane(cx))
-                .into_any_element(),
+        if let Some(name) = self.preview_screen.clone() {
+            let screen = preview_desktop(&name);
+            return root
+                .child(self.sidebar(window.is_fullscreen(), cx))
+                .child(self.screen_view(&name, screen, false, window, cx))
+                .children(self.toast(cx))
+                .children(self.modal_view(cx));
+        }
+        let (side, content) = match self.page {
+            Page::AppSettings => (
+                self.settings_nav(cx),
+                div()
+                    .id("app-settings-page")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .w_full()
+                            .px_12()
+                            .pb_8()
+                            .children(self.notices(cx))
+                            .child(self.app_settings_view(cx)),
+                    )
+                    .into_any_element(),
+            ),
+            Page::Sandbox => (
+                self.sidebar(window.is_fullscreen(), cx),
+                self.sandbox_page(window, cx).into_any_element(),
+            ),
         };
-        root.flex()
-            .flex_col()
+        root.child(side)
             .child(
                 div()
                     .flex()
+                    .flex_col()
                     .flex_1()
-                    .min_h_0()
-                    .child(self.sidebar(cx))
+                    .min_w_0()
+                    .h_full()
+                    .child(Self::window_bar(None, window, cx))
                     .child(content),
             )
-            .child(self.footer(cx))
+            .children(self.toast(cx))
             .children(self.modal_view(cx))
     }
 }
 
+/// A sandbox's screen as a preview draws it: its cover where the desktop
+/// would be.
+fn preview_desktop(name: &str) -> gpui::AnyElement {
+    div()
+        .flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .bg(gpui::black())
+        .child(
+            div()
+                .w(px(820.))
+                .h(px(461.))
+                .rounded(px(6.))
+                .bg(shell::cover(name))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(gpui::white().opacity(0.45))
+                .child("[the sandbox's desktop, live]"),
+        )
+        .into_any_element()
+}
+
 fn main() {
+    if preview::state().as_deref() == Some("list") {
+        print!("{}", preview::list());
+        return;
+    }
     gpu::stay_off_reserved_gpu();
-    Application::new()
+    gpui_kit::application()
         .with_assets(icons::Assets)
         .run(|cx: &mut App| {
+            gpui_kit::init(cx);
+            // Previews match the design, which is dark.
+            let look = config::AppConfig::load().look;
+            let light = preview::state().is_none() && look.light(cx.window_appearance());
+            Theme::apply(light, cx);
             text_input::bind_keys(cx);
-            let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
-            cx.open_window(
+            let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+            gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("GUI Sandbox Environment".into()),
-                        ..TitlebarOptions::default()
+                        title: Some("GSE".into()),
+                        ..TitleBar::title_bar_options()
                     }),
+                    window_decorations: Some(WindowDecorations::Client),
+                    app_owns_titlebar_drag: true,
                     app_id: Some("io.github.sovgut.gse".into()),
-                    window_min_size: Some(size(px(820.), px(520.))),
+                    window_min_size: Some(size(px(960.), px(600.))),
                     ..WindowOptions::default()
                 },
+                cx,
                 |window, cx| {
                     let home = cx.new(Home::new);
+                    if let Some(state) = preview::state() {
+                        home.update(cx, |home, cx| home.preview(&state, cx));
+                    }
                     let weak = home.downgrade();
                     window.on_window_should_close(cx, move |_, cx| {
                         weak.update(cx, Home::should_close).unwrap_or(true)

@@ -9,8 +9,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use futures::channel::mpsc::UnboundedSender;
 use gse_protocol::{
-    Build, Environment, Event, Gpu, GuestApp, GuestFiles, JournalEntry, Preset, Reply, Request,
-    SOCKET, Settings, Stage, receive, send,
+    BaseImage, Build, Environment, Event, Gpu, GuestApp, GuestFiles, JournalEntry, Preset, Reply,
+    Request, SOCKET, Settings, Stage, receive, send,
 };
 
 /// The service closed the connection without answering. A service older
@@ -85,9 +85,11 @@ pub enum Match {
 /// Asks the service for its protocol version.
 pub fn hello() -> Result<Match> {
     let mut version = None;
+    let mut build = None;
     let outcome = call(&Request::Hello, |reply| {
-        if let Reply::Hello { version: v, .. } = reply {
+        if let Reply::Hello { version: v, build: b } = reply {
             version = Some(v);
+            build = Some(b);
         }
     });
     match outcome {
@@ -99,11 +101,27 @@ pub fn hello() -> Result<Match> {
             .context("no version in the reply")?
             .cmp(&gse_protocol::VERSION)
         {
-            std::cmp::Ordering::Equal => Match::Same,
+            // One protocol, but the service may still be an older release
+            // with fixes this app's copy has.
+            std::cmp::Ordering::Equal => build_match(build.as_deref()),
             std::cmp::Ordering::Less => Match::ServiceOlder,
             std::cmp::Ordering::Greater => Match::ServiceNewer,
         },
     )
+}
+
+/// How the service's release compares with this app's, when both speak
+/// one protocol; a build that is not a version counts as the same.
+fn build_match(build: Option<&str>) -> Match {
+    let parse = |v: &str| semver::Version::parse(v).ok();
+    match (build.and_then(parse), parse(env!("CARGO_PKG_VERSION"))) {
+        (Some(service), Some(app)) => match service.cmp(&app) {
+            std::cmp::Ordering::Less => Match::ServiceOlder,
+            std::cmp::Ordering::Greater => Match::ServiceNewer,
+            std::cmp::Ordering::Equal => Match::Same,
+        },
+        _ => Match::Same,
+    }
 }
 
 /// The service's settings and the GPUs they can name.
@@ -207,15 +225,48 @@ pub fn journal(name: &str) -> Result<Vec<JournalEntry>> {
     found.context("no journal in the reply")
 }
 
-/// The presets and the image build in progress, if any.
-pub fn presets() -> Result<(Vec<Preset>, Option<Build>)> {
+/// What the service says of the presets and their images.
+pub struct PresetsState {
+    pub presets: Vec<Preset>,
+    /// The image build in progress, if any.
+    pub build: Option<Build>,
+    pub base: Option<BaseImage>,
+    /// The presets whose images stand on an older base image.
+    pub stale: Vec<String>,
+}
+
+/// The presets, the image build in progress, the base image and the
+/// images built on an older one.
+pub fn presets() -> Result<PresetsState> {
     let mut found = None;
     call(&Request::Presets, |reply| {
-        if let Reply::Presets { presets, build } = reply {
-            found = Some((presets, build));
+        if let Reply::Presets {
+            presets,
+            build,
+            base,
+            stale,
+        } = reply
+        {
+            found = Some(PresetsState {
+                presets,
+                build,
+                base,
+                stale,
+            });
         }
     })?;
     found.context("no presets in the reply")
+}
+
+/// The presets the service ships with, to start new ones from.
+pub fn preset_templates() -> Result<Vec<Preset>> {
+    let mut found = None;
+    call(&Request::PresetTemplates, |reply| {
+        if let Reply::PresetTemplates { templates } = reply {
+            found = Some(templates);
+        }
+    })?;
+    found.context("no templates in the reply")
 }
 
 /// Builds the image of preset `name`, returning once the build ends. Its
@@ -227,6 +278,12 @@ pub fn build_preset(name: &str) -> Result<()> {
         },
         |_| {},
     )
+}
+
+/// Builds the base image every set of apps is built on, downloading the
+/// Fedora image it starts from when needed; returns when the build ends.
+pub fn build_base() -> Result<()> {
+    call(&Request::BuildBase, |_| {})
 }
 
 /// Starts `name` and calls `progress` with each stage until it is ready.

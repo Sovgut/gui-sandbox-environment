@@ -1,14 +1,15 @@
 //! The settings forms: which GPU an environment gets, the mode of its
-//! screen and whether it reaches the internet. App settings edit what new
-//! sandboxes start with; a sandbox's settings dialog edits that sandbox's
-//! own. Each form edits a draft and saves it in one request.
+//! screen and whether it reaches the internet, as rows of a group. App
+//! settings edit what new sandboxes start with; a sandbox's settings panel
+//! edits that sandbox's own. A change is saved as soon as it is made.
 
-use gpui::{Context, Div, FontWeight, IntoElement, SharedString, div, prelude::*};
+use gpui::{Context, Div, FontWeight, IntoElement, SharedString, div, prelude::*, px};
+use gpui_kit::component::{Disableable as _, Sizable as _};
 use gse_protocol::{Gpu, Request, ScreenMode, Settings, SwitchMode};
 
 use crate::client::{self, Unanswered};
 use crate::text_input::TextInput;
-use crate::ui::{self, Kind, Theme, badge, button, segment, segments, tag};
+use crate::ui::{self, Kind, Theme, button};
 use crate::{Home, Modal};
 
 const RESOLUTIONS: [(u32, u32); 4] = [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)];
@@ -39,25 +40,52 @@ pub fn explain(error: &anyhow::Error) -> SharedString {
     }
 }
 
-fn gpu_title(gpu: &Gpu) -> String {
+pub(crate) fn gpu_title(gpu: &Gpu) -> String {
     gpu.device
         .clone()
         .unwrap_or_else(|| format!("GPU {:04x}:{:04x}", gpu.vendor_id, gpu.device_id))
 }
 
-fn field(label: &'static str, control: Div) -> Div {
-    div()
+/// A group of settings rows, with a small heading when given.
+pub(crate) fn group(heading: Option<&'static str>, rows: Vec<Div>) -> Div {
+    let mut group = div()
         .flex()
         .flex_col()
-        .gap_2()
+        .rounded(px(12.))
+        .bg(Theme::group())
+        .children(heading.map(|h| {
+            div()
+                .px_3p5()
+                .pt_3()
+                .pb_1()
+                .text_xs()
+                .text_color(Theme::muted())
+                .child(h)
+        }));
+    for (i, row) in rows.into_iter().enumerate() {
+        group = group.child(row.when(i > 0, |r| r.border_t_1().border_color(Theme::border())));
+    }
+    group
+}
+
+/// One row of a [`group`]: what it is, a line under it, and its control.
+pub(crate) fn row(title: &'static str, hint: Option<String>, control: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .px_3p5()
+        .py_3()
         .child(
             div()
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(Theme::muted())
-                .child(label),
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .child(div().text_sm().child(title))
+                .children(hint.map(|h| div().text_xs().text_color(Theme::muted()).child(h))),
         )
-        .child(div().flex().child(control))
+        .child(div().flex_none().child(control))
 }
 
 impl Home {
@@ -92,13 +120,6 @@ impl Home {
         self.draft_of(target)
             .and_then(|d| d.screen_mode.parse().ok())
             .unwrap_or(FALLBACK)
-    }
-
-    fn set_draft_mode(&mut self, target: Target, mode: ScreenMode, cx: &mut Context<Self>) {
-        if let Some(draft) = self.draft_mut(target) {
-            draft.screen_mode = mode.to_string();
-            cx.notify();
-        }
     }
 
     fn save_defaults(&mut self, cx: &mut Context<Self>) {
@@ -145,7 +166,7 @@ impl Home {
     }
 
     /// Saves the settings of `name`, renaming it to `to` first when that
-    /// differs.
+    /// differs; the settings panel stays open on the new name.
     pub(crate) fn save_sandbox_settings(&mut self, name: &str, to: &str, cx: &mut Context<Self>) {
         let Some(settings) = self.sandbox_draft.clone() else {
             return;
@@ -175,10 +196,13 @@ impl Home {
                 home.saving = false;
                 match outcome {
                     Ok(()) => {
-                        home.modal = None;
-                        home.sandbox_draft = None;
+                        if let Some(Modal::SandboxSettings { name, .. }) = home.modal.as_mut()
+                            && *name != to
+                        {
+                            name.clone_from(&to);
+                            home.journal = None;
+                        }
                         home.selected = Some(to);
-                        home.journal = None;
                     }
                     Err(e) => home.say(explain(&e), true),
                 }
@@ -189,155 +213,139 @@ impl Home {
         .detach();
     }
 
-    fn gpu_row(
+    /// A button showing `current` that opens a list of `options`; picking
+    /// one calls `pick` with its value. One menu is open at a time, by `id`.
+    pub(crate) fn menu<T: Clone + 'static>(
         &self,
-        target: Target,
-        gpu: &Gpu,
-        saved: &Settings,
+        id: impl Into<SharedString>,
+        current: &str,
+        options: Vec<(String, T)>,
+        enabled: bool,
+        pick: impl Fn(&mut Self, T, &mut Context<Self>) + Clone + 'static,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let selected = self.draft_of(target).is_some_and(|d| d.gpu == gpu.address);
-        let address = gpu.address.clone();
-        let (mode, mode_color) = match gpu.mode {
-            SwitchMode::Single => ("single", Theme::warning()),
-            SwitchMode::Secondary => ("secondary", Theme::good()),
-        };
-        let mut facts = vec![gpu.address.clone()];
-        facts.push(match &gpu.driver {
-            Some(driver) => format!("driver {driver}"),
-            None => "no driver".into(),
-        });
-        facts.push(if gpu.monitor {
-            "monitor connected".into()
-        } else {
-            "no monitor".into()
-        });
-        let radio = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .size_4()
-            .rounded_full()
-            .border_2()
-            .border_color(if selected {
-                Theme::accent()
-            } else {
-                Theme::subtle()
-            })
-            .when(selected, |r| {
-                r.child(div().size_2().rounded_full().bg(Theme::accent()))
-            });
-        div()
-            .id(SharedString::from(format!(
-                "gpu-{target:?}-{}",
-                gpu.address
-            )))
-            .flex()
-            .items_center()
-            .gap_3()
-            .p_3()
-            .rounded_lg()
-            .border_1()
-            .map(|row| {
-                if selected {
-                    row.bg(Theme::accent().opacity(0.08))
-                        .border_color(Theme::accent().opacity(0.6))
-                } else {
-                    row.border_color(Theme::border())
-                }
-            })
-            .when(!self.saving && !selected, |row| {
-                row.cursor_pointer()
-                    .hover(|s| s.bg(Theme::raised()))
-                    .on_click(cx.listener(move |home, _, _, cx| {
-                        if let Some(draft) = home.draft_mut(target) {
-                            draft.gpu.clone_from(&address);
-                            cx.notify();
-                        }
-                    }))
-            })
-            .child(radio)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .truncate()
-                                    .child(gpu_title(gpu)),
-                            )
-                            .when(saved.gpu == gpu.address, |line| line.child(tag("saved"))),
-                    )
-                    .child(
-                        div().text_sm().text_color(Theme::muted()).truncate().child(
-                            gpu.vendor
-                                .clone()
-                                .unwrap_or_else(|| format!("PCI vendor {:04x}", gpu.vendor_id)),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(Theme::subtle())
-                            .child(facts.join("  |  ")),
-                    ),
+    ) -> Div {
+        let id: SharedString = id.into();
+        let open = self.open_menu.as_ref() == Some(&id);
+        let mut picker = div().relative().child(
+            button(
+                id.clone(),
+                current.to_owned(),
+                Kind::Secondary,
+                enabled,
+                cx.listener({
+                    let id = id.clone();
+                    move |home, _, _, cx| {
+                        home.open_menu = if home.open_menu.as_ref() == Some(&id) {
+                            None
+                        } else {
+                            Some(id.clone())
+                        };
+                        cx.notify();
+                    }
+                }),
             )
-            .child(badge(mode, mode_color))
+            .small()
+            .icon(gpui_kit::component::IconName::ChevronDown),
+        );
+        if open {
+            let mut list = div()
+                .id(SharedString::from(format!("{id}-menu")))
+                .absolute()
+                .top(px(34.))
+                .right_0()
+                .min_w(px(180.))
+                .max_h(px(260.))
+                .overflow_y_scroll()
+                .p_1()
+                .rounded(px(10.))
+                .bg(Theme::popover())
+                .border_1()
+                .border_color(Theme::line())
+                .shadow_lg()
+                .occlude();
+            for (i, (label, value)) in options.into_iter().enumerate() {
+                let pick = pick.clone();
+                let chosen = label == current;
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("{id}-{i}")))
+                        .px_2p5()
+                        .py_1p5()
+                        .rounded(px(6.))
+                        .text_sm()
+                        .whitespace_nowrap()
+                        .cursor_pointer()
+                        .when(chosen, |o| {
+                            o.font_weight(FontWeight::SEMIBOLD).bg(Theme::selected())
+                        })
+                        .hover(|o| o.bg(Theme::raised()))
+                        .on_click(cx.listener(move |home, _, _, cx| {
+                            home.open_menu = None;
+                            pick(home, value.clone(), cx);
+                            cx.notify();
+                        }))
+                        .child(label),
+                );
+            }
+            picker = picker.child(gpui::deferred(list).with_priority(1));
+        }
+        picker
     }
 
-    fn gpu_card(
+    /// Changes the draft of `target` with `change` and saves it at once.
+    fn change(
+        &mut self,
+        target: Target,
+        change: impl FnOnce(&mut Settings),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(draft) = self.draft_mut(target) else {
+            return;
+        };
+        change(draft);
+        match target {
+            Target::Defaults => self.save_defaults(cx),
+            Target::Sandbox => {
+                if let Some(Modal::SandboxSettings { name, .. }) = &self.modal {
+                    let name = name.clone();
+                    self.save_sandbox_settings(&name, &name, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// The graphics rows of `target`: its GPU, screen size and frame rate.
+    pub(crate) fn graphics_rows(
         &self,
         target: Target,
-        saved: &Settings,
         gpus: &[Gpu],
         cx: &mut Context<Self>,
     ) -> Div {
-        let mut gpu_card = ui::card(
-            "Target GPU",
-            Some("The GPU the sandbox gets. It leaves the host while the sandbox runs."),
-        );
-        if gpus.is_empty() {
-            gpu_card = gpu_card.child(
-                div()
-                    .text_sm()
-                    .text_color(Theme::subtle())
-                    .child("The service found no GPU."),
-            );
-        }
-        for gpu in gpus {
-            gpu_card = gpu_card.child(self.gpu_row(target, gpu, saved, cx));
-        }
-        gpu_card.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .text_xs()
-                .text_color(Theme::subtle())
-                .child(
-                    "single: the GPU drives the host desktop, which stops while the sandbox runs.",
-                )
-                .child("secondary: another GPU drives the desktop, which stays up."),
-        )
-    }
-
-    fn screen_card(&self, target: Target, gpus: &[Gpu], cx: &mut Context<Self>) -> Div {
         let enabled = !self.saving;
-        let mode = self.draft_mode(target);
-        let single = self.draft_of(target).is_some_and(|d| {
-            gpus.iter()
-                .any(|g| g.address == d.gpu && g.mode == SwitchMode::Single)
+        let draft = self.draft_of(target);
+        let chosen = draft.and_then(|d| gpus.iter().find(|g| g.address == d.gpu));
+        let gpu_hint = chosen.map(|g| match g.mode {
+            SwitchMode::Single => "Takes the monitor while it runs".to_owned(),
+            SwitchMode::Secondary => "Your desktop stays up while it runs".to_owned(),
         });
+        let gpu_menu = self.menu(
+            match target {
+                Target::Defaults => "defaults-gpu",
+                Target::Sandbox => "sandbox-gpu",
+            },
+            &chosen.map_or_else(|| "None".to_owned(), gpu_title),
+            gpus.iter()
+                .map(|g| (gpu_title(g), g.address.clone()))
+                .collect(),
+            enabled && !gpus.is_empty(),
+            move |home, address: String, cx| {
+                home.change(target, |d| d.gpu = address, cx);
+            },
+            cx,
+        );
+        let single = chosen.is_some_and(|g| g.mode == SwitchMode::Single);
+        let mode = self.draft_mode(target);
         let mut sizes: Vec<(u32, u32)> = RESOLUTIONS.to_vec();
         if !sizes.contains(&(mode.width, mode.height)) {
             sizes.push((mode.width, mode.height));
@@ -347,165 +355,154 @@ impl Home {
             rates.push(mode.rate);
             rates.sort_unstable();
         }
-
-        let mut size_choice = segments();
-        for (width, height) in sizes {
-            size_choice = size_choice.child(segment(
-                format!("size-{target:?}-{width}x{height}"),
-                format!("{width} x {height}"),
-                (mode.width, mode.height) == (width, height),
+        let screen: Div = if single {
+            div()
+                .text_sm()
+                .text_color(Theme::muted())
+                .child("The monitor's own")
+        } else {
+            self.menu(
+                match target {
+                    Target::Defaults => "defaults-size",
+                    Target::Sandbox => "sandbox-size",
+                },
+                &format!("{} x {}", mode.width, mode.height),
+                sizes
+                    .into_iter()
+                    .map(|(w, h)| (format!("{w} x {h}"), (w, h)))
+                    .collect(),
                 enabled,
-                cx.listener(move |home, _, _, cx| {
+                move |home, (width, height): (u32, u32), cx| {
                     let mode = ScreenMode {
                         width,
                         height,
                         ..home.draft_mode(target)
                     };
-                    home.set_draft_mode(target, mode, cx);
-                }),
-            ));
-        }
-        let mut rate_choice = segments();
-        for rate in rates {
-            rate_choice = rate_choice.child(segment(
-                format!("rate-{target:?}-{rate}"),
-                format!("{rate} FPS"),
-                mode.rate == rate,
+                    home.change(target, |d| d.screen_mode = mode.to_string(), cx);
+                },
+                cx,
+            )
+        };
+        let rate: Div = if single {
+            div()
+                .text_sm()
+                .text_color(Theme::muted())
+                .child("The monitor's own")
+        } else {
+            self.menu(
+                match target {
+                    Target::Defaults => "defaults-rate",
+                    Target::Sandbox => "sandbox-rate",
+                },
+                &format!("{} FPS", mode.rate),
+                rates.into_iter().map(|r| (format!("{r} FPS"), r)).collect(),
                 enabled,
-                cx.listener(move |home, _, _, cx| {
+                move |home, rate: u32, cx| {
                     let mode = ScreenMode {
                         rate,
                         ..home.draft_mode(target)
                     };
-                    home.set_draft_mode(target, mode, cx);
-                }),
-            ));
-        }
-        let card = ui::card(
-            "Screen",
-            Some(
-                "The sandbox's screen in the app's window. \
-                 Its refresh rate is the most frames per second the sandbox shows.",
-            ),
-        );
-        if single {
-            return card.child(div().text_sm().text_color(Theme::subtle()).child(
-                "With this GPU the sandbox drives the monitor itself, \
-                 at the monitor's own resolution and refresh rate.",
-            ));
-        }
-        card.child(field("Resolution", size_choice))
-            .child(field("Frame rate", rate_choice))
-    }
-
-    fn internet_card(&self, target: Target, cx: &mut Context<Self>) -> Div {
-        let on = self.draft_of(target).is_none_or(|d| d.internet);
-        let choice = |label: &'static str, value: bool, cx: &mut Context<Self>| {
-            segment(
-                format!("internet-{target:?}-{value}"),
-                label,
-                on == value,
-                !self.saving,
-                cx.listener(move |home, _, _, cx| {
-                    if let Some(draft) = home.draft_mut(target) {
-                        draft.internet = value;
-                        cx.notify();
-                    }
-                }),
+                    home.change(target, |d| d.screen_mode = mode.to_string(), cx);
+                },
+                cx,
             )
         };
-        ui::card(
-            "Internet",
-            Some(
-                "Without it the sandbox reaches nothing outside itself. \
-                 A running sandbox follows a change at once.",
-            ),
-        )
-        .child(
-            div().flex().child(
-                segments()
-                    .child(choice("Allowed", true, cx))
-                    .child(choice("Cut off", false, cx)),
-            ),
+        group(
+            Some("Graphics"),
+            vec![
+                row("Graphics card", gpu_hint, gpu_menu),
+                row("Screen size", None, screen),
+                row("Frame rate", None, rate),
+            ],
         )
     }
 
-    /// The GPU, screen and internet cards of `target`.
-    pub(crate) fn settings_form(
+    /// The internet row of `target`, as a switch.
+    pub(crate) fn internet_row(
         &self,
         target: Target,
-        saved: &Settings,
-        gpus: &[Gpu],
+        hint: &'static str,
         cx: &mut Context<Self>,
     ) -> Div {
-        div()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(self.gpu_card(target, saved, gpus, cx))
-            .child(self.screen_card(target, gpus, cx))
-            .child(self.internet_card(target, cx))
-    }
-
-    fn save_bar(&self, saved: &Settings, cx: &mut Context<Self>) -> Div {
-        let dirty = self.draft.as_ref().is_some_and(|d| d != saved);
-        div()
-            .flex()
-            .items_center()
-            .justify_end()
-            .gap_2()
-            .child(
-                div()
-                    .flex_1()
-                    .text_sm()
-                    .text_color(Theme::subtle())
-                    .child(if dirty {
-                        "Unsaved changes"
-                    } else {
-                        "No changes"
-                    }),
-            )
-            .child(button(
-                "settings-revert",
-                "Revert",
-                Kind::Ghost,
-                dirty && !self.saving,
-                cx.listener(|home, _, _, cx| {
-                    home.draft = home.settings.as_ref().ok().map(|(s, _)| s.clone());
-                    cx.notify();
-                }),
-            ))
-            .child(button(
-                "settings-save",
-                if self.saving { "Saving..." } else { "Save" },
-                Kind::Primary,
-                dirty && !self.saving,
-                cx.listener(|home, _, _, cx| home.save_defaults(cx)),
-            ))
+        let on = self.draft_of(target).is_none_or(|d| d.internet);
+        row(
+            "Internet",
+            Some(hint.to_owned()),
+            gpui_kit::component::switch::Switch::new(match target {
+                Target::Defaults => "defaults-internet",
+                Target::Sandbox => "sandbox-internet",
+            })
+            .checked(on)
+            .disabled(self.saving)
+            .on_change(cx.listener(move |home, on: &bool, _, cx| {
+                let on = *on;
+                home.change(target, |d| d.internet = on, cx);
+            })),
+        )
     }
 
     /// App settings: what new sandboxes start with.
     pub(crate) fn defaults_view(&self, cx: &mut Context<Self>) -> Div {
         let view = div().flex().flex_col().gap_4().child(
             div().text_sm().text_color(Theme::muted()).child(
-                "A new sandbox starts with these settings; each sandbox then keeps its own.",
+                "What a sandbox gets when it is made. Each one can change these later in its \
+                 own settings.",
             ),
         );
-        match &self.settings {
-            Ok((saved, gpus)) => view
-                .child(self.settings_form(Target::Defaults, saved, gpus, cx))
-                .child(self.save_bar(saved, cx)),
-            Err(reason) => view.child(
-                ui::notice(Theme::warning(), "Settings are unavailable", reason.clone()).child(
-                    button(
-                        "settings-retry",
-                        "Try again",
-                        Kind::Secondary,
-                        true,
-                        cx.listener(|_, _, _, cx| Self::reload(cx)),
+        let (_, gpus) = match &self.settings {
+            Ok(loaded) => loaded,
+            Err(reason) => {
+                return view.child(
+                    ui::notice(Theme::warning(), "Settings are unavailable", reason.clone()).child(
+                        button(
+                            "settings-retry",
+                            "Try again",
+                            Kind::Secondary,
+                            true,
+                            cx.listener(|_, _, _, cx| Self::reload(cx)),
+                        ),
                     ),
-                ),
-            ),
-        }
+                );
+            }
+        };
+        let sets = self.presets_list().unwrap_or_default();
+        let first = self
+            .app_config
+            .first_set
+            .clone()
+            .filter(|s| sets.contains(s))
+            .or_else(|| sets.first().cloned())
+            .unwrap_or_else(|| "None".to_owned());
+        let set_menu = self.menu(
+            "defaults-set",
+            &first,
+            sets.iter().map(|s| (s.clone(), s.clone())).collect(),
+            !sets.is_empty(),
+            |home, set: String, cx| {
+                home.app_config.first_set = Some(set);
+                if let Err(e) = home.app_config.save() {
+                    home.say(format!("The setting was not saved: {e:#}"), true);
+                }
+                cx.notify();
+            },
+            cx,
+        );
+        view.child(group(
+            None,
+            vec![row(
+                "Set of apps",
+                Some("Picked first in the new sandbox dialog".to_owned()),
+                set_menu,
+            )],
+        ))
+        .child(self.graphics_rows(Target::Defaults, gpus, cx))
+        .child(group(
+            None,
+            vec![self.internet_row(
+                Target::Defaults,
+                "Off is safer for programs you don't know",
+                cx,
+            )],
+        ))
     }
 }

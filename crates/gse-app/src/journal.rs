@@ -40,9 +40,50 @@ struct Span {
 
 pub struct Filter {
     pattern: Option<Regex>,
+    /// Whether the words compiled as a regular expression, not as text.
+    pub expression: bool,
     spans: Vec<Span>,
     /// What the user should know about the filter as typed.
     pub problem: Option<String>,
+}
+
+/// How far back the journal shows, besides the filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Period {
+    Everything,
+    LastHour,
+    Today,
+    Week,
+}
+
+impl Period {
+    pub const ALL: [Self; 4] = [Self::Everything, Self::Today, Self::LastHour, Self::Week];
+
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::Everything => "Everything",
+            Self::LastHour => "Last hour",
+            Self::Today => "Today",
+            Self::Week => "This week",
+        }
+    }
+
+    /// Whether a line written at `time` (seconds since the epoch) is in it.
+    pub fn keeps(self, time: u64) -> bool {
+        let Some(when) = i64::try_from(time)
+            .ok()
+            .and_then(|t| Local.timestamp_opt(t, 0).single())
+        else {
+            return self == Self::Everything;
+        };
+        let now = Local::now();
+        match self {
+            Self::Everything => true,
+            Self::LastHour => now - when <= chrono::Duration::hours(1),
+            Self::Today => when.date_naive() == now.date_naive(),
+            Self::Week => now - when <= chrono::Duration::days(7),
+        }
+    }
 }
 
 fn time(text: &str) -> Option<(NaiveTime, Unit)> {
@@ -148,19 +189,21 @@ impl Filter {
             }
         }
         let expression = words.join(" ");
-        let pattern = if expression.is_empty() {
-            None
+        let build = |p: &str| RegexBuilder::new(p).case_insensitive(true).build();
+        let (pattern, compiled) = if expression.is_empty() {
+            (None, false)
+        } else if let Ok(pattern) = build(&expression) {
+            (Some(pattern), true)
         } else {
-            let build = |p: &str| RegexBuilder::new(p).case_insensitive(true).build();
-            Some(build(&expression).unwrap_or_else(|_| {
-                problem.get_or_insert_with(|| {
-                    "Not a regular expression; matched as plain text".to_owned()
-                });
-                build(&regex::escape(&expression)).expect("an escaped pattern compiles")
-            }))
+            problem.get_or_insert_with(|| {
+                "Not a regular expression; matched as plain text".to_owned()
+            });
+            let escaped = build(&regex::escape(&expression)).expect("an escaped pattern compiles");
+            (Some(escaped), false)
         };
         Self {
             pattern,
+            expression: compiled,
             spans,
             problem,
         }
@@ -181,6 +224,18 @@ impl Filter {
         self.pattern
             .as_ref()
             .is_none_or(|p| p.is_match(&format!("{} {text}", when.format("%Y-%m-%d %H:%M:%S"))))
+    }
+}
+
+impl Filter {
+    /// Where the expression matches in `text`, to mark them.
+    pub fn matches(&self, text: &str) -> Vec<std::ops::Range<usize>> {
+        self.pattern.as_ref().map_or_else(Vec::new, |p| {
+            p.find_iter(text)
+                .filter(|m| !m.is_empty())
+                .map(|m| m.range())
+                .collect()
+        })
     }
 }
 
@@ -255,6 +310,17 @@ mod tests {
         assert!(filter.keeps(at("2026-11-01 14:10:00"), "Booting"));
         assert!(!filter.keeps(at("2026-11-01 14:10:00"), "Stopped"));
         assert!(!filter.keeps(at("2026-11-01 15:10:00"), "Booting"));
+    }
+
+    #[test]
+    fn matches_mark_where_the_expression_is_found() {
+        let filter = Filter::new("refus|block");
+        assert!(filter.expression);
+        assert_eq!(filter.matches("Refused x, blocked"), [0..5, 11..16]);
+        assert_eq!(
+            Filter::new("@14:00").matches("anything"),
+            Vec::<std::ops::Range<usize>>::new()
+        );
     }
 
     #[test]

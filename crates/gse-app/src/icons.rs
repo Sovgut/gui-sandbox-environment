@@ -1,6 +1,7 @@
 //! The app's icons: small line drawings on a 24 by 24 grid, kept in the
-//! binary and served to gpui as `icons/<name>.svg`. gpui paints an icon in
-//! the text colour of its element, so the drawings only need a shape.
+//! binary and served to gpui as `icons/gse/<name>.svg`, next to GPUI Kit's
+//! own icons. gpui paints an icon in the text colour of its element, so the
+//! drawings only need a shape.
 
 use std::borrow::Cow;
 
@@ -28,10 +29,17 @@ pub enum Icon {
     Transfer,
     Copy,
     Folder,
+    Monitor,
+    Fullscreen,
+    ExitFullscreen,
+    WindowMinimize,
+    WindowMaximize,
+    WindowRestore,
+    WindowClose,
 }
 
 impl Icon {
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 26] = [
         Self::Settings,
         Self::Sliders,
         Self::Play,
@@ -51,6 +59,13 @@ impl Icon {
         Self::Transfer,
         Self::Copy,
         Self::Folder,
+        Self::Monitor,
+        Self::Fullscreen,
+        Self::ExitFullscreen,
+        Self::WindowMinimize,
+        Self::WindowMaximize,
+        Self::WindowRestore,
+        Self::WindowClose,
     ];
 
     fn name(self) -> &'static str {
@@ -74,12 +89,19 @@ impl Icon {
             Self::Transfer => "transfer",
             Self::Copy => "copy",
             Self::Folder => "folder",
+            Self::Monitor => "monitor",
+            Self::Fullscreen => "fullscreen",
+            Self::ExitFullscreen => "exit-fullscreen",
+            Self::WindowMinimize => "window-minimize",
+            Self::WindowMaximize => "window-maximize",
+            Self::WindowRestore => "window-restore",
+            Self::WindowClose => "window-close",
         }
     }
 
     /// The asset path gpui loads the icon from.
     pub fn path(self) -> SharedString {
-        format!("icons/{}.svg", self.name()).into()
+        format!("icons/gse/{}.svg", self.name()).into()
     }
 
     /// The drawing: SVG elements on the 24 by 24 grid, stroked.
@@ -117,6 +139,16 @@ impl Icon {
                 r#"<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5.5A1.5 1.5 0 0 0 14.5 4H5.5A1.5 1.5 0 0 0 4 5.5V14.5A1.5 1.5 0 0 0 5.5 16H8"/>"#
             }
             Self::Folder => r#"<path d="M3 7V18H21V9H12L10 7Z"/>"#,
+            Self::Monitor => {
+                r#"<rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21H16M12 17V21"/>"#
+            }
+            Self::Fullscreen => r#"<path d="M4 9V4H9M20 9V4H15M4 15V20H9M20 15V20H15"/>"#,
+            Self::ExitFullscreen => r#"<path d="M9 4V9H4M15 4V9H20M4 15H9V20M20 15H15V20"/>"#,
+            // The window buttons, drawn the way KDE's Breeze draws them.
+            Self::WindowMinimize => r#"<path d="M6 9.5L12 15.5L18 9.5"/>"#,
+            Self::WindowMaximize => r#"<path d="M6 14.5L12 8.5L18 14.5"/>"#,
+            Self::WindowRestore => r#"<path d="M12 6L18 12L12 18L6 12Z"/>"#,
+            Self::WindowClose => r#"<path d="M7 7L17 17M17 7L7 17"/>"#,
             Self::Refresh => {
                 r#"<path d="M20 12A8 8 0 1 1 17.66 6.34L20 8.7"/><path d="M20 4V8.7H15.3"/>"#
             }
@@ -131,23 +163,27 @@ impl Icon {
     }
 }
 
-/// Serves [`Icon`]s to gpui.
+/// Serves [`Icon`]s to gpui, and GPUI Kit's icons that its components draw.
 pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        Ok(Icon::ALL
-            .iter()
-            .find(|icon| icon.path() == path)
-            .map(|icon| Cow::Owned(icon.svg().into_bytes())))
+        match Icon::ALL.iter().find(|icon| icon.path() == path) {
+            Some(icon) => Ok(Some(Cow::Owned(icon.svg().into_bytes()))),
+            // GPUI Kit's source answers an unknown path with an error;
+            // gpui takes `None` as "not found".
+            None => Ok(gpui_kit::assets::Assets.load(path).ok().flatten()),
+        }
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        Ok(Icon::ALL
+        let mut listed: Vec<SharedString> = Icon::ALL
             .iter()
             .map(|icon| icon.path())
             .filter(|p| p.starts_with(path))
-            .collect())
+            .collect();
+        listed.extend(gpui_kit::assets::Assets.list(path)?);
+        Ok(listed)
     }
 }
 
@@ -162,6 +198,7 @@ mod tests {
             assert!(bytes.starts_with(b"<svg"));
         }
         assert!(Assets.load("icons/missing.svg").unwrap().is_none());
-        assert_eq!(Assets.list("icons/").unwrap().len(), Icon::ALL.len());
+        assert!(Assets.load("icons/check.svg").unwrap().is_some());
+        assert_eq!(Assets.list("icons/gse/").unwrap().len(), Icon::ALL.len());
     }
 }

@@ -102,7 +102,7 @@ impl Home {
     /// pane is in sight.
     pub(crate) fn poll_processes(&mut self, cx: &mut Context<Self>) {
         let Some(name) = self.selected_up().filter(|_| {
-            self.page == crate::Page::Sandbox && self.screen.is_none() && !self.processes_loading
+            (self.page == crate::Page::Sandbox || self.screen.is_some()) && !self.processes_loading
         }) else {
             if self.selected_up().is_none() {
                 self.processes = None;
@@ -296,7 +296,7 @@ impl Home {
             .flex()
             .flex_col()
             .gap_1()
-            .max_h(px(220.))
+            .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.processes_scroll);
         let mut summary = String::new();
@@ -353,19 +353,16 @@ impl Home {
         (list, summary)
     }
 
-    /// The programs of the selected sandbox, when it runs.
-    pub(crate) fn processes_card(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let name = self.selected_up()?;
+    /// The Programs tab of `name`: every program with its processes.
+    pub(crate) fn programs_body(&self, name: &str, cx: &mut Context<Self>) -> Div {
         let search = Search::new(self.processes_filter.read(cx).text());
-        let (list, summary) = self.process_list(&name, &search, cx);
+        let (list, summary) = self.process_list(name, &search, cx);
         let columns = div()
             .flex()
             .items_center()
             .gap_2()
             .px_2()
-            .pb_1()
-            .border_b_1()
-            .border_color(Theme::border())
+            .py_1p5()
             .text_xs()
             .text_color(Theme::subtle())
             .child(cell(PID_WIDTH).child("PID"))
@@ -373,52 +370,200 @@ impl Home {
             .child(cell(MEMORY_WIDTH).child("Memory"))
             .child(cell(CPU_WIDTH).child("CPU"))
             .child(cell(ACTIONS_WIDTH));
-        Some(
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .p_3()
-                .rounded_lg()
-                .bg(Theme::surface())
-                .border_1()
-                .border_color(Theme::border())
-                .child(
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3p5()
+                    .py_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.processes_filter.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(Theme::muted())
+                            .child(summary),
+                    ),
+            )
+            .when(search.broken, |body| {
+                body.child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex_none()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("Programs"),
-                        )
-                        .child(div().flex_1().child(self.processes_filter.clone()))
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(Theme::subtle())
-                                .child(summary),
-                        ),
+                        .px_3p5()
+                        .pb_2()
+                        .text_xs()
+                        .text_color(Theme::warning())
+                        .child("Not a regular expression; matched as plain text"),
                 )
-                .when(search.broken, |card| {
-                    card.child(
+            })
+            .child(div().px_1p5().child(columns))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .px_1p5()
+                    .child(list)
+                    .children(scrollbar(&self.processes_scroll)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .px_3p5()
+                    .py_2p5()
+                    .border_t_1()
+                    .border_color(Theme::border())
+                    .text_xs()
+                    .text_color(Theme::muted())
+                    .child(
+                        "\u{d7} asks a program to quit and lets it save; \u{25a0} ends it at once. \
+                         On a program's row it ends the program with everything it started.",
+                    ),
+            )
+    }
+
+    /// A program of the sandbox at play, as a card beside its screen.
+    fn aside_card(name: &str, app: &GuestApp, cx: &mut Context<Self>) -> Div {
+        let memory: u64 = app.processes.iter().map(|p| p.memory_kib).sum();
+        let detail = match app.processes.len() {
+            1 => format!("1 process \u{b7} {}", size_text(memory * 1024)),
+            n => format!("{n} processes \u{b7} {}", size_text(memory * 1024)),
+        };
+        let end = app.unit.clone().map(|unit| {
+            let owner = name.to_owned();
+            small_icon_button(
+                SharedString::from(format!("aside-end-{unit}")),
+                Icon::Close,
+                "Close it with everything it started",
+                Kind::Ghost,
+                cx.listener(move |home, _, _, cx| {
+                    let request = Request::EndApp {
+                        name: owner.clone(),
+                        unit: unit.clone(),
+                    };
+                    home.end(&owner, request, cx);
+                }),
+            )
+        });
+        div()
+            .flex()
+            .items_center()
+            .gap_2p5()
+            .p_2p5()
+            .rounded(px(10.))
+            .bg(Theme::surface())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(app.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .text_color(Theme::muted())
+                            .child(detail),
+                    ),
+            )
+            .children(end)
+    }
+
+    /// The programs of the sandbox at play, as cards beside its screen.
+    pub(crate) fn programs_aside(&self, name: &str, cx: &mut Context<Self>) -> Div {
+        let mut cards = div()
+            .id("aside-programs")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap_1()
+            .px_2p5()
+            .overflow_y_scroll();
+        let mut count = 0;
+        match self.processes.as_ref().filter(|(n, _)| n == name) {
+            Some((_, Ok(apps))) => {
+                count = apps.len();
+                for app in apps {
+                    cards = cards.child(Self::aside_card(name, app, cx));
+                }
+            }
+            Some((_, Err(e))) => {
+                cards = cards.child(
+                    div()
+                        .text_sm()
+                        .text_color(Theme::warning())
+                        .child(e.clone()),
+                );
+            }
+            None => {
+                cards = cards.child(
+                    div()
+                        .text_sm()
+                        .text_color(Theme::muted())
+                        .child("Loading..."),
+                );
+            }
+        }
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(300.))
+            .h_full()
+            .bg(Theme::aside())
+            .rounded_br(self.corners.bottom_right)
+            .border_l_1()
+            .border_color(Theme::border())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .pt_3p5()
+                    .pb_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::BOLD)
+                            .child("Programs"),
+                    )
+                    .child(
                         div()
                             .text_xs()
-                            .text_color(Theme::warning())
-                            .child("Not a regular expression; matched as plain text"),
-                    )
-                })
-                .child(columns)
-                .child(
-                    div()
-                        .relative()
-                        .child(list)
-                        .children(scrollbar(&self.processes_scroll)),
-                ),
-        )
+                            .text_color(Theme::muted())
+                            .child(format!("{count} running")),
+                    ),
+            )
+            .child(cards)
+            .child(
+                div()
+                    .px_4()
+                    .py_3p5()
+                    .border_t_1()
+                    .border_color(Theme::border())
+                    .text_xs()
+                    .text_color(Theme::muted())
+                    .child("Every process, and ending one at once, is in the Programs tab."),
+            )
     }
 }
 

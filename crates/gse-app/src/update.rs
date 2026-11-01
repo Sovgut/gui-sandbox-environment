@@ -1,6 +1,7 @@
-//! Updates of the app, from the project's GitHub releases. While the app
-//! runs as an AppImage it looks for a newer release when it starts and
-//! every few hours, and the user decides whether to install it.
+//! Updates of the app, from the project's GitHub releases. The app looks
+//! for a newer release when it starts and every few hours, unless the user
+//! turns that off, and the user decides whether to install it; only a copy
+//! run from the AppImage can install one.
 //!
 //! A release carries the AppImage and its ed25519 signature, made by the
 //! release workflow with a key whose public half is built in here. The
@@ -20,6 +21,8 @@ use semver::Version;
 use serde::Deserialize;
 
 const LATEST: &str = "https://api.github.com/repos/Sovgut/gui-sandbox-environment/releases/latest";
+/// Every release, for people to read.
+const RELEASES: &str = "https://github.com/Sovgut/gui-sandbox-environment/releases";
 /// The release assets: the AppImage and its raw 64-byte signature.
 const APPIMAGE: &str = "gse-x86_64.AppImage";
 const SIGNATURE: &str = "gse-x86_64.AppImage.sig";
@@ -37,13 +40,29 @@ pub const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 #[derive(Debug, Clone)]
 pub struct Release {
     pub version: Version,
+    /// What the release says it changes, as written on GitHub.
+    pub notes: String,
     appimage: String,
     signature: String,
+}
+
+impl Release {
+    /// A release that downloads nothing, for a preview of the updates page.
+    pub fn preview(version: &str, notes: &str) -> Self {
+        Self {
+            version: Version::parse(version).expect("a preview version"),
+            notes: notes.to_owned(),
+            appimage: String::new(),
+            signature: String::new(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct GithubRelease {
     tag_name: String,
+    #[serde(default)]
+    body: Option<String>,
     assets: Vec<GithubAsset>,
 }
 
@@ -93,6 +112,7 @@ pub fn newer() -> Result<Option<Release>> {
     Ok(Some(Release {
         appimage: url(APPIMAGE)?,
         signature: url(SIGNATURE)?,
+        notes: release.body.unwrap_or_default(),
         version,
     }))
 }
@@ -162,9 +182,10 @@ pub enum State {
 }
 
 impl crate::Home {
-    /// Looks for a newer release, when the app runs as an AppImage.
-    pub(crate) fn check_updates(&mut self, cx: &mut gpui::Context<Self>) {
-        if running_appimage().is_none()
+    /// Looks for a newer release: when asked, or on its own when the user
+    /// keeps automatic checks on.
+    pub(crate) fn check_updates(&mut self, asked: bool, cx: &mut gpui::Context<Self>) {
+        if (!asked && !self.app_config.check_updates)
             || matches!(self.update, State::Checking | State::Installing(_))
         {
             return;
@@ -174,6 +195,7 @@ impl crate::Home {
         cx.spawn(async move |this, cx| {
             let found = cx.background_executor().spawn(async { newer() }).await;
             this.update(cx, |home, cx| {
+                home.update_checked = Some(chrono::Local::now());
                 home.update = match found {
                     Ok(Some(release)) => State::Available(release),
                     Ok(None) => State::UpToDate,
@@ -240,45 +262,204 @@ impl crate::Home {
         )
     }
 
-    /// App settings: the version and looking for updates.
-    pub(crate) fn updates_card(&self, cx: &mut gpui::Context<Self>) -> gpui::Div {
-        use gpui::{div, prelude::*};
-        let status: String = match &self.update {
-            _ if running_appimage().is_none() => {
-                "This copy does not run from an AppImage, so it does not update itself.".into()
-            }
-            State::Idle => String::new(),
-            State::Checking => "Looking for a newer version...".into(),
-            State::UpToDate => "This is the latest version.".into(),
-            State::Available(release) => format!("Version {} is available.", release.version),
-            State::Installing(version) => format!("Installing version {version}..."),
-            State::Failed(e) => format!("Looking for updates failed: {e}"),
-        };
-        crate::ui::card(
-            "Updates",
-            Some("The app looks for a newer version when it starts and every six hours."),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(
+    /// A newer release: the way to install it and what it brings.
+    fn release_news(
+        &self,
+        release: &Release,
+        appimage: bool,
+        cx: &mut gpui::Context<Self>,
+    ) -> gpui::Div {
+        use crate::ui::{Kind, Theme, button};
+        use gpui::{div, prelude::*, px};
+
+        let current = env!("CARGO_PKG_VERSION");
+        let mut news = div().flex().flex_col().gap_4();
+        let installing = matches!(self.update, State::Installing(_));
+        news =
+            news.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .p(px(18.))
+                    .rounded(px(12.))
+                    .bg(Theme::chosen())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(format!("GSE {} is available", release.version)),
+                            )
+                            .child(div().text_sm().text_color(Theme::secondary_text()).child(
+                                format!(
+                                    "You have {current}. Signed by the GSE release key, checked \
+                                 before installing."
+                                ),
+                            )),
+                    )
+                    .child(
+                        button(
+                            "update-install",
+                            if installing {
+                                "Installing..."
+                            } else {
+                                "Install and restart"
+                            },
+                            Kind::Primary,
+                            appimage && !installing,
+                            cx.listener(|home, _, _, cx| home.install_update(cx)),
+                        )
+                        .when(!appimage, |b| {
+                            b.tooltip("Only a copy run from the AppImage updates itself")
+                        }),
+                    ),
+            );
+        if !release.notes.trim().is_empty() {
+            let mut notes = div().flex().flex_col().gap_1();
+            for line in release
+                .notes
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+            {
+                let (bullet, text) =
+                    match line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+                        Some(text) => ("\u{2022}", text),
+                        None => ("", line.trim_start_matches('#').trim()),
+                    };
+                notes = notes.child(
                     div()
-                        .flex_1()
+                        .flex()
+                        .gap_2()
                         .text_sm()
-                        .text_color(crate::ui::Theme::muted())
-                        .child(format!("Version {}. {status}", env!("CARGO_PKG_VERSION"))),
-                )
-                .child(crate::ui::button(
-                    "update-check",
-                    "Check now",
-                    crate::ui::Kind::Secondary,
-                    running_appimage().is_some()
-                        && !matches!(self.update, State::Checking | State::Installing(_)),
-                    cx.listener(|home, _, _, cx| home.check_updates(cx)),
-                )),
-        )
+                        .text_color(Theme::secondary_text())
+                        .child(bullet)
+                        .child(text.to_owned()),
+                );
+            }
+            news = news.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .rounded(px(12.))
+                    .bg(Theme::surface())
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(format!("What's new in {}", release.version)),
+                    )
+                    .child(notes)
+                    .child(
+                        div()
+                            .id("all-releases")
+                            .text_sm()
+                            .text_color(Theme::accent())
+                            .cursor_pointer()
+                            .on_click(|_, _, cx| cx.open_url(RELEASES))
+                            .child("All releases"),
+                    ),
+            );
+        }
+        news
+    }
+
+    /// App settings, About and updates: a newer release when there is one,
+    /// what it brings, and how the app looks for updates.
+    pub(crate) fn updates_card(&self, cx: &mut gpui::Context<Self>) -> gpui::Div {
+        use crate::settings::{group, row};
+        use crate::ui::{Kind, Theme, button};
+        use gpui::{div, prelude::*};
+
+        let appimage = running_appimage().is_some();
+        let current = env!("CARGO_PKG_VERSION");
+        let mut page = div().flex().flex_col().gap_4();
+        let release = match &self.update {
+            State::Available(release) => Some(release),
+            _ => None,
+        };
+        if let Some(release) = release {
+            page = page.child(self.release_news(release, appimage, cx));
+        }
+        let checked = match &self.update {
+            State::Checking => "Looking for a newer version...".to_owned(),
+            State::Failed(e) => format!("Looking failed: {e}"),
+            _ => self.update_checked.map_or_else(
+                || "Not checked yet".to_owned(),
+                |at| {
+                    let today = chrono::Local::now().date_naive() == at.date_naive();
+                    if today {
+                        format!("Last checked today at {}", at.format("%H:%M"))
+                    } else {
+                        format!("Last checked {}", at.format("%-d %b at %H:%M"))
+                    }
+                },
+            ),
+        };
+        let (service, service_color) = match self.service {
+            crate::client::Match::Same => ("Up to date", Theme::good()),
+            crate::client::Match::ServiceOlder if crate::setup::carries_service() => {
+                ("Older; update it", Theme::warning())
+            }
+            crate::client::Match::ServiceOlder => ("Older; restart it", Theme::warning()),
+            crate::client::Match::ServiceNewer => ("Newer than the app", Theme::warning()),
+        };
+        let auto = self.app_config.check_updates;
+        if let Some(dev) = self.dev_service_card(cx) {
+            page = page.child(dev);
+        }
+        page.child(group(
+            None,
+            vec![
+                row(
+                    "Version",
+                    Some(if appimage {
+                        "Runs from the AppImage and updates itself".to_owned()
+                    } else {
+                        "Not run from the AppImage, so it does not update itself".to_owned()
+                    }),
+                    div().text_sm().child(current),
+                ),
+                row(
+                    "Check automatically",
+                    Some(
+                        "When the app starts and every six hours; installing always asks first"
+                            .to_owned(),
+                    ),
+                    gpui_kit::component::switch::Switch::new("check-updates")
+                        .checked(auto)
+                        .on_change(cx.listener(|home, on: &bool, _, cx| {
+                            home.app_config.check_updates = *on;
+                            if let Err(e) = home.app_config.save() {
+                                home.say(format!("The setting was not saved: {e:#}"), true);
+                            }
+                            cx.notify();
+                        })),
+                ),
+                row(
+                    "Background service",
+                    Some(format!("Protocol {}", gse_protocol::VERSION)),
+                    div().text_sm().text_color(service_color).child(service),
+                ),
+                row(
+                    "Updates",
+                    Some(checked),
+                    button(
+                        "update-check",
+                        "Check now",
+                        Kind::Secondary,
+                        !matches!(self.update, State::Checking | State::Installing(_)),
+                        cx.listener(|home, _, _, cx| home.check_updates(true, cx)),
+                    ),
+                ),
+            ],
+        ))
     }
 }
 

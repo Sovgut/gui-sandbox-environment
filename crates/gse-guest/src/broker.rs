@@ -1,10 +1,10 @@
-//! The desktop side of launching: holds the jail launcher's connection and
+//! The desktop side of launching: holds the environment launcher's connection and
 //! relays `run` requests over it.
 //!
 //! Requests travel as a 4-byte big-endian length followed by the command line,
 //! NUL-separated. The launcher answers with one line, `ok <unit>` or
-//! `error <text>`, which is all that ever comes back from the jail. A newer
-//! launcher connection replaces an older one; a jail process posing as the
+//! `error <text>`, which is all that ever comes back from the environment. A newer
+//! launcher connection replaces an older one; a guest process posing as the
 //! launcher can only drop or misreport requests.
 
 use std::fs;
@@ -33,7 +33,7 @@ fn listen(path: &Path, mode: u32) -> Result<UnixListener> {
 }
 
 /// Starts relaying in the background: the launcher connects on
-/// `launcher_socket` (group `jail`), `run` on `run_socket` (only `friend`).
+/// `launcher_socket` (group `guest`), `run` on `run_socket` (only `sandbox`).
 pub fn spawn(launcher_socket: &Path, run_socket: &Path) -> Result<()> {
     let launchers = listen(launcher_socket, 0o660)?;
     let requests = listen(run_socket, 0o600)?;
@@ -64,7 +64,7 @@ fn relay(launcher: &Mutex<Option<UnixStream>>, client: &mut UnixStream) -> Resul
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(stream) = slot.as_mut() else {
-        bail!("the jail launcher is not connected");
+        bail!("the environment launcher is not connected");
     };
     let exchange = |stream: &mut UnixStream| -> Result<String> {
         let len = u32::try_from(request.len())?;
@@ -73,7 +73,7 @@ fn relay(launcher: &Mutex<Option<UnixStream>>, client: &mut UnixStream) -> Resul
         let mut reply = String::new();
         BufReader::new(stream.take(MAX_REPLY)).read_line(&mut reply)?;
         if reply.is_empty() {
-            bail!("the jail launcher hung up");
+            bail!("the environment launcher hung up");
         }
         Ok(reply.trim_end().to_owned())
     };
@@ -86,7 +86,7 @@ fn relay(launcher: &Mutex<Option<UnixStream>>, client: &mut UnixStream) -> Resul
     }
 }
 
-/// Hands `command` to the desktop and reports what the jail answered.
+/// Hands `command` to the desktop and reports what the environment answered.
 pub fn request(run_socket: &Path, command: &[String]) -> Result<()> {
     let mut stream = UnixStream::connect(run_socket)
         .with_context(|| format!("connecting to the desktop at {}", run_socket.display()))?;
@@ -97,7 +97,7 @@ pub fn request(run_socket: &Path, command: &[String]) -> Result<()> {
     let reply = reply.trim();
     match reply.strip_prefix("ok ") {
         Some(unit) => {
-            println!("started as jail: {unit}");
+            println!("started as guest: {unit}");
             Ok(())
         }
         None => bail!("{}", reply.strip_prefix("error ").unwrap_or(reply)),

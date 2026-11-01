@@ -1,8 +1,8 @@
-//! Building jail images.
+//! Building environment images.
 //!
 //! An image is built inside a VM without a GPU, from an existing image (the
 //! Fedora Cloud image for the base, the base image for a preset) and a
-//! cloud-init seed carrying the provisioning script. The build VM uses the jail
+//! cloud-init seed carrying the provisioning script. The build VM uses the environment
 //! network, so it reaches package mirrors and nothing local. Its verdict comes
 //! back on the serial console; a passing build is flattened into one
 //! compressed qcow2 that no longer depends on the image it was built from.
@@ -17,17 +17,17 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use gamejail_host::preset::Preset;
-use gamejail_host::seed;
-use gamejail_host::vm::{Network, VmSpec};
+use gse_host::preset::Preset;
+use gse_host::seed;
+use gse_host::vm::{Network, VmSpec};
 use tracing::info;
 
 use crate::{state_path, vm};
 
-const VERDICT: &str = "GAMEJAIL-BUILD: ";
+const VERDICT: &str = "GSE-BUILD: ";
 /// The guest-side program, installed by the provisioning script from the seed.
-const GUEST_BIN: &str = "gamejail-guest";
-/// Room for the driver build and the desktop; the jail's own overlay grows on
+const GUEST_BIN: &str = "gse-guest";
+/// Room for the driver build and the desktop; the environment's own overlay grows on
 /// top of this.
 const BUILD_DISK: &str = "40G";
 
@@ -41,7 +41,7 @@ pub struct BuildBaseArgs {
     /// Development only: keep SSH and a `dev` account with this public key.
     #[arg(long, value_name = "PUBKEY_FILE")]
     dev_ssh_key: Option<PathBuf>,
-    /// The `gamejail-guest` binary to install in the image; by default the one
+    /// The `gse-guest` binary to install in the image; by default the one
     /// next to this program.
     #[arg(long)]
     guest_bin: Option<PathBuf>,
@@ -134,9 +134,12 @@ fn build(
         passthrough: Vec::new(),
         network: Network::Passt { socket },
         vnc_display: None,
+        screen: None,
+        input_socket: None,
         monitor_socket: state_path("build.monitor"),
         serial_log: console.clone(),
         run_as: vm::invoking_user(),
+        image_build: true,
     };
     if dry_run {
         info!("dry run: build in {}", work.display());
@@ -166,7 +169,7 @@ fn build(
         .collect();
     seed::write_nocloud(
         &seed_img,
-        &format!("gamejail-{stem}-{}", now()),
+        &format!("gse-{stem}-{}", now()),
         user_data,
         &seed_files,
     )?;

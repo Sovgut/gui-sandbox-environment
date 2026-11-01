@@ -1,4 +1,4 @@
-//! The restricted Wayland socket for the jail account.
+//! The restricted Wayland socket for the `guest` account.
 
 use std::fs;
 use std::os::fd::AsFd as _;
@@ -13,9 +13,9 @@ use wayland_client::{Connection, Dispatch, QueueHandle};
 use wayland_protocols::wp::security_context::v1::client::wp_security_context_manager_v1::WpSecurityContextManagerV1;
 use wayland_protocols::wp::security_context::v1::client::wp_security_context_v1::WpSecurityContextV1;
 
-/// Sandbox engine name the compositor sees for jail clients.
-const ENGINE: &str = "org.gamejail";
-const APP_ID: &str = "jail";
+/// Sandbox engine name the compositor sees for environment clients.
+const ENGINE: &str = "org.gse";
+const APP_ID: &str = "guest";
 
 struct State;
 
@@ -71,7 +71,7 @@ pub fn serve(socket: &Path) -> Result<()> {
     }
     let listener =
         UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))?;
-    // The directory is setgid `jail`; members of that group may connect.
+    // The directory is setgid `guest`; members of that group may connect.
     fs::set_permissions(socket, fs::Permissions::from_mode(0o660))?;
 
     // The compositor keeps listening until the read end of this pipe sees the
@@ -85,7 +85,7 @@ pub fn serve(socket: &Path) -> Result<()> {
     queue.roundtrip(&mut State)?;
     drop(listener);
     drop(close_read);
-    eprintln!("jail display ready on {}", socket.display());
+    eprintln!("guest display ready on {}", socket.display());
 
     loop {
         queue

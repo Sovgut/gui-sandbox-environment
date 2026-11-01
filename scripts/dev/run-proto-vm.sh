@@ -6,7 +6,7 @@
 # The GPU must already be on vfio-pci (gpu-vfio.sh attach). The guest is
 # reachable over SSH on 127.0.0.1:2222, its emulated display over VNC on
 # 127.0.0.1:5901 and its serial console in console.log. This prototype uses
-# QEMU user networking; the jail network isolation is not part of it.
+# QEMU user networking; the environment network isolation is not part of it.
 #
 # Usage: run-proto-vm.sh [slot]
 
@@ -27,7 +27,7 @@ done
 ulimit -l unlimited
 
 exec qemu-system-x86_64 \
-    -name gamejail-proto \
+    -name gse-proto \
     -machine q35,accel=kvm \
     -cpu host,topoext=on \
     -smp 8,sockets=1,cores=4,threads=2 \

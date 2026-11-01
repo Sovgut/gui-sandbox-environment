@@ -21,7 +21,7 @@ pub const GPU_SERVICES: [&str; 2] = ["nvidia-powerd.service", "nvidia-persistenc
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// The GPU drives the host desktop, which has to stop while a jail runs.
+    /// The GPU drives the host desktop, which has to stop while an environment runs.
     Single,
     /// Another GPU drives the desktop; only this GPU changes hands.
     Secondary,
@@ -379,7 +379,7 @@ mod tests {
         (dir, snapshot)
     }
 
-    /// The friend's machine: one NVIDIA card on the proprietary driver, with
+    /// The target machine: one NVIDIA card on the proprietary driver, with
     /// the monitor on it.
     fn rtx_target() -> (tempfile::TempDir, Snapshot) {
         let dir = tempfile::tempdir().unwrap();

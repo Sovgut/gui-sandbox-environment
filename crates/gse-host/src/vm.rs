@@ -1,4 +1,4 @@
-//! A jail VM and the QEMU command line that runs it.
+//! An environment VM and the QEMU command line that runs it.
 
 use std::path::PathBuf;
 
@@ -14,7 +14,7 @@ pub const OVMF_VARS_TEMPLATE: &str = "/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmSpec {
     pub name: String,
-    /// The jail's writable disk, usually an overlay on a preset image.
+    /// The environment's writable disk, usually an overlay on a preset image.
     pub disk: PathBuf,
     /// Extra raw disks attached read-only, such as a cloud-init seed.
     pub read_only_disks: Vec<PathBuf>,
@@ -28,20 +28,51 @@ pub struct VmSpec {
     pub passthrough: Vec<PciAddress>,
     pub network: Network,
     /// An emulated display reachable over VNC on localhost, for development:
-    /// the passed-through GPU is the jail's real screen.
+    /// the passed-through GPU is the environment's real screen.
     pub vnc_display: Option<u16>,
-    /// QEMU's human monitor, used to ask the guest to power down.
+    /// The environment screen shown on the host: the guest copies its desktop
+    /// into shared memory instead of driving a monitor of its own, and plays
+    /// its sound on a playback-only sound card through the host user's sound
+    /// server. QEMU reaches it over the PulseAudio protocol: its native
+    /// PipeWire backend barely advances a stream it opened as root before
+    /// dropping privileges, and the guest's sound then crawls.
+    pub screen: Option<Screen>,
+    /// A QMP socket through which the viewer of the environment screen sends input to
+    /// the VM's virtual keyboard, its tablet (absolute pointer for the
+    /// desktop) and its mouse (relative motion for games that lock the
+    /// pointer).
+    pub input_socket: Option<PathBuf>,
+    /// QEMU's human monitor, on a socket only root reaches, for inspecting a
+    /// running VM.
     pub monitor_socket: PathBuf,
     pub serial_log: PathBuf,
     /// The account QEMU drops to once its devices are open.
     pub run_as: Option<String>,
+    /// An image build: the guest learns it through the `fw_cfg` item
+    /// `opt/gse/build` and starts no desktop, which a VM without a GPU could
+    /// only start and lose in a loop.
+    pub image_build: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Screen {
+    /// The file behind the memory the guest shares with the host
+    /// (`ivshmem-plain`); see `gse-screen` for its layout.
+    pub memory: PathBuf,
+    /// The guest's output mode, such as `2560x1440@60`, handed over as the
+    /// `fw_cfg` item `opt/gse/screen`.
+    pub mode: String,
+    /// The PulseAudio socket of the host user's sound server. QEMU opens it
+    /// while still root, so it is named rather than looked up in a runtime
+    /// directory, which libpulse refuses to use for another user.
+    pub sound_server: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Network {
     None,
     /// A virtio card backed by the passt instance listening on `socket`;
-    /// see [`crate::net`] for what the jail can reach through it.
+    /// see [`crate::net`] for what the environment can reach through it.
     Passt {
         socket: PathBuf,
     },
@@ -114,6 +145,16 @@ impl VmSpec {
             ]),
             None => push(&["-vga", "none", "-display", "none"]),
         }
+        let screen_and_input = self.screen_and_input();
+        push(
+            &screen_and_input
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        if self.image_build {
+            push(&["-fw_cfg", "name=opt/gse/build,string=1"]);
+        }
         push(&["-serial", &format!("file:{}", self.serial_log.display())]);
         push(&[
             "-monitor",
@@ -121,6 +162,57 @@ impl VmSpec {
         ]);
         if let Some(user) = &self.run_as {
             push(&["-run-with", &format!("user={user}")]);
+        }
+        args
+    }
+
+    /// The shared screen memory and the input devices and socket of the
+    /// environment screen shown on the host.
+    fn screen_and_input(&self) -> Vec<String> {
+        let mut args: Vec<String> = Vec::new();
+        let mut push = |parts: &[&str]| args.extend(parts.iter().map(|s| (*s).to_owned()));
+        if let Some(screen) = &self.screen {
+            push(&[
+                "-object",
+                &format!(
+                    "memory-backend-file,id=screen,mem-path={},size={},share=on",
+                    screen.memory.display(),
+                    gse_screen::SIZE
+                ),
+                "-device",
+                "ivshmem-plain,memdev=screen",
+                "-fw_cfg",
+                &format!("name=opt/gse/screen,string={}", screen.mode),
+                // One playback stream and no capture: the guest gets no
+                // input from the host's microphones. virtio-sound rather
+                // than an emulated Intel HDA, whose DMA timing the guest's
+                // PipeWire follows unevenly and plays with dropouts.
+                "-audiodev",
+                &format!(
+                    "pa,id=audio,server=unix:{},out.stream-name=gse-{}",
+                    screen.sound_server.display(),
+                    self.name
+                ),
+                "-device",
+                "virtio-sound-pci,audiodev=audio,streams=1",
+            ]);
+        }
+        if let Some(socket) = &self.input_socket {
+            push(&[
+                "-device",
+                "virtio-keyboard-pci",
+                "-device",
+                "virtio-tablet-pci",
+                "-device",
+                "virtio-mouse-pci",
+                "-chardev",
+                &format!(
+                    "socket,id=input,path={},server=on,wait=off",
+                    socket.display()
+                ),
+                "-object",
+                "monitor-qmp,id=input-monitor,chardev=input",
+            ]);
         }
         args
     }
@@ -144,9 +236,12 @@ mod tests {
             ],
             network: Network::None,
             vnc_display: None,
-            monitor_socket: "/run/gamejail/proto.monitor".into(),
+            screen: None,
+            input_socket: None,
+            monitor_socket: "/run/gse/proto.monitor".into(),
             serial_log: "/vm/console.log".into(),
             run_as: Some("sovhut".into()),
+            image_build: false,
         }
     }
 
@@ -174,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn jail_has_no_network_and_no_emulated_display_by_default() {
+    fn environment_has_no_network_and_no_emulated_display_by_default() {
         let args = spec().command_line();
         assert_eq!(after(&args, "-nic"), ["none"]);
         assert_eq!(after(&args, "-vga"), ["none"]);
@@ -183,15 +278,15 @@ mod tests {
 
     #[test]
     fn network_card_is_backed_by_passt() {
-        let mut jail = spec();
-        jail.network = Network::Passt {
-            socket: "/run/gamejail/proto.passt".into(),
+        let mut environment = spec();
+        environment.network = Network::Passt {
+            socket: "/run/gse/proto.passt".into(),
         };
-        let args = jail.command_line();
+        let args = environment.command_line();
         assert_eq!(after(&args, "-nic"), Vec::<&str>::new());
         assert_eq!(
             after(&args, "-netdev"),
-            ["stream,id=net0,server=off,addr.type=unix,addr.path=/run/gamejail/proto.passt"]
+            ["stream,id=net0,server=off,addr.type=unix,addr.path=/run/gse/proto.passt"]
         );
         assert!(after(&args, "-device").contains(&"virtio-net-pci,netdev=net0"));
     }
@@ -203,6 +298,44 @@ mod tests {
         let args = dev.command_line();
         assert_eq!(after(&args, "-display"), ["vnc=127.0.0.1:1"]);
         assert!(after(&args, "-device").contains(&"virtio-vga"));
+    }
+
+    #[test]
+    fn environment_screen_is_shared_memory() {
+        let mut environment = spec();
+        environment.screen = Some(Screen {
+            memory: "/dev/shm/gse-proto.screen".into(),
+            mode: "1920x1080@60".into(),
+            sound_server: "/run/user/1000/pulse/native".into(),
+        });
+        let args = environment.command_line();
+        assert_eq!(
+            after(&args, "-object"),
+            [
+                "memory-backend-file,id=screen,mem-path=/dev/shm/gse-proto.screen,size=134217728,share=on"
+            ]
+        );
+        assert!(after(&args, "-device").contains(&"ivshmem-plain,memdev=screen"));
+        assert_eq!(
+            after(&args, "-fw_cfg"),
+            ["name=opt/gse/screen,string=1920x1080@60"]
+        );
+        assert_eq!(
+            after(&args, "-audiodev"),
+            ["pa,id=audio,server=unix:/run/user/1000/pulse/native,out.stream-name=gse-proto"]
+        );
+        assert!(after(&args, "-device").contains(&"virtio-sound-pci,audiodev=audio,streams=1"));
+    }
+
+    #[test]
+    fn image_builds_tell_the_guest() {
+        let mut build = spec();
+        assert_eq!(after(&build.command_line(), "-fw_cfg"), Vec::<&str>::new());
+        build.image_build = true;
+        assert_eq!(
+            after(&build.command_line(), "-fw_cfg"),
+            ["name=opt/gse/build,string=1"]
+        );
     }
 
     #[test]

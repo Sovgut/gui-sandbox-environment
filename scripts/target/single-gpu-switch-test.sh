@@ -16,7 +16,7 @@
 # card that is the boot VGA device. HOLD_SECONDS (default 5) is the time spent
 # on vfio-pci.
 #
-# The log is /var/tmp/gamejail-switch-test-<time>.log, readable by everyone.
+# The log is /var/tmp/gse-switch-test-<time>.log, readable by everyone.
 
 set -u
 export LC_ALL=C
@@ -24,8 +24,8 @@ export LC_ALL=C
 DRY_RUN="${DRY_RUN:-0}"
 HOLD_SECONDS="${HOLD_SECONDS:-5}"
 FAILSAFE_SECONDS="${FAILSAFE_SECONDS:-60}"
-UNIT=gamejail-switch-test
-FAILSAFE_UNIT=gamejail-switch-failsafe
+UNIT=gse-switch-test
+FAILSAFE_UNIT=gse-switch-failsafe
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "run it with sudo" >&2
@@ -36,12 +36,12 @@ fi
 # test itself runs as a transient system service outside the session.
 if [ -z "${GJ_DETACHED:-}" ]; then
     self="${BASH_SOURCE[0]}"
-    if [ ! -f "$self" ] || ! grep -q 'gamejail single-GPU switch test' "$self"; then
+    if [ ! -f "$self" ] || ! grep -q 'gse single-GPU switch test' "$self"; then
         echo "run it from a saved file: sudo bash single-gpu-switch-test.sh" >&2
         exit 1
     fi
     stamp="$(date +%Y%m%d-%H%M%S)"
-    log="/var/tmp/gamejail-switch-test-$stamp.log"
+    log="/var/tmp/gse-switch-test-$stamp.log"
     # Stays owned by root and world-readable: with fs.protected_regular, root
     # cannot append to a file in /var/tmp that another user owns.
     install -m 644 /dev/null "$log"
@@ -50,14 +50,14 @@ if [ -z "${GJ_DETACHED:-}" ]; then
         echo "launcher: $(sha256sum < "$self" | cut -c1-16), $(grep -c $'\r' "$self") CR characters"
     } >> "$log"
     # Line endings from a messenger or browser would break every line.
-    tr -d '\r' < "$self" > /run/gamejail-switch-test.sh
-    chmod 700 /run/gamejail-switch-test.sh
+    tr -d '\r' < "$self" > /run/gse-switch-test.sh
+    chmod 700 /run/gse-switch-test.sh
     systemctl reset-failed "$UNIT.service" "$FAILSAFE_UNIT.timer" 2>/dev/null
     if ! systemd-run --unit "$UNIT" --collect --property=Type=exec \
         --setenv=GJ_DETACHED=1 --setenv=GJ_LOG="$log" \
         --setenv=DRY_RUN="$DRY_RUN" --setenv=HOLD_SECONDS="$HOLD_SECONDS" \
         --setenv=FAILSAFE_SECONDS="$FAILSAFE_SECONDS" --setenv=SLOT="${SLOT:-}" \
-        /bin/bash /run/gamejail-switch-test.sh >> "$log" 2>&1; then
+        /bin/bash /run/gse-switch-test.sh >> "$log" 2>&1; then
         echo "launcher: systemd-run failed" >> "$log"
         cat "$log"
         exit 1
@@ -78,7 +78,7 @@ if [ -z "${GJ_DETACHED:-}" ]; then
 fi
 
 log="$GJ_LOG"
-# A failure here lands in the journal: journalctl -u gamejail-switch-test
+# A failure here lands in the journal: journalctl -u gse-switch-test
 if ! exec >>"$log" 2>&1; then
     echo "cannot write $log" >&2
     exit 1
@@ -114,7 +114,7 @@ write() {
     printf '%s\n' "$1" > "$2" || { say "  -> write failed"; return 1; }
 }
 
-say "gamejail single-GPU switch test, dry run: $DRY_RUN"
+say "gse single-GPU switch test, dry run: $DRY_RUN"
 uname -r
 
 # --- target -----------------------------------------------------------------

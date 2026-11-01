@@ -1,11 +1,12 @@
 [package]
-name = "gamejail-host"
-description = "Host-side model of gamejail: PCI GPUs, their users, and the plans that move a GPU between the host and a jail"
+name = "gse-host"
+description = "Host-side model of gse: PCI GPUs, their users, and the plans that move a GPU between the host and an environment"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+gse-screen = { path = "../gse-screen" }
 thiserror.workspace = true
 tracing.workspace = true
 fatfs.workspace = true

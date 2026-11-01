@@ -1,0 +1,29 @@
+[package]
+name = "gse-screen"
+description = "The environment screen: frames the guest writes into memory it shares with the host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ash = { version = "0.38", optional = true }
+memmap2 = "0.9"
+thiserror.workspace = true
+
+[features]
+# The guest's Vulkan readback of frames the compositor copied into GPU
+# buffers; the host never needs it.
+readback = ["dep:ash"]
+
+# Mapping shared memory and reading it with atomics needs `unsafe`; it is
+# confined to this crate, which the workspace's `forbid` would otherwise
+# reject.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+
+[dev-dependencies]
+tempfile.workspace = true

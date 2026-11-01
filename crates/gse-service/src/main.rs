@@ -1,4 +1,4 @@
-//! gamejail's root service.
+//! gse's root service.
 //!
 //! The commands here are the service's operations, callable directly while
 //! the service grows its socket interface.
@@ -13,12 +13,12 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use gamejail_host::Root;
-use gamejail_host::pci::PciAddress;
+use gse_host::Root;
+use gse_host::pci::PciAddress;
 use tracing::error;
 
 /// Runtime state; cleared on reboot, which also returns every GPU to the host.
-const STATE_DIR: &str = "/run/gamejail";
+const STATE_DIR: &str = "/run/gse";
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -32,22 +32,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// GPUs and their hand-over to jails.
+    /// GPUs and their hand-over to environments.
     Gpu {
         #[command(subcommand)]
         action: GpuAction,
     },
-    /// Jail virtual machines.
+    /// Environment virtual machines.
     Vm {
         #[command(subcommand)]
         action: VmAction,
     },
-    /// The jail network rules.
+    /// The environment network rules.
     Net {
         #[command(subcommand)]
         action: NetAction,
     },
-    /// Jail images.
+    /// Environment images.
     Image {
         #[command(subcommand)]
         action: ImageAction,
@@ -56,8 +56,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ImageAction {
-    /// Build the base image every jail shares: NVIDIA driver, desktop and the
-    /// `friend` and `jail` accounts, in a VM without a GPU.
+    /// Build the base image every environment shares: NVIDIA driver, desktop and the
+    /// `sandbox` and `guest` accounts, in a VM without a GPU.
     BuildBase(image::BuildBaseArgs),
     /// Build a preset image: the base image with a preset's applications.
     BuildPreset(image::BuildPresetArgs),
@@ -65,14 +65,14 @@ enum ImageAction {
 
 #[derive(Subcommand)]
 enum NetAction {
-    /// Turn the running jail's internet on or off.
+    /// Turn the running environment's internet on or off.
     Internet {
         #[arg(value_enum)]
         state: Switch,
     },
-    /// Remove the jail network rules.
+    /// Remove the environment network rules.
     Remove,
-    /// Print the rules installed while a jail runs with internet on.
+    /// Print the rules installed while an environment runs with internet on.
     Rules,
 }
 

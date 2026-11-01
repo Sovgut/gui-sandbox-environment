@@ -1,12 +1,13 @@
 [package]
-name = "gamejail-service"
-description = "Root service of gamejail: switches the GPU between the host and a jail and runs the jail VM"
+name = "gse-service"
+description = "Root service of gse: switches the GPU between the host and an environment and runs the environment VM"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-gamejail-host = { path = "../gamejail-host" }
+gse-screen = { path = "../gse-screen" }
+gse-host = { path = "../gse-host" }
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true

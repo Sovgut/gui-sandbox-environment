@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/gamejail-guest", "crates/gamejail-host", "crates/gamejail-service"]
+members = ["crates/gse-guest", "crates/gse-host", "crates/gse-screen", "crates/gse-service", "crates/gse-viewer"]
 
 [workspace.package]
 version = "0.1.0"

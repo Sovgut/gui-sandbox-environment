@@ -1,9 +1,9 @@
-//! The jail's network: internet only, nothing local.
+//! The environment's network: internet only, nothing local.
 //!
 //! The guest's network card is backed by passt, a user-space network stack
 //! that turns the guest's traffic into ordinary sockets of the passt process.
 //! The host therefore needs no bridge, no forwarding and no NAT, and every
-//! packet the jail sends leaves the host as a packet of one dedicated account.
+//! packet the environment sends leaves the host as a packet of one dedicated account.
 //! An nftables output rule on that account drops everything bound for the
 //! host itself, the LAN and other non-internet ranges, and turning the
 //! internet off is one more rule.
@@ -13,8 +13,8 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 /// The system account passt runs as; only its traffic is filtered.
-pub const NET_USER: &str = "gamejail-net";
-pub const TABLE: &str = "gamejail";
+pub const NET_USER: &str = "gse-net";
+pub const TABLE: &str = "gse";
 pub const PASST: &str = "passt";
 
 /// Public resolvers handed to the guest, so DNS never touches the host's
@@ -47,7 +47,7 @@ const BLOCKED_V6: &[&str] = &[
     "ff00::/8",
 ];
 
-/// The nftables script for the jail network, applied atomically with
+/// The nftables script for the environment network, applied atomically with
 /// `nft -f -`. It replaces any earlier version of the table.
 #[must_use]
 pub fn ruleset(net_uid: u32, internet: bool) -> String {
@@ -62,7 +62,7 @@ pub fn ruleset(net_uid: u32, internet: bool) -> String {
     );
     let _ = writeln!(out, "    meta skuid != {net_uid} accept");
     // Replies on connections this host opened into passt, such as the
-    // development SSH forward. The jail cannot open such a connection itself:
+    // development SSH forward. The environment cannot open such a connection itself:
     // its own connections leave as new ones and meet the rules below.
     let _ = writeln!(
         out,
@@ -98,7 +98,7 @@ pub fn remove_ruleset() -> String {
     format!("table inet {TABLE}\ndelete table inet {TABLE}\n")
 }
 
-/// A passt instance serving one jail.
+/// A passt instance serving one environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Passt {
     pub socket: PathBuf,
@@ -141,7 +141,7 @@ impl Passt {
     }
 }
 
-/// Whether `addr` is one the jail may reach, by the same ranges the ruleset
+/// Whether `addr` is one the environment may reach, by the same ranges the ruleset
 /// blocks. Addresses of the host itself are only known to the kernel, so a
 /// public address of this host still reads as allowed here.
 #[must_use]
@@ -178,18 +178,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_jail_account_is_filtered() {
+    fn only_the_network_account_is_filtered() {
         let rules = ruleset(978, true);
         assert!(rules.contains("meta skuid != 978 accept"));
         assert!(
             rules.contains("fib daddr type { local, broadcast, multicast, anycast } counter drop")
         );
         assert!(!rules.contains("internet off"));
-        assert!(rules.starts_with("table inet gamejail\ndelete table inet gamejail\n"));
+        assert!(rules.starts_with("table inet gse\ndelete table inet gse\n"));
     }
 
     #[test]
-    fn internet_off_drops_everything_from_the_jail() {
+    fn internet_off_drops_everything_from_the_environment() {
         let rules = ruleset(978, false);
         let off = rules.find("internet off").unwrap();
         assert!(off > rules.find("skuid != 978").unwrap());
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn passt_serves_one_guest_without_inbound_ports() {
         let passt = Passt {
-            socket: "/run/gamejail/proto.passt".into(),
+            socket: "/run/gse/proto.passt".into(),
             net_uid: 978,
             dev_ssh_port: None,
         };

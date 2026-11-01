@@ -4,10 +4,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use gamejail_host::exec::{self, Executor, HostSystem};
-use gamejail_host::pci::{Gpu, PciAddress};
-use gamejail_host::plan::{self, Handoff, Mode, VFIO_PCI};
-use gamejail_host::{Root, holders};
+use gse_host::exec::{self, Executor, HostSystem};
+use gse_host::pci::{Gpu, PciAddress};
+use gse_host::plan::{self, Handoff, Mode, VFIO_PCI};
+use gse_host::{Root, holders};
 use tracing::{error, info};
 
 use crate::{STATE_DIR, is_root, state_path};

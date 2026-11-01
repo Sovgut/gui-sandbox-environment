@@ -16,15 +16,15 @@ if [ ! -e "$vm/disk.qcow2" ]; then
     qemu-img create -q -f qcow2 -F qcow2 -b "$base" "$vm/disk.qcow2" 60G
 fi
 [ -e "$vm/OVMF_VARS.qcow2" ] || cp /usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2 "$vm/OVMF_VARS.qcow2"
-[ -e "$vm/id_ed25519" ] || ssh-keygen -q -t ed25519 -N '' -C gamejail-proto -f "$vm/id_ed25519"
+[ -e "$vm/id_ed25519" ] || ssh-keygen -q -t ed25519 -N '' -C gse-proto -f "$vm/id_ed25519"
 
 seed="$vm/seed"
 mkdir -p "$seed"
 cat > "$seed/meta-data" <<EOF
-instance-id: gamejail-proto
-local-hostname: gamejail-proto
+instance-id: gse-proto
+local-hostname: gse-proto
 EOF
-# The prototype user gets passwordless sudo; the real jail image has no sudo.
+# The prototype user gets passwordless sudo; the real environment image has no sudo.
 cat > "$seed/user-data" <<EOF
 #cloud-config
 users:

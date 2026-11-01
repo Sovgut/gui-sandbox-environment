@@ -1,21 +1,21 @@
 #!/bin/bash
-# Builds the base layer every jail image shares, inside a fresh Fedora Cloud
+# Builds the base layer every environment image shares, inside a fresh Fedora Cloud
 # guest that cloud-init boots once: the NVIDIA driver, a light Wayland desktop
-# that logs `friend` in on its own, the confined `jail` account for games,
+# that logs `sandbox` in on its own, the confined `guest` account for untrusted programs,
 # PipeWire and Flatpak. The build VM has no GPU, so the driver module is built
 # for the newest installed kernel rather than the running one.
 #
 # The last line on the serial console is the verdict the host reads:
-# "GAMEJAIL-BUILD: OK" or "GAMEJAIL-BUILD: FAILED <line>". The guest powers off
+# "GSE-BUILD: OK" or "GSE-BUILD: FAILED <line>". The guest powers off
 # either way.
 #
-# GAMEJAIL_DEV=1 keeps SSH and the `dev` account cloud-init created; without it
+# GSE_DEV=1 keeps SSH and the `dev` account cloud-init created; without it
 # the image has no SSH server and no account that can become root.
 
 set -euo pipefail
 
 verdict() {
-    echo "GAMEJAIL-BUILD: $*" > /dev/ttyS0
+    echo "GSE-BUILD: $*" > /dev/ttyS0
     systemctl --no-block poweroff
 }
 trap 'verdict "FAILED $LINENO"' ERR
@@ -35,37 +35,81 @@ step "NVIDIA driver"
 # Cloud images carry kernel-core without the `kernel` meta package, so the
 # installed kernels are read from their module directories.
 kernel="$(find /lib/modules -mindepth 1 -maxdepth 1 -printf '%f\n' | sort -V | tail -1)"
-dnf -y install akmod-nvidia xorg-x11-drv-nvidia-cuda "kernel-devel-$kernel"
+# kernel-modules carries the sound drivers (HDMI audio of the GPU, the sound
+# card the host provides in window mode); cloud images leave it out.
+dnf -y install akmod-nvidia xorg-x11-drv-nvidia-cuda "kernel-devel-$kernel" \
+    "kernel-modules-$kernel"
 akmods --force --kernels "$kernel"
-# A missing module would only show at the first jail boot as a black screen.
+# A missing module would only show at the first environment boot as a black screen.
 modinfo -k "$kernel" nvidia > /dev/null
 
 step "desktop"
 dnf -y install \
     labwc lxqt-wayland-session lxqt-session lxqt-panel lxqt-config \
+    lxqt-qtplugin lxqt-themes lxqt-notificationd lxqt-runner breeze-icon-theme \
     pcmanfm-qt qterminal featherpad xdg-desktop-portal-lxqt xdg-desktop-portal-wlr \
-    xorg-x11-server-Xwayland xwayland-satellite greetd greetd-selinux \
+    xorg-x11-server-Xwayland xwayland-satellite greetd greetd-selinux wlr-randr \
     pipewire wireplumber pipewire-pulseaudio \
     flatpak policycoreutils-python-utils google-noto-sans-fonts
 
 step "accounts"
-# `friend` owns the desktop and trusted apps; `jail` runs every launcher and
-# game as an SELinux confined user, which forbids su, sudo and SUID
+# `sandbox` owns the desktop and trusted apps; `guest` runs every launcher and
+# untrusted program as an SELinux confined user, which forbids su, sudo and SUID
 # transitions. Neither has a password: the desktop starts without a login.
-useradd --create-home --comment "Desktop owner" friend
-useradd --create-home --comment "Games" jail
-semanage login -a -s user_u jail
-chmod 0700 /home/friend /home/jail
+useradd --create-home --comment "Desktop owner" sandbox
+useradd --create-home --comment "Untrusted programs" guest
+semanage login -a -s user_u guest
+chmod 0700 /home/sandbox /home/guest
 
-install -d -o friend -g friend /home/friend/.config/lxqt
-cat > /home/friend/.config/lxqt/session.conf <<'EOF'
+install -d -o sandbox -g sandbox /home/sandbox/.config/lxqt
+cat > /home/sandbox/.config/lxqt/session.conf <<'EOF'
 [General]
 compositor=labwc
 EOF
-chown friend:friend /home/friend/.config/lxqt/session.conf
+chown sandbox:sandbox /home/sandbox/.config/lxqt/session.conf
 
 step "login"
-# greetd starts the desktop as `friend` on boot as an ordinary user session.
+# The host tells the guest how its screen is shown through QEMU's fw_cfg:
+# opt/gse/screen holds a mode such as 2560x1440@60 when the screen goes to
+# the host through shared memory, and is absent when the GPU drives a monitor
+# of its own. In the first case labwc runs with a virtual output on the GPU
+# instead of the GPU's connectors. The fw_cfg file is readable by root only,
+# so a service copies the mode to /run/gse/screen-mode before the login.
+# opt/gse/build marks an image build, which has no GPU: the service then
+# leaves /run/gse/build, and greetd starts no desktop.
+cat > /etc/systemd/system/gse-screen-mode.service <<'EOF'
+[Unit]
+Description=Screen mode the host chose for this environment
+After=systemd-modules-load.service
+Before=greetd.service
+
+[Service]
+Type=oneshot
+ExecStartPre=-/usr/sbin/modprobe qemu_fw_cfg
+ExecStart=/bin/sh -c 'install -d /run/gse; f=/sys/firmware/qemu_fw_cfg/by_name/opt/gse/screen/raw; rm -f /run/gse/screen-mode; [ -r $f ] && install -m 0644 $f /run/gse/screen-mode; true'
+ExecStart=/bin/sh -c 'rm -f /run/gse/build; [ -r /sys/firmware/qemu_fw_cfg/by_name/opt/gse/build/raw ] && touch /run/gse/build; true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable gse-screen-mode.service
+mkdir -p /etc/systemd/system/greetd.service.d
+cat > /etc/systemd/system/greetd.service.d/gse.conf <<'EOF'
+[Unit]
+After=gse-screen-mode.service
+ConditionPathExists=!/run/gse/build
+EOF
+install -d /usr/libexec/gse
+cat > /usr/libexec/gse/session <<'EOF'
+#!/bin/sh
+# Starts the desktop of `sandbox` for the screen the host chose.
+if [ -s /run/gse/screen-mode ]; then
+    export WLR_BACKENDS=headless,libinput WLR_HEADLESS_OUTPUTS=1
+fi
+exec startlxqtwayland
+EOF
+chmod 0755 /usr/libexec/gse/session
+# greetd starts the desktop as `sandbox` on boot as an ordinary user session.
 # After a logout it falls back to the greeter slot, which starts the same
 # desktop again; logind then classes that session as a greeter.
 cat > /etc/greetd/config.toml <<'EOF'
@@ -73,48 +117,63 @@ cat > /etc/greetd/config.toml <<'EOF'
 vt = 1
 
 [initial_session]
-command = "startlxqtwayland"
-user = "friend"
+command = "/usr/libexec/gse/session"
+user = "sandbox"
 
 [default_session]
-command = "startlxqtwayland"
-user = "friend"
+command = "/usr/libexec/gse/session"
+user = "sandbox"
 EOF
 systemctl enable greetd.service
+# The host waits for this line on the serial console to know the environment
+# is up: it goes out once the desktop of `sandbox` has its Wayland socket.
+cat > /etc/systemd/system/gse-ready.service <<'EOF'
+[Unit]
+Description=Tell the host the environment is up
+After=greetd.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'socket=/run/user/$(id -u sandbox)/wayland-0; for i in $(seq 120); do [ -S $socket ] && exec sh -c "echo GSE-READY > /dev/ttyS0"; sleep 1; done'
+
+[Install]
+WantedBy=graphical.target
+EOF
+systemctl enable gse-ready.service
 systemctl set-default graphical.target
 
-step "jail runtime"
-# gamejail-guest travels on the seed volume next to the cloud-init files.
-mkdir -p /run/gamejail-seed
-mount -o ro LABEL=CIDATA /run/gamejail-seed
-install -D -m 0755 /run/gamejail-seed/gamejail-guest /usr/libexec/gamejail/gamejail-guest
-umount /run/gamejail-seed
-restorecon -R /usr/libexec/gamejail
+step "guest runtime"
+# gse-guest travels on the seed volume next to the cloud-init files.
+mkdir -p /run/gse-seed
+mount -o ro LABEL=CIDATA /run/gse-seed
+install -D -m 0755 /run/gse-seed/gse-guest /usr/libexec/gse/gse-guest
+umount /run/gse-seed
+restorecon -R /usr/libexec/gse
 
-# The sockets `jail` connects to live in a directory owned by `friend` with
-# setgid group `jail`, so only those two accounts reach them. Every connection
-# between them is opened by `jail`: SELinux cannot label one opened by the
-# unconfined `friend` towards a socket the confined `jail` serves.
-semanage fcontext -a -t user_tmp_t '/run/gamejail(/.*)?'
-cat > /etc/tmpfiles.d/gamejail.conf <<'EOF'
-d /run/gamejail 0755 root root -
-d /run/gamejail/display 2750 friend jail -
+# The sockets `guest` connects to live in a directory owned by `sandbox` with
+# setgid group `guest`, so only those two accounts reach them. Every connection
+# between them is opened by `guest`: SELinux cannot label one opened by the
+# unconfined `sandbox` towards a socket the confined `guest` serves.
+semanage fcontext -a -t user_tmp_t '/run/gse(/.*)?'
+cat > /etc/tmpfiles.d/gse.conf <<'EOF'
+d /run/gse 0755 root root -
+d /run/gse/display 2750 sandbox guest -
 EOF
 
-# The jail account's systemd instance runs from boot, so its launcher and X
+# The `guest` account's systemd instance runs from boot, so its launcher and X
 # server wait for the desktop rather than the other way round.
-loginctl enable-linger jail
-units=/home/jail/.config/systemd/user
-install -d -o jail -g jail /home/jail/.config /home/jail/.config/systemd \
-    "$units" "$units/default.target.wants" /home/jail/.config/environment.d
-cat > /home/jail/.config/environment.d/gamejail.conf <<'EOF'
-WAYLAND_DISPLAY=/run/gamejail/display/wayland-0
+loginctl enable-linger guest
+units=/home/guest/.config/systemd/user
+install -d -o guest -g guest /home/guest/.config /home/guest/.config/systemd \
+    "$units" "$units/default.target.wants" /home/guest/.config/environment.d
+cat > /home/guest/.config/environment.d/gse.conf <<'EOF'
+WAYLAND_DISPLAY=/run/gse/display/wayland-0
 DISPLAY=:1
-PULSE_SERVER=unix:/run/gamejail/display/pulse
+PULSE_SERVER=unix:/run/gse/display/pulse
 EOF
-cat > "$units/gamejail-xwayland.service" <<'EOF'
+cat > "$units/gse-xwayland.service" <<'EOF'
 [Unit]
-Description=X server for jail programs, on the restricted display
+Description=X server for guest programs, on the restricted display
 # Retries until the desktop has opened the display.
 StartLimitIntervalSec=0
 
@@ -125,30 +184,37 @@ ExecStart=/usr/bin/xwayland-satellite :1
 Restart=always
 RestartSec=2
 EOF
-cat > "$units/gamejail-launch.service" <<'EOF'
+cat > "$units/gse-launch.service" <<'EOF'
 [Unit]
-Description=Starts programs as jail when the desktop asks
+Description=Starts programs as guest when the desktop asks
 StartLimitIntervalSec=0
 
 [Service]
-ExecStart=/usr/libexec/gamejail/gamejail-guest launcher
+ExecStart=/usr/libexec/gse/gse-guest launcher
 Restart=always
 RestartSec=1
 EOF
-ln -s ../gamejail-xwayland.service ../gamejail-launch.service "$units/default.target.wants/"
-chown -R jail:jail /home/jail/.config
+ln -s ../gse-xwayland.service ../gse-launch.service "$units/default.target.wants/"
+# `guest` has no sound server of its own: one would hold no sound card, and
+# Wine's PipeWire driver would pick it and play into nothing instead of
+# reaching the desktop's server through PULSE_SERVER.
+for unit in pipewire.socket pipewire.service pipewire-pulse.socket \
+    pipewire-pulse.service wireplumber.service filter-chain.service; do
+    ln -s /dev/null "$units/$unit"
+done
+chown -R guest:guest /home/guest/.config
 
-# Sound for `jail` comes from the desktop's sound server through a second
+# Sound for `guest` comes from the desktop's sound server through a second
 # PulseAudio socket beside the display. Its clients are "restricted", which
 # WirePlumber turns into read-only access, and they may not record (no
-# microphone, no monitor of what others play) or change any volume. `jail`
+# microphone, no monitor of what others play) or change any volume. `guest`
 # has no other way to PipeWire.
 mkdir -p /etc/pipewire/pipewire-pulse.conf.d
-cat > /etc/pipewire/pipewire-pulse.conf.d/gamejail.conf <<'EOF'
+cat > /etc/pipewire/pipewire-pulse.conf.d/gse.conf <<'EOF'
 pulse.properties = {
     server.address = [
         "unix:native"
-        { address = "unix:/run/gamejail/display/pulse" client.access = "restricted" }
+        { address = "unix:/run/gse/display/pulse" client.access = "restricted" }
     ]
 }
 
@@ -163,17 +229,44 @@ pulse.rules = [
 EOF
 
 # The desktop opens the restricted display and the launch relay when
-# `friend` logs in.
-install -d -o friend -g friend /home/friend/.config/autostart
-cat > /home/friend/.config/autostart/gamejail-desktop.desktop <<'EOF'
+# `sandbox` logs in.
+install -d -o sandbox -g sandbox /home/sandbox/.config/autostart
+cat > /home/sandbox/.config/autostart/gse-desktop.desktop <<'EOF'
 [Desktop Entry]
 Type=Application
-Name=gamejail desktop
-Exec=/usr/libexec/gamejail/gamejail-guest desktop
+Name=gse desktop
+Exec=/usr/libexec/gse/gse-guest desktop
 EOF
-chown friend:friend /home/friend/.config/autostart/gamejail-desktop.desktop
+chown sandbox:sandbox /home/sandbox/.config/autostart/gse-desktop.desktop
 
-if [ "${GAMEJAIL_DEV:-0}" = 1 ]; then
+# The screen the host shows: `sandbox` sets the virtual output to the mode the
+# host asked for and copies it into the shared memory (QEMU ivshmem), which
+# udev hands to `sandbox` alone. Without that mode the copy does not start.
+# The copy runs under the user systemd of `sandbox`, which has the user's
+# SELinux context: the desktop greetd starts stays in the display manager's
+# domain, which may not map the shared memory.
+cat > /etc/udev/rules.d/70-gse-screen.rules <<'EOF'
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x1af4", ATTR{device}=="0x1110", ATTR{enable}="1", RUN+="/bin/sh -c 'chown sandbox:sandbox /sys%p/resource2 /sys%p/resource2_wc'"
+EOF
+cat > /usr/libexec/gse/screen <<'EOF'
+#!/bin/sh
+# Copies the desktop to the host when the host asked for it.
+[ -s /run/gse/screen-mode ] || exit 0
+wlr-randr --output HEADLESS-1 --on --custom-mode "$(cat /run/gse/screen-mode)"
+exec systemd-run --user --collect --quiet --unit=gse-screen \
+    --setenv=WAYLAND_DISPLAY="$WAYLAND_DISPLAY" /usr/libexec/gse/gse-guest screen
+EOF
+chmod 0755 /usr/libexec/gse/screen
+restorecon -R /usr/libexec/gse
+cat > /home/sandbox/.config/autostart/gse-screen.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=gse screen
+Exec=/usr/libexec/gse/screen
+EOF
+chown sandbox:sandbox /home/sandbox/.config/autostart/gse-screen.desktop
+
+if [ "${GSE_DEV:-0}" = 1 ]; then
     dnf -y install grim wl-clipboard wayland-utils xdpyinfo pulseaudio-utils
 fi
 
@@ -188,49 +281,49 @@ semanage fcontext -a -t bin_t '/var/lib/flatpak/(app|repo|runtime)(/.*)?'
 restorecon -R /var/lib/flatpak
 
 step "sandboxes"
-# Flatpak and Steam's pressure-vessel run programs under bwrap, which `jail`
+# Flatpak and Steam's pressure-vessel run programs under bwrap, which `guest`
 # may use as it creates its own user namespace. Inside that namespace bwrap
 # brings up loopback, caps nested user namespaces and bind-mounts home
 # directories. Each of these needs CAP_NET_ADMIN, CAP_SYS_RESOURCE or
-# CAP_SYS_ADMIN, which `jail` holds only over namespaces it created, so the
+# CAP_SYS_ADMIN, which `guest` holds only over namespaces it created, so the
 # rules below reach nothing outside them.
-cat > /tmp/gamejail_sandboxes.cil <<'EOF'
+cat > /tmp/gse_sandboxes.cil <<'EOF'
 (allow user_t self (netlink_route_socket (nlmsg_write)))
 (allow user_t sysctl_t (file (open write)))
 (allow user_t user_home_dir_t (dir (mounton)))
 (allow user_t user_home_content_type (dir (mounton)))
 (allow user_t user_home_content_type (file (mounton)))
 EOF
-semodule -i /tmp/gamejail_sandboxes.cil
-rm /tmp/gamejail_sandboxes.cil
+semodule -i /tmp/gse_sandboxes.cil
+rm /tmp/gse_sandboxes.cil
 
 # Proton synchronises Windows threads through /dev/ntsync, and the sandboxes
-# bind it in. The policy leaves it the generic device_t, which `jail` may not
-# touch, so it gets a type of its own that `jail` may use. The device is meant
+# bind it in. The policy leaves it the generic device_t, which `guest` may not
+# touch, so it gets a type of its own that `guest` may use. The device is meant
 # for unprivileged users (mode 0666). tmpfiles restores the label at boot in
 # case the module loads before udev labels devices.
-cat > /tmp/gamejail_ntsync.cil <<'EOF'
-(type gamejail_ntsync_device_t)
-(roletype object_r gamejail_ntsync_device_t)
-(typeattributeset device_node (gamejail_ntsync_device_t))
-(allow user_t gamejail_ntsync_device_t (chr_file (getattr open read write ioctl)))
+cat > /tmp/gse_ntsync.cil <<'EOF'
+(type gse_ntsync_device_t)
+(roletype object_r gse_ntsync_device_t)
+(typeattributeset device_node (gse_ntsync_device_t))
+(allow user_t gse_ntsync_device_t (chr_file (getattr open read write ioctl)))
 EOF
-semodule -i /tmp/gamejail_ntsync.cil
-rm /tmp/gamejail_ntsync.cil
-semanage fcontext -a -t gamejail_ntsync_device_t /dev/ntsync
-echo 'z /dev/ntsync - - - -' > /etc/tmpfiles.d/gamejail-ntsync.conf
+semodule -i /tmp/gse_ntsync.cil
+rm /tmp/gse_ntsync.cil
+semanage fcontext -a -t gse_ntsync_device_t /dev/ntsync
+echo 'z /dev/ntsync - - - -' > /etc/tmpfiles.d/gse-ntsync.conf
 
 step "cleanup"
-if [ "${GAMEJAIL_DEV:-0}" != 1 ]; then
+if [ "${GSE_DEV:-0}" != 1 ]; then
     systemctl disable sshd.service
     userdel --remove dev 2>/dev/null || true
     rm -f /etc/sudoers.d/90-cloud-init-users
 fi
 dnf clean all
-# cloud-init only looks for a NoCloud seed volume. A jail boots without one,
+# cloud-init only looks for a NoCloud seed volume. An environment boots without one,
 # and cloud-init then turns itself off for that boot without waiting; a preset
 # build attaches one, and cloud-init runs the preset's script.
-cat > /etc/cloud/cloud.cfg.d/90-gamejail.cfg <<'EOF'
+cat > /etc/cloud/cloud.cfg.d/90-gse.cfg <<'EOF'
 datasource_list: [ NoCloud ]
 EOF
 truncate -s 0 /etc/machine-id

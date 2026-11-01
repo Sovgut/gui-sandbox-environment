@@ -1,4 +1,4 @@
-//! The jail network on the host: the nftables table and the passt process.
+//! The environment network on the host: the nftables table and the passt process.
 
 use std::fs;
 use std::io::{ErrorKind, Write as _};
@@ -10,16 +10,16 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use gamejail_host::net::{self, NET_USER, Passt};
+use gse_host::net::{self, NET_USER, Passt};
 use tracing::info;
 
 /// UID of the account passt runs as. It comes from
-/// `dist/sysusers.d/gamejail.conf`.
+/// `dist/sysusers.d/gse.conf`.
 pub fn net_uid() -> Result<u32> {
     let output = Command::new("id").args(["-u", NET_USER]).output()?;
     if !output.status.success() {
         bail!(
-            "no '{NET_USER}' account; install dist/sysusers.d/gamejail.conf into \
+            "no '{NET_USER}' account; install dist/sysusers.d/gse.conf into \
              /etc/sysusers.d and run systemd-sysusers"
         );
     }
@@ -51,11 +51,11 @@ fn nft(script: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// Installs or replaces the jail network rules.
+/// Installs or replaces the environment network rules.
 pub fn apply(internet: bool, dry_run: bool) -> Result<()> {
     nft(&net::ruleset(net_uid()?, internet), dry_run)?;
     info!(
-        "jail network: internet {}",
+        "environment network: internet {}",
         if internet { "on" } else { "off" }
     );
     Ok(())
@@ -75,7 +75,7 @@ pub fn print_rules() -> Result<()> {
 /// as root, before dropping to the network account, and is denied
 /// `dac_override`, so the directory is root's; mode 0700 keeps other users
 /// from planting a socket QEMU would connect to.
-pub const SOCKET_DIR: &str = "/tmp/gamejail-net";
+pub const SOCKET_DIR: &str = "/tmp/gse-net";
 
 fn socket_dir() -> Result<PathBuf> {
     let dir = PathBuf::from(SOCKET_DIR);
@@ -91,7 +91,7 @@ fn socket_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Starts passt for the jail `name` and waits until its socket exists.
+/// Starts passt for the environment `name` and waits until its socket exists.
 pub fn start_passt(name: &str, dev_ssh_port: Option<u16>) -> Result<(Passt, Child)> {
     let uid = net_uid()?;
     let dir = socket_dir()?;

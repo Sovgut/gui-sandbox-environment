@@ -1,0 +1,17 @@
+[package]
+name = "gse-guest"
+description = "Runs inside an environment: the restricted display for the guest account and the launcher that starts programs as it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+gse-screen = { path = "../gse-screen", features = ["readback"] }
+
+[lints]
+workspace = true

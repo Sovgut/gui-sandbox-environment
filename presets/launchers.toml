@@ -1,6 +1,7 @@
-# Game launchers and the tools around them. Everything runs as `jail` except
-# Discord, which runs as `friend` so it stays out of reach of the games.
-name = "games"
+# Game launchers and the tools around them. Everything runs as `guest` except
+# Discord, which runs as `sandbox` so it stays out of reach of what the
+# launchers start.
+name = "launchers"
 
 [[app]]
 name = "Steam"

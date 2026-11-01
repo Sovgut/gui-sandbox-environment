@@ -1,0 +1,16 @@
+[package]
+name = "gse-viewer"
+description = "Development viewer for the environment screen: shows the frames a running environment publishes, counts them and forwards input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+gse-screen = { path = "../gse-screen" }
+softbuffer = "0.4"
+winit = "0.30"
+
+[lints]
+workspace = true

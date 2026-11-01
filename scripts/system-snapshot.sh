@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Collects what gamejail needs to know about a machine: OS and image-based
+# Collects what gse needs to know about a machine: OS and image-based
 # deployment, boot, CPU virtualization, IOMMU groups, GPUs and their drivers,
 # what a single-GPU switch has to stop (consoles, framebuffers, GPU users and
 # services), displays, session, memory, storage, network, audio, input devices
@@ -15,7 +15,7 @@
 set -u
 export LC_ALL=C
 
-out="gamejail-snapshot-$(date +%Y%m%d-%H%M%S).txt"
+out="gse-snapshot-$(date +%Y%m%d-%H%M%S).txt"
 host_name="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
 user_name="$(id -un)"
 
@@ -26,7 +26,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 section() {
     printf '\n===== %s =====\n' "$1"
-    printf '[gamejail-snapshot] %s\n' "$1" >&3
+    printf '[gse-snapshot] %s\n' "$1" >&3
 }
 
 # Every external command gets 20 seconds: GPU tools hang on a wedged driver and

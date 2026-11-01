@@ -1,14 +1,14 @@
-//! Presets: what a jail image contains on top of the base image.
+//! Presets: what an environment image contains on top of the base image.
 //!
 //! A preset is a TOML file listing applications, each installed from Fedora or
 //! RPM Fusion, from Flathub, or from a local AppImage. An application runs as
-//! `jail` unless it is marked `trusted`, which makes it run as `friend`. Every
-//! jail application gets a menu entry on the desktop that starts it through
-//! `gamejail-guest run`, overriding any entry its package installs, so clicking
-//! it never starts it as `friend`.
+//! `guest` unless it is marked `trusted`, which makes it run as `sandbox`. Every
+//! `guest` application gets a menu entry on the desktop that starts it through
+//! `gse-guest run`, overriding any entry its package installs, so clicking
+//! it never starts it as `sandbox`; the same entries go onto the desktop.
 //!
 //! ```toml
-//! name = "games"
+//! name = "launchers"
 //!
 //! [[app]]
 //! name = "Steam"
@@ -39,8 +39,8 @@ use serde::Deserialize;
 use crate::{Error, Result};
 
 /// Where AppImages are unpacked inside the image.
-pub const APPS_DIR: &str = "/opt/gamejail/apps";
-const GUEST_RUN: &str = "/usr/libexec/gamejail/gamejail-guest run";
+pub const APPS_DIR: &str = "/opt/gse/apps";
+const GUEST_RUN: &str = "/usr/libexec/gse/gse-guest run";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,7 +66,7 @@ pub struct App {
     /// What to run; derived from a Flatpak ID or AppImage when absent.
     #[serde(default)]
     pub command: Vec<String>,
-    /// Runs as `friend` instead of `jail`.
+    /// Runs as `sandbox` instead of `guest`.
     #[serde(default)]
     pub trusted: bool,
 }
@@ -139,7 +139,7 @@ impl App {
         match (&self.desktop, &self.flatpak) {
             (Some(id), _) => id.clone(),
             (None, Some(flatpak)) => format!("{flatpak}.desktop"),
-            (None, None) => format!("gamejail-{}.desktop", self.slug()),
+            (None, None) => format!("gse-{}.desktop", self.slug()),
         }
     }
 
@@ -162,10 +162,10 @@ impl App {
                 .trim_end_matches(".desktop")
                 .to_owned(),
         };
-        let suffix = if self.trusted { "" } else { " (jail)" };
+        let suffix = if self.trusted { "" } else { " (guest)" };
         let _ = writeln!(
             s,
-            "cat > \"$entries\"/{} <<'GAMEJAIL_ENTRY'",
+            "cat > \"$entries\"/{} <<'GSE_ENTRY'",
             quote(&self.desktop_id())
         );
         let _ = writeln!(
@@ -173,7 +173,7 @@ impl App {
             "[Desktop Entry]\nType=Application\nName={}{suffix}\nExec={exec}\nIcon={icon}\nCategories=Game;",
             self.name
         );
-        let _ = writeln!(s, "GAMEJAIL_ENTRY");
+        let _ = writeln!(s, "GSE_ENTRY");
         Ok(())
     }
 }
@@ -240,14 +240,14 @@ impl Preset {
             let _ = writeln!(s, "step \"appimages\"");
             let _ = writeln!(
                 s,
-                "mkdir -p /run/gamejail-seed && mount -o ro LABEL=CIDATA /run/gamejail-seed"
+                "mkdir -p /run/gse-seed && mount -o ro LABEL=CIDATA /run/gse-seed"
             );
             for app in self.apps.iter().filter(|a| a.appimage.is_some()) {
                 let dir = format!("{APPS_DIR}/{}", app.slug());
                 let _ = writeln!(s, "rm -rf {0} && mkdir -p {0}", quote(&dir));
                 let _ = writeln!(
                     s,
-                    "cp /run/gamejail-seed/{} /tmp/app.appimage && chmod +x /tmp/app.appimage",
+                    "cp /run/gse-seed/{} /tmp/app.appimage && chmod +x /tmp/app.appimage",
                     quote(&app.seed_file())
                 );
                 let _ = writeln!(
@@ -260,30 +260,40 @@ impl Preset {
                     quote(&dir)
                 );
             }
-            let _ = writeln!(s, "umount /run/gamejail-seed");
-            let _ = writeln!(s, "chmod -R a+rX {APPS_DIR} && restorecon -R /opt/gamejail");
+            let _ = writeln!(s, "umount /run/gse-seed");
+            let _ = writeln!(s, "chmod -R a+rX {APPS_DIR} && restorecon -R /opt/gse");
         }
 
         let _ = writeln!(s, "step \"menu\"");
-        let _ = writeln!(s, "entries=/home/friend/.local/share/applications");
+        let _ = writeln!(s, "entries=/home/sandbox/.local/share/applications");
         let _ = writeln!(
             s,
-            "install -d -o friend -g friend /home/friend/.local /home/friend/.local/share \"$entries\""
+            "install -d -o sandbox -g sandbox /home/sandbox/.local /home/sandbox/.local/share \"$entries\""
         );
         for app in &self.apps {
             app.write_menu_entry(&mut s)?;
         }
-        let _ = writeln!(s, "chown -R friend:friend /home/friend/.local");
+        let _ = writeln!(s, "chown -R sandbox:sandbox /home/sandbox/.local");
+        // The same entries as desktop shortcuts, executable so the file
+        // manager starts them without asking.
+        let _ = writeln!(s, "install -d -o sandbox -g sandbox /home/sandbox/Desktop");
+        for app in &self.apps {
+            let _ = writeln!(
+                s,
+                "install -o sandbox -g sandbox -m 0755 \"$entries\"/{0} /home/sandbox/Desktop/{0}",
+                quote(&app.desktop_id())
+            );
+        }
         s.push_str(EPILOGUE);
         Ok(s)
     }
 }
 
 const PRELUDE: &str = r#"#!/bin/bash
-# Installs a preset on the base image; generated by gamejail-service.
+# Installs a preset on the base image; generated by gse-service.
 set -euo pipefail
 verdict() {
-    echo "GAMEJAIL-BUILD: $*" > /dev/ttyS0
+    echo "GSE-BUILD: $*" > /dev/ttyS0
     systemctl --no-block poweroff
 }
 trap 'verdict "FAILED $LINENO"' ERR
@@ -294,7 +304,7 @@ step() { echo "=== $*" > /dev/ttyS0; }
 /// matching its exact version. Flatpak picks it by the loaded module, which
 /// the GPU-less build VM does not have, so it is named from the package.
 /// Installed files keep the label of the repository objects they link to
-/// until relabelled, and `jail` cannot run them before that.
+/// until relabelled, and `guest` cannot run them before that.
 const NVIDIA_FLATPAK_GL: &str = r#"nvidia="$(rpm -q --qf '%{VERSION}' xorg-x11-drv-nvidia | tr . -)"
 flatpak install --system -y --noninteractive flathub \
     "org.freedesktop.Platform.GL.nvidia-$nvidia" "org.freedesktop.Platform.GL32.nvidia-$nvidia"
@@ -343,8 +353,8 @@ fn join_desktop(args: &[String]) -> String {
 mod tests {
     use super::*;
 
-    const GAMES: &str = r#"
-name = "games"
+    const LAUNCHERS: &str = r#"
+name = "launchers"
 
 [[app]]
 name = "Steam"
@@ -369,7 +379,7 @@ trusted = true
 
     #[test]
     fn parses_and_derives_commands() {
-        let preset = Preset::parse(GAMES).unwrap();
+        let preset = Preset::parse(LAUNCHERS).unwrap();
         assert_eq!(preset.apps.len(), 4);
         assert_eq!(
             preset.apps[1].command_line().unwrap(),
@@ -400,25 +410,31 @@ trusted = true
     }
 
     #[test]
-    fn jail_apps_start_through_the_guest_and_trusted_ones_do_not() {
-        let script = Preset::parse(GAMES).unwrap().script().unwrap();
-        assert!(script.contains("Exec=/usr/libexec/gamejail/gamejail-guest run steam\n"));
-        assert!(script.contains("Exec=/usr/libexec/gamejail/gamejail-guest run flatpak run com.heroicgameslauncher.hgl\n"));
-        assert!(script.contains("Exec=/usr/libexec/gamejail/gamejail-guest run /opt/gamejail/apps/epic-games-launcher/AppRun\n"));
+    fn guest_apps_start_through_the_launcher_and_trusted_ones_do_not() {
+        let script = Preset::parse(LAUNCHERS).unwrap().script().unwrap();
+        assert!(script.contains("Exec=/usr/libexec/gse/gse-guest run steam\n"));
+        assert!(script.contains(
+            "Exec=/usr/libexec/gse/gse-guest run flatpak run com.heroicgameslauncher.hgl\n"
+        ));
+        assert!(script.contains(
+            "Exec=/usr/libexec/gse/gse-guest run /opt/gse/apps/epic-games-launcher/AppRun\n"
+        ));
         assert!(script.contains("Name=Discord\nExec=flatpak run com.discordapp.Discord\n"));
         assert!(script.contains("\"$entries\"/'steam.desktop'"));
+        assert!(script.contains(
+            "install -o sandbox -g sandbox -m 0755 \"$entries\"/'steam.desktop' /home/sandbox/Desktop/'steam.desktop'\n"
+        ));
         assert!(script.contains("\"$entries\"/'com.heroicgameslauncher.hgl.desktop'"));
     }
 
     #[test]
     fn script_installs_every_source_and_reports_a_verdict() {
-        let script = Preset::parse(GAMES).unwrap().script().unwrap();
+        let script = Preset::parse(LAUNCHERS).unwrap().script().unwrap();
         assert!(script.contains("dnf -y install --enablerepo='rpmfusion-nonfree-steam' 'steam'\n"));
         assert!(script.contains("flatpak install --system -y --noninteractive flathub 'com.heroicgameslauncher.hgl' 'com.discordapp.Discord'\n"));
         assert!(script.contains("org.freedesktop.Platform.GL.nvidia-$nvidia"));
         assert!(
-            script
-                .contains("cp /run/gamejail-seed/'epic-games-launcher.appimage' /tmp/app.appimage")
+            script.contains("cp /run/gse-seed/'epic-games-launcher.appimage' /tmp/app.appimage")
         );
         assert!(script.ends_with("verdict \"OK\"\n"));
     }

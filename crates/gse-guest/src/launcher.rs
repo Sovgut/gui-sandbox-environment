@@ -1,5 +1,5 @@
-//! The jail side of launching: connects to the desktop and starts what it is
-//! asked for as transient units of the jail account's systemd instance, so a
+//! The environment side of launching: connects to the desktop and starts what it is
+//! asked for as transient units of the `guest` account's systemd instance, so a
 //! program gets that account's environment (the restricted display, its own X
 //! server) and can be tracked and stopped like any unit.
 
@@ -62,7 +62,7 @@ fn start(request: &[u8]) -> Result<String> {
         bail!("empty command line");
     }
     let unit = format!(
-        "jail-app-{}",
+        "guest-app-{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos())

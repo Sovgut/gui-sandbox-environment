@@ -51,7 +51,7 @@ pub fn cloud_config(script: &str, dev_ssh_key: Option<&str>) -> String {
     let _ = writeln!(out, "runcmd:");
     let _ = writeln!(
         out,
-        "  - [env, \"GAMEJAIL_DEV={dev}\", bash, /root/provision.sh]"
+        "  - [env, \"GSE_DEV={dev}\", bash, /root/provision.sh]"
     );
     out
 }
@@ -93,7 +93,7 @@ fn format_and_fill(
     let fs = fatfs::FileSystem::new(file, fatfs::FsOptions::new())?;
     let root = fs.root_dir();
     root.create_file("meta-data")?
-        .write_all(format!("instance-id: {instance_id}\nlocal-hostname: gamejail\n").as_bytes())?;
+        .write_all(format!("instance-id: {instance_id}\nlocal-hostname: gse\n").as_bytes())?;
     root.create_file("user-data")?
         .write_all(user_data.as_bytes())?;
     for (name, data) in files {
@@ -118,7 +118,7 @@ mod tests {
             config
                 .contains("    content: |\n      #!/bin/bash\n      echo one\n\n      echo two\n")
         );
-        assert!(config.contains("GAMEJAIL_DEV=0"));
+        assert!(config.contains("GSE_DEV=0"));
     }
 
     #[test]
@@ -126,7 +126,7 @@ mod tests {
         let config = cloud_config("true\n", Some("ssh-ed25519 AAAA test\n"));
         assert!(config.contains("  - name: dev"));
         assert!(config.contains("      - ssh-ed25519 AAAA test\n"));
-        assert!(config.contains("GAMEJAIL_DEV=1"));
+        assert!(config.contains("GSE_DEV=1"));
     }
 
     #[test]
@@ -134,13 +134,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seed.img");
         let blob = vec![0x5a_u8; 3 * 1024 * 1024];
-        write_nocloud(
-            &path,
-            "build-1",
-            "#cloud-config\n",
-            &[("gamejail-guest", &blob)],
-        )
-        .unwrap();
+        write_nocloud(&path, "build-1", "#cloud-config\n", &[("gse-guest", &blob)]).unwrap();
 
         let fs =
             fatfs::FileSystem::new(File::open(&path).unwrap(), fatfs::FsOptions::new()).unwrap();
@@ -161,7 +155,7 @@ mod tests {
         assert!(meta.starts_with("instance-id: build-1\n"));
         let mut copied = Vec::new();
         fs.root_dir()
-            .open_file("gamejail-guest")
+            .open_file("gse-guest")
             .unwrap()
             .read_to_end(&mut copied)
             .unwrap();
@@ -170,7 +164,7 @@ mod tests {
 
     #[test]
     fn the_base_script_reports_a_verdict() {
-        assert!(BASE_PROVISION.contains("GAMEJAIL-BUILD: $*"));
+        assert!(BASE_PROVISION.contains("GSE-BUILD: $*"));
         assert!(BASE_PROVISION.contains("verdict \"OK\""));
     }
 }

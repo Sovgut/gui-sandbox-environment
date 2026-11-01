@@ -1,8 +1,8 @@
 //! The desktop side of launching: holds the environment launcher's connection and
 //! relays `run` requests over it.
 //!
-//! Requests travel as a 4-byte big-endian length followed by the command line,
-//! NUL-separated. The launcher answers with one line, `ok <unit>` or
+//! Requests travel as a 4-byte big-endian length followed by the program's
+//! title and its command line, NUL-separated; the title may be empty. The launcher answers with one line, `ok <unit>` or
 //! `error <text>`, which is all that ever comes back from the environment. A newer
 //! launcher connection replaces an older one; a guest process posing as the
 //! launcher can only drop or misreport requests.
@@ -86,11 +86,42 @@ fn relay(launcher: &Mutex<Option<UnixStream>>, client: &mut UnixStream) -> Resul
     }
 }
 
+/// Tells `sandbox` that `title` is starting, through the desktop's
+/// notifications. A desktop without them just shows nothing.
+pub fn notify_starting(title: &str, icon: Option<&str>) {
+    std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.Notifications",
+            "--object-path",
+            "/org/freedesktop/Notifications",
+            "--method",
+            "org.freedesktop.Notifications.Notify",
+            "GUI Sandbox Environment",
+            "0",
+            icon.unwrap_or(""),
+            &format!("Starting {title}"),
+            "Its window appears once it has loaded; that can take a minute.",
+            "[]",
+            "{}",
+            "8000",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok();
+}
+
 /// Hands `command` to the desktop and reports what the environment answered.
-pub fn request(run_socket: &Path, command: &[String]) -> Result<()> {
+/// `title` names the program wherever its processes are listed.
+pub fn request(run_socket: &Path, title: Option<&str>, command: &[String]) -> Result<()> {
     let mut stream = UnixStream::connect(run_socket)
         .with_context(|| format!("connecting to the desktop at {}", run_socket.display()))?;
-    stream.write_all(command.join("\0").as_bytes())?;
+    let mut fields = vec![title.unwrap_or_default()];
+    fields.extend(command.iter().map(String::as_str));
+    stream.write_all(fields.join("\0").as_bytes())?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut reply = String::new();
     stream.take(MAX_REPLY).read_to_string(&mut reply)?;

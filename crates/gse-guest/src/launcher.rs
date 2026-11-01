@@ -52,8 +52,13 @@ fn serve_connection(mut stream: UnixStream) -> Result<()> {
 }
 
 fn start(request: &[u8]) -> Result<String> {
-    let argv: Vec<String> = request
-        .split(|b| *b == 0)
+    let mut fields = request.split(|b| *b == 0);
+    let title: String = String::from_utf8_lossy(fields.next().unwrap_or_default())
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(100)
+        .collect();
+    let argv: Vec<String> = fields
         .filter(|a| !a.is_empty())
         .map(|a| String::from_utf8(a.to_vec()))
         .collect::<Result<_, _>>()
@@ -67,8 +72,13 @@ fn start(request: &[u8]) -> Result<String> {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos())
     );
-    let status = Command::new("systemd-run")
-        .args(["--user", "--collect", "--quiet", "--unit", &unit, "--"])
+    let mut command = Command::new("systemd-run");
+    command.args(["--user", "--collect", "--quiet", "--unit", &unit]);
+    if !title.is_empty() {
+        command.arg(format!("--description={title}"));
+    }
+    let status = command
+        .arg("--")
         .args(&argv)
         .status()
         .context("starting systemd-run")?;

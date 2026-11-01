@@ -22,6 +22,7 @@
 //! SELinux cannot label a connection from the former to a socket the latter
 //! serves, and the connect fails with `EINVAL`.
 
+mod agent;
 mod broker;
 mod display;
 mod launcher;
@@ -57,12 +58,21 @@ enum Cli {
     Launcher,
     /// As `sandbox`: start a program as `guest`.
     Run {
+        /// The program's name: a notification says it is starting, since a
+        /// launcher can take a while to show a window.
+        #[arg(long)]
+        title: Option<String>,
+        /// The notification's icon, as a menu entry names it.
+        #[arg(long, requires = "title")]
+        icon: Option<String>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
     /// As `sandbox`: copy the desktop into the environment screen memory the host
     /// shows, for the lifetime of the desktop.
     Screen,
+    /// As root: answer the host on the agent's port.
+    Agent,
 }
 
 fn main() -> Result<()> {
@@ -72,7 +82,18 @@ fn main() -> Result<()> {
             display::serve(DISPLAY_SOCKET.as_ref())
         }
         Cli::Launcher => launcher::serve(LAUNCHER_SOCKET.as_ref()),
-        Cli::Run { command } => broker::request(&run_socket()?, &command),
+        Cli::Run {
+            title,
+            icon,
+            command,
+        } => {
+            broker::request(&run_socket()?, title.as_deref(), &command)?;
+            if let Some(title) = title {
+                broker::notify_starting(&title, icon.as_deref());
+            }
+            Ok(())
+        }
         Cli::Screen => screen::serve(),
+        Cli::Agent => agent::serve(),
     }
 }

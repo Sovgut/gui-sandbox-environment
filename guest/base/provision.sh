@@ -48,7 +48,7 @@ dnf -y install \
     labwc lxqt-wayland-session lxqt-session lxqt-panel lxqt-config \
     lxqt-qtplugin lxqt-themes lxqt-notificationd lxqt-runner breeze-icon-theme \
     pcmanfm-qt qterminal featherpad xdg-desktop-portal-lxqt xdg-desktop-portal-wlr \
-    xorg-x11-server-Xwayland xwayland-satellite greetd greetd-selinux wlr-randr \
+    xorg-x11-server-Xwayland xwayland-satellite xrandr greetd greetd-selinux wlr-randr \
     pipewire wireplumber pipewire-pulseaudio \
     flatpak policycoreutils-python-utils google-noto-sans-fonts
 
@@ -170,6 +170,8 @@ cat > /home/guest/.config/environment.d/gse.conf <<'EOF'
 WAYLAND_DISPLAY=/run/gse/display/wayland-0
 DISPLAY=:1
 PULSE_SERVER=unix:/run/gse/display/pulse
+# AppImages unpack themselves and run: `guest` has no FUSE to mount one.
+APPIMAGE_EXTRACT_AND_RUN=1
 EOF
 cat > "$units/gse-xwayland.service" <<'EOF'
 [Unit]
@@ -195,6 +197,46 @@ Restart=always
 RestartSec=1
 EOF
 ln -s ../gse-xwayland.service ../gse-launch.service "$units/default.target.wants/"
+
+# The agent answers the host about `guest`'s programs and its Inbox and
+# Outbox, as root, on a virtio-serial port only root opens
+# (crates/gse-guest/src/agent.rs). An image build has no such port; the
+# agent then waits for it.
+cat > /etc/systemd/system/gse-agent.service <<'EOF'
+[Unit]
+Description=Answers the host about guest's programs and files
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/libexec/gse/gse-guest agent
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable gse-agent.service
+install -d -o guest -g guest -m 0755 /home/guest/Inbox /home/guest/Outbox
+# `sandbox` cannot look into `guest`'s home, so the desktop's Inbox and
+# Outbox open a file manager as `guest`: files reach the Outbox from
+# wherever `guest`'s programs keep them, and what arrives in the Inbox is
+# there to take.
+install -d -o sandbox -g sandbox /home/sandbox/Desktop
+for box in Inbox Outbox; do
+    cat > "/home/sandbox/Desktop/gse-$box.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$box
+Comment=guest's ~/$box, which the host fills or empties
+Icon=folder
+Exec=/usr/libexec/gse/gse-guest run --title $box --icon folder pcmanfm-qt --new-window /home/guest/$box
+EOF
+    chmod 0755 "/home/sandbox/Desktop/gse-$box.desktop"
+    chown sandbox:sandbox "/home/sandbox/Desktop/gse-$box.desktop"
+done
+# The file manager runs shortcuts it is told to trust without asking.
+runuser -u sandbox -- dbus-run-session -- sh -c \
+    'for f in /home/sandbox/Desktop/gse-*.desktop; do gio set -t string "$f" metadata::trust true; done' || true
 # `guest` has no sound server of its own: one would hold no sound card, and
 # Wine's PipeWire driver would pick it and play into nothing instead of
 # reaching the desktop's server through PULSE_SERVER.
@@ -286,8 +328,13 @@ step "sandboxes"
 # brings up loopback, caps nested user namespaces and bind-mounts home
 # directories. Each of these needs CAP_NET_ADMIN, CAP_SYS_RESOURCE or
 # CAP_SYS_ADMIN, which `guest` holds only over namespaces it created, so the
-# rules below reach nothing outside them.
+# rules below reach nothing outside them. A Flatpak sub-sandbox (Electron
+# apps such as Heroic start their renderers in one) joins the namespaces of
+# its parent app through /proc/<pid>/ns, which the kernel opens only for the
+# caller's own processes. The policy refuses `user_t` those files without
+# logging it, so such an app hangs with no window.
 cat > /tmp/gse_sandboxes.cil <<'EOF'
+(allow user_t nsfs_t (file (open read)))
 (allow user_t self (netlink_route_socket (nlmsg_write)))
 (allow user_t sysctl_t (file (open write)))
 (allow user_t user_home_dir_t (dir (mounton)))

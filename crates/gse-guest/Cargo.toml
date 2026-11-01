@@ -12,6 +12,10 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 gse-screen = { path = "../gse-screen", features = ["readback"] }
+gse-protocol = { path = "../gse-protocol" }
+base64 = "0.22"
+rustix = { version = "1", features = ["fs", "process"] }
+sha2 = "0.10"
 
 [lints]
 workspace = true

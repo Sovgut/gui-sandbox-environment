@@ -1,0 +1,15 @@
+#!/bin/sh
+# Installs the working tree's debug build of gse-service as the service the
+# development drop-in runs. install-dev-service.sh puts this script at
+# /usr/local/libexec/gse-dev-install with @TREE@ filled in; it runs as root
+# through pkexec, which asks for an administrator password
+# (io.github.sovgut.gse.dev-install). The app restarts the service after it.
+# It takes no arguments: the path it copies from is fixed at setup.
+set -eu
+
+src=@TREE@/target/debug/gse-service
+dst=/usr/local/sbin/gse-service
+
+[ -f "$src" ] || { echo "no build at $src" >&2; exit 1; }
+install -m 0755 -o root -g root -Z "$src" "$dst.new"
+mv -f "$dst.new" "$dst"

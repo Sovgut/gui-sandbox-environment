@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Development machines only (install-dev-service.sh): putting a working
+     tree's build in place as the root service takes an administrator
+     password, remembered for a few minutes. -->
+<policyconfig>
+  <action id="io.github.sovgut.gse.dev-install">
+    <description>Install a development build of the gse service</description>
+    <message>Authentication is required to run a development build of the gse service as root</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/gse-dev-install</annotate>
+  </action>
+</policyconfig>

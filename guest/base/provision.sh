@@ -44,13 +44,81 @@ akmods --force --kernels "$kernel"
 modinfo -k "$kernel" nvidia > /dev/null
 
 step "desktop"
+# Budgie on labwc: a desktop with a panel at the bottom, a start menu and
+# open windows beside it, laid out like Windows. labwc is also what keeps
+# `guest`'s programs apart (wp_security_context_v1). Nemo shows the Inbox
+# and Outbox.
 dnf -y install \
-    labwc lxqt-wayland-session lxqt-session lxqt-panel lxqt-config \
-    lxqt-qtplugin lxqt-themes lxqt-notificationd lxqt-runner breeze-icon-theme \
-    pcmanfm-qt qterminal featherpad xdg-desktop-portal-lxqt xdg-desktop-portal-wlr \
+    budgie-desktop budgie-desktop-defaults budgie-desktop-view budgie-backgrounds \
+    python3-systemd papirus-icon-theme nemo gnome-text-editor xdg-desktop-portal-gtk \
+    labwc xdg-desktop-portal-wlr \
     xorg-x11-server-Xwayland xwayland-satellite xrandr greetd greetd-selinux wlr-randr \
     pipewire wireplumber pipewire-pulseaudio \
     flatpak policycoreutils-python-utils google-noto-sans-fonts
+
+# One panel at the bottom: the menu and the open windows at the left, the
+# tray, sound and clock at the right. An applet's ID is the Name in its
+# .plugin file; the panel skips an applet it does not know.
+install -d /usr/share/budgie-desktop/layouts
+cat > /usr/share/budgie-desktop/layouts/gse.layout <<'EOF'
+[Panels]
+Panels=Taskbar
+
+[Taskbar]
+Position=Bottom
+Size=44
+Spacing=4
+Autohide=never
+Dock=false
+Shadow=true
+Theme=true
+Transparency=none
+Children=Menu;Tasks;Tray;Status;Clock;Notifications
+
+[Menu]
+ID=Budgie Menu
+Alignment=start
+
+[Tasks]
+ID=Icon Task List
+Alignment=start
+
+[Tray]
+ID=System Tray
+Alignment=end
+
+[Status]
+ID=Status Indicator
+Alignment=end
+
+[Clock]
+ID=Clock
+Alignment=end
+
+[Notifications]
+ID=Notifications
+Alignment=end
+EOF
+cat > /usr/share/glib-2.0/schemas/30_gse.gschema.override <<'EOF'
+[com.solus-project.budgie-panel]
+layout='gse'
+
+[com.solus-project.icon-tasklist]
+pinned-launchers=['org.mozilla.firefox.desktop', 'nemo.desktop']
+
+[org.gnome.desktop.interface:Budgie]
+color-scheme='prefer-dark'
+icon-theme='Papirus-Dark'
+font-name='Noto Sans 10'
+
+[org.gnome.desktop.background:Budgie]
+picture-uri='file:///usr/share/backgrounds/budgie/high-trestle-trail.jpg'
+picture-uri-dark='file:///usr/share/backgrounds/budgie/high-trestle-trail.jpg'
+
+[org.buddiesofbudgie.budgie-desktop-view]
+click-policy='double'
+EOF
+glib-compile-schemas /usr/share/glib-2.0/schemas
 
 step "accounts"
 # `sandbox` owns the desktop and trusted apps; `guest` runs every launcher and
@@ -60,13 +128,16 @@ useradd --create-home --comment "Desktop owner" sandbox
 useradd --create-home --comment "Untrusted programs" guest
 semanage login -a -s user_u guest
 chmod 0700 /home/sandbox /home/guest
-
-install -d -o sandbox -g sandbox /home/sandbox/.config/lxqt
-cat > /home/sandbox/.config/lxqt/session.conf <<'EOF'
-[General]
-compositor=labwc
-EOF
-chown sandbox:sandbox /home/sandbox/.config/lxqt/session.conf
+# Everything below creates files under ~sandbox/.config as root, so the
+# directories come first and belong to `sandbox`: the panel, Nemo and
+# dconf write there, and the session copies labwc's config there before
+# labwc starts. Budgie's dark window frames are its themerc-dark, which
+# its settings apply as this override; Pocillo has no labwc theme.
+labwc_config=/home/sandbox/.config/budgie-desktop/labwc
+install -d -o sandbox -g sandbox /home/sandbox/.config \
+    /home/sandbox/.config/budgie-desktop "$labwc_config"
+ln -s /usr/share/budgie-desktop/labwc/themerc-dark "$labwc_config/themerc-override"
+chown -h sandbox:sandbox "$labwc_config/themerc-override"
 
 step "login"
 # The host tells the guest how its screen is shown through QEMU's fw_cfg:
@@ -106,7 +177,7 @@ cat > /usr/libexec/gse/session <<'EOF'
 if [ -s /run/gse/screen-mode ]; then
     export WLR_BACKENDS=headless,libinput WLR_HEADLESS_OUTPUTS=1
 fi
-exec startlxqtwayland
+exec startbudgielabwc
 EOF
 chmod 0755 /usr/libexec/gse/session
 # greetd starts the desktop as `sandbox` on boot as an ordinary user session.
@@ -170,6 +241,8 @@ cat > /home/guest/.config/environment.d/gse.conf <<'EOF'
 WAYLAND_DISPLAY=/run/gse/display/wayland-0
 DISPLAY=:1
 PULSE_SERVER=unix:/run/gse/display/pulse
+# The desktop's dark look is set for Budgie sessions only.
+XDG_CURRENT_DESKTOP=Budgie:GNOME
 # AppImages unpack themselves and run: `guest` has no FUSE to mount one.
 APPIMAGE_EXTRACT_AND_RUN=1
 EOF
@@ -229,12 +302,12 @@ Type=Application
 Name=$box
 Comment=guest's ~/$box, which the host fills or empties
 Icon=folder
-Exec=/usr/libexec/gse/gse-guest run --title $box --icon folder pcmanfm-qt --new-window /home/guest/$box
+Exec=/usr/libexec/gse/gse-guest run --title $box --icon folder nemo /home/guest/$box
 EOF
     chmod 0755 "/home/sandbox/Desktop/gse-$box.desktop"
     chown sandbox:sandbox "/home/sandbox/Desktop/gse-$box.desktop"
 done
-# The file manager runs shortcuts it is told to trust without asking.
+# The desktop runs shortcuts it is told to trust without asking.
 runuser -u sandbox -- dbus-run-session -- sh -c \
     'for f in /home/sandbox/Desktop/gse-*.desktop; do gio set -t string "$f" metadata::trust true; done' || true
 # `guest` has no sound server of its own: one would hold no sound card, and
@@ -325,21 +398,28 @@ restorecon -R /var/lib/flatpak
 step "sandboxes"
 # Flatpak and Steam's pressure-vessel run programs under bwrap, which `guest`
 # may use as it creates its own user namespace. Inside that namespace bwrap
-# brings up loopback, caps nested user namespaces and bind-mounts home
-# directories. Each of these needs CAP_NET_ADMIN, CAP_SYS_RESOURCE or
-# CAP_SYS_ADMIN, which `guest` holds only over namespaces it created, so the
-# rules below reach nothing outside them. A Flatpak sub-sandbox (Electron
-# apps such as Heroic start their renderers in one) joins the namespaces of
-# its parent app through /proc/<pid>/ns, which the kernel opens only for the
-# caller's own processes. The policy refuses `user_t` those files without
-# logging it, so such an app hangs with no window.
+# brings up loopback, caps nested user namespaces and builds a new root from
+# bind mounts, which it then remounts read-only one by one: every filesystem
+# type under / (proc, sysfs, cgroup, efivarfs...) and any directory or file
+# it mounts onto. GTK does the same for each image it loads (glycin runs its
+# loaders under bwrap), so without this even Nemo for the Inbox aborts on its
+# first icon. Each of these needs CAP_NET_ADMIN, CAP_SYS_RESOURCE or
+# CAP_SYS_ADMIN, which `guest` holds only over namespaces it created, and the
+# kernel lets such a namespace mount only what is safe there and never lift a
+# flag the mount was given outside, so the rules below reach nothing outside
+# them. A Flatpak sub-sandbox (Electron apps such as Heroic start their
+# renderers in one) joins the namespaces of its parent app through
+# /proc/<pid>/ns, which the kernel opens only for the caller's own
+# processes. The policy refuses `user_t` those files without logging it, so
+# such an app hangs with no window. Heroic's Electron also uses io_uring.
 cat > /tmp/gse_sandboxes.cil <<'EOF'
+(allow user_t file_type (dir (mounton)))
+(allow user_t file_type (file (mounton)))
+(allow user_t filesystem_type (filesystem (mount remount unmount)))
+(allow user_t io_uring_t (anon_inode (create getattr map read write)))
 (allow user_t nsfs_t (file (open read)))
 (allow user_t self (netlink_route_socket (nlmsg_write)))
 (allow user_t sysctl_t (file (open write)))
-(allow user_t user_home_dir_t (dir (mounton)))
-(allow user_t user_home_content_type (dir (mounton)))
-(allow user_t user_home_content_type (file (mounton)))
 EOF
 semodule -i /tmp/gse_sandboxes.cil
 rm /tmp/gse_sandboxes.cil

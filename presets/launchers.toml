@@ -24,6 +24,10 @@ name = "ProtonPlus"
 flatpak = "com.vysp3r.ProtonPlus"
 
 [[app]]
+name = "Bottles"
+flatpak = "com.usebottles.bottles"
+
+[[app]]
 name = "Faugus Launcher"
 flatpak = "io.github.Faugus.faugus-launcher"
 

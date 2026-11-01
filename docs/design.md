@@ -153,8 +153,28 @@ kernel; with it the guest sees the 3070 at PCIe 4.0 x16 with Vulkan.
   - `jail` runs every launcher and game. It is an SELinux confined user
     (`user_u`): no `sudo`, `su` or SUID transitions, and no access to
     `friend`'s files through either Unix permissions or SELinux labels.
-- Trusted apps run as native Wayland clients; games run through XWayland, so a
-  game cannot capture a trusted window or its input.
+- Programs of `jail` show their windows on the desktop of `friend` through
+  `gamejail-guest` (`crates/gamejail-guest`):
+  - `desktop`, autostarted as `friend`, opens a Wayland socket for `jail`
+    through the compositor's security-context protocol. labwc withholds every
+    privileged protocol from its clients: no screen capture, no clipboard
+    monitoring, no virtual input, no list of other windows.
+  - `jail` has its own X server (`xwayland-satellite` on `:1`, a client of that
+    socket), so its X programs never share an X server with `friend`'s.
+  - `launcher`, a service of the jail account's lingering systemd instance,
+    starts what `friend` asks for (`gamejail-guest run <command>`) as transient
+    units of that instance. Only the command line goes in; one line of status
+    comes back.
+  - Every connection between the two accounts is opened by `jail`, through
+    sockets in `/run/gamejail/display` (owner `friend`, setgid group `jail`,
+    label `user_tmp_t`). `friend` is `unconfined_u` with the full MCS range
+    and `jail` is `user_u` at `s0`; SELinux cannot label a connection opened by
+    the former to a socket the latter serves, and the connect fails with
+    `EINVAL` without an audit record.
+  - Measured in a jail booted from the base image: a program started as
+    `jail` runs as `user_u:user_r:user_t:s0`, opens windows, gets no
+    privileged protocol (`grim` and `wl-paste` fail), reaches `:1`, and cannot
+    list `/home/friend`.
 - PipeWire belongs to `friend`. `jail` gets a separate socket that allows
   playback only, so a game cannot record the microphone or voice chat.
 - Nobody inside the guest has `sudo`. A root exploit inside the guest still

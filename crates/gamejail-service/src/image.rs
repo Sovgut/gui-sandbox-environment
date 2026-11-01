@@ -23,6 +23,8 @@ use tracing::info;
 use crate::{state_path, vm};
 
 const VERDICT: &str = "GAMEJAIL-BUILD: ";
+/// The guest-side program, installed by the provisioning script from the seed.
+const GUEST_BIN: &str = "gamejail-guest";
 /// Room for the driver build and the desktop; the jail's own overlay grows on
 /// top of this.
 const BUILD_DISK: &str = "40G";
@@ -37,6 +39,10 @@ pub struct BuildBaseArgs {
     /// Development only: keep SSH and a `dev` account with this public key.
     #[arg(long, value_name = "PUBKEY_FILE")]
     dev_ssh_key: Option<PathBuf>,
+    /// The `gamejail-guest` binary to install in the image; by default the one
+    /// next to this program.
+    #[arg(long)]
+    guest_bin: Option<PathBuf>,
 }
 
 pub fn build_base(args: &BuildBaseArgs, dry_run: bool) -> Result<()> {
@@ -55,6 +61,12 @@ pub fn build_base(args: &BuildBaseArgs, dry_run: bool) -> Result<()> {
         .as_ref()
         .map(|p| fs::read_to_string(p).with_context(|| format!("key {}", p.display())))
         .transpose()?;
+    let guest_bin = match &args.guest_bin {
+        Some(path) => path.clone(),
+        None => std::env::current_exe()?.with_file_name(GUEST_BIN),
+    };
+    let guest =
+        fs::read(&guest_bin).with_context(|| format!("guest binary {}", guest_bin.display()))?;
 
     let overlay = work.join("disk.qcow2");
     let seed_img = work.join("seed.img");
@@ -95,7 +107,12 @@ pub fn build_base(args: &BuildBaseArgs, dry_run: bool) -> Result<()> {
         &[BUILD_DISK],
     )?;
     let user_data = seed::cloud_config(seed::BASE_PROVISION, key.as_deref());
-    seed::write_nocloud(&seed_img, &format!("gamejail-{stem}-{}", now()), &user_data)?;
+    seed::write_nocloud(
+        &seed_img,
+        &format!("gamejail-{stem}-{}", now()),
+        &user_data,
+        &[(GUEST_BIN, &guest)],
+    )?;
     info!(
         "building {}; guest console: {}",
         out.display(),

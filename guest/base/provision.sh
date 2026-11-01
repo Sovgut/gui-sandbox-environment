@@ -44,7 +44,7 @@ step "desktop"
 dnf -y install \
     labwc lxqt-wayland-session lxqt-session lxqt-panel lxqt-config \
     pcmanfm-qt qterminal featherpad xdg-desktop-portal-lxqt xdg-desktop-portal-wlr \
-    xorg-x11-server-Xwayland greetd greetd-selinux \
+    xorg-x11-server-Xwayland xwayland-satellite greetd greetd-selinux \
     pipewire wireplumber pipewire-pulseaudio \
     flatpak policycoreutils-python-utils google-noto-sans-fonts
 
@@ -82,6 +82,75 @@ user = "friend"
 EOF
 systemctl enable greetd.service
 systemctl set-default graphical.target
+
+step "jail runtime"
+# gamejail-guest travels on the seed volume next to the cloud-init files.
+mkdir -p /run/gamejail-seed
+mount -o ro LABEL=CIDATA /run/gamejail-seed
+install -D -m 0755 /run/gamejail-seed/gamejail-guest /usr/libexec/gamejail/gamejail-guest
+umount /run/gamejail-seed
+restorecon -R /usr/libexec/gamejail
+
+# The sockets `jail` connects to live in a directory owned by `friend` with
+# setgid group `jail`, so only those two accounts reach them. Every connection
+# between them is opened by `jail`: SELinux cannot label one opened by the
+# unconfined `friend` towards a socket the confined `jail` serves.
+semanage fcontext -a -t user_tmp_t '/run/gamejail(/.*)?'
+cat > /etc/tmpfiles.d/gamejail.conf <<'EOF'
+d /run/gamejail 0755 root root -
+d /run/gamejail/display 2750 friend jail -
+EOF
+
+# The jail account's systemd instance runs from boot, so its launcher and X
+# server wait for the desktop rather than the other way round.
+loginctl enable-linger jail
+units=/home/jail/.config/systemd/user
+install -d -o jail -g jail /home/jail/.config /home/jail/.config/systemd \
+    "$units" "$units/default.target.wants" /home/jail/.config/environment.d
+cat > /home/jail/.config/environment.d/gamejail.conf <<'EOF'
+WAYLAND_DISPLAY=/run/gamejail/display/wayland-0
+DISPLAY=:1
+EOF
+cat > "$units/gamejail-xwayland.service" <<'EOF'
+[Unit]
+Description=X server for jail programs, on the restricted display
+# Retries until the desktop has opened the display.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/usr/bin/xwayland-satellite :1
+Restart=always
+RestartSec=2
+EOF
+cat > "$units/gamejail-launch.service" <<'EOF'
+[Unit]
+Description=Starts programs as jail when the desktop asks
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/libexec/gamejail/gamejail-guest launcher
+Restart=always
+RestartSec=1
+EOF
+ln -s ../gamejail-xwayland.service ../gamejail-launch.service "$units/default.target.wants/"
+chown -R jail:jail /home/jail/.config
+
+# The desktop opens the restricted display and the launch relay when
+# `friend` logs in.
+install -d -o friend -g friend /home/friend/.config/autostart
+cat > /home/friend/.config/autostart/gamejail-desktop.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=gamejail desktop
+Exec=/usr/libexec/gamejail/gamejail-guest desktop
+EOF
+chown friend:friend /home/friend/.config/autostart/gamejail-desktop.desktop
+
+if [ "${GAMEJAIL_DEV:-0}" = 1 ]; then
+    dnf -y install grim wl-clipboard wayland-utils xdpyinfo
+fi
 
 step "flatpak"
 flatpak remote-add --system --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo

@@ -56,8 +56,18 @@ pub fn cloud_config(script: &str, dev_ssh_key: Option<&str>) -> String {
     out
 }
 
-/// Writes a NoCloud seed volume with `user_data` and an instance id.
-pub fn write_nocloud(path: &Path, instance_id: &str, user_data: &str) -> Result<()> {
+/// Writes a NoCloud seed volume with `user_data`, an instance id, and `files`
+/// beside them, which the provisioning script copies off the volume (its
+/// label is `CIDATA`). The volume is sized to fit.
+pub fn write_nocloud(
+    path: &Path,
+    instance_id: &str,
+    user_data: &str,
+    files: &[(&str, &[u8])],
+) -> Result<()> {
+    let payload: u64 = files.iter().map(|(_, data)| data.len() as u64).sum();
+    // FAT overhead stays well under a quarter of the payload at these sizes.
+    let size = (SEED_BYTES + payload + payload / 4).next_multiple_of(1024 * 1024);
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -65,12 +75,17 @@ pub fn write_nocloud(path: &Path, instance_id: &str, user_data: &str) -> Result<
         .truncate(true)
         .open(path)
         .map_err(io_error(path))?;
-    file.set_len(SEED_BYTES).map_err(io_error(path))?;
-    format_and_fill(file, instance_id, user_data)
+    file.set_len(size).map_err(io_error(path))?;
+    format_and_fill(file, instance_id, user_data, files)
         .map_err(|e| Error::Step(format!("{}: writing the seed: {e}", path.display())))
 }
 
-fn format_and_fill(mut file: File, instance_id: &str, user_data: &str) -> std::io::Result<()> {
+fn format_and_fill(
+    mut file: File,
+    instance_id: &str,
+    user_data: &str,
+    files: &[(&str, &[u8])],
+) -> std::io::Result<()> {
     fatfs::format_volume(
         &mut file,
         fatfs::FormatVolumeOptions::new().volume_label(*b"CIDATA     "),
@@ -81,6 +96,9 @@ fn format_and_fill(mut file: File, instance_id: &str, user_data: &str) -> std::i
         .write_all(format!("instance-id: {instance_id}\nlocal-hostname: gamejail\n").as_bytes())?;
     root.create_file("user-data")?
         .write_all(user_data.as_bytes())?;
+    for (name, data) in files {
+        root.create_file(name)?.write_all(data)?;
+    }
     drop(root);
     fs.unmount()
 }
@@ -115,7 +133,14 @@ mod tests {
     fn seed_is_a_cidata_volume_with_both_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seed.img");
-        write_nocloud(&path, "build-1", "#cloud-config\n").unwrap();
+        let blob = vec![0x5a_u8; 3 * 1024 * 1024];
+        write_nocloud(
+            &path,
+            "build-1",
+            "#cloud-config\n",
+            &[("gamejail-guest", &blob)],
+        )
+        .unwrap();
 
         let fs =
             fatfs::FileSystem::new(File::open(&path).unwrap(), fatfs::FsOptions::new()).unwrap();
@@ -134,6 +159,13 @@ mod tests {
             .read_to_string(&mut meta)
             .unwrap();
         assert!(meta.starts_with("instance-id: build-1\n"));
+        let mut copied = Vec::new();
+        fs.root_dir()
+            .open_file("gamejail-guest")
+            .unwrap()
+            .read_to_end(&mut copied)
+            .unwrap();
+        assert_eq!(copied, blob);
     }
 
     #[test]

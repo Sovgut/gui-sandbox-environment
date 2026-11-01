@@ -113,8 +113,9 @@ kernel; with it the guest sees the 3070 at PCIe 4.0 x16 with Vulkan.
 The app shows the running environment according to the switch mode:
 
 - **secondary**: the environment's screen is shown in the app window next to the host
-  desktop. A "Full screen" button spreads it over the monitor. Keyboard and
-  mouse go to the environment while its view has focus.
+  desktop. A "Full screen" button spreads it over the monitor; full screen
+  hides the bar, and Ctrl+Alt+F leaves it. Keyboard and mouse go to the
+  environment while its view has focus.
 - **single**: in place of "Full screen" the app has an "Enter" button. It
   performs the switch: the host desktop goes away and the environment owns the
   monitor. Shutting the environment down or the emergency hotkey brings the desktop
@@ -205,15 +206,33 @@ look into an environment without the app.
 
 - Fedora, built from the Fedora Cloud image by `guest/base/provision.sh`,
   which cloud-init runs once in a build VM without a GPU and with the environment
-  network (`gse-service image build-base`). The seed is a FAT volume
-  written by the service itself, so the host needs no mkfs or mtools. The
-  guest reports its verdict on the serial console; a passing build is
-  flattened into one compressed qcow2 with no backing file. On the
+  network. The service builds this base image into `/var/lib/gse/base.qcow2`
+  at the app's request (`build-base`) the way it builds a preset's image
+  (see "Presets and reset"), under the name `base`, which no preset may
+  take; `gse-service image build-base` builds one from a terminal. The seed
+  is a FAT volume written by the service itself, so the host needs no mkfs
+  or mtools. The guest reports its verdict on the serial console; a passing
+  build is flattened into one compressed qcow2 with no backing file, so
+  images built on an older base image keep working. On the
   development PC a build takes about 5 minutes, two of them for the driver.
+- The service fetches the Fedora Cloud Base Generic image itself. The
+  release is `fedora_release` in `/etc/gse/gse.toml`, by default the one
+  `provision.sh` is made for (`RELEASE` in `crates/gse-service/src/fedora.rs`).
+  The image's name, size and SHA-256 come from the release's CHECKSUM file,
+  read with the listing of `releases/<N>/Cloud/x86_64/images/` from
+  Fedora's own server (`dl.fedoraproject.org`) over HTTPS, which stands in
+  for the file's signature; the image comes from a mirror through
+  `download.fedoraproject.org` and counts only once it matches. The app
+  sees the steps `download` and `download <percent>%` while it downloads.
+  A verified image stays in `/var/lib/gse/cache` and serves the next build
+  while it still matches.
 - `akmod-nvidia` from RPM Fusion, built for the newest installed kernel since
   the build VM runs an older one; the build fails if the module is missing.
-- LXQt on labwc (Wayland) with Xwayland for games. greetd starts it as
-  `sandbox` without a password, on boot and after a logout.
+- Budgie on labwc (Wayland) with Xwayland for games: one panel at the
+  bottom with the menu, the open windows, the tray and the clock
+  (`/usr/share/budgie-desktop/layouts/gse.layout`), Papirus icons, a dark
+  theme, and Nemo for the Inbox and Outbox. greetd starts it as `sandbox`
+  without a password, on boot and after a logout.
 - `kernel-modules` is installed for the guest kernel: cloud images leave it
   out, and it carries every sound driver.
 - The guest writes `GSE-READY` to its serial console once the desktop is up;
@@ -308,8 +327,9 @@ voice activation does.
   (`flatpak`) or a local AppImage (`appimage`). Applications run as `guest`
   unless marked `trusted`, which makes them run as `sandbox`.
 - The service keeps the presets in `/var/lib/gse/presets/<name>.toml` and
-  puts the built-in `launchers` preset (`presets/launchers.toml`) there when
-  the directory is empty. The Presets part of the app's settings lists them
+  puts the built-in presets there when the directory is empty: `launchers`
+  (`presets/launchers.toml`, the game launchers with a browser) and
+  `desktop` (`presets/desktop.toml`, the desktop with only a browser). The Presets part of the app's settings lists them
   with their applications, sources and trusted marks and whether an image
   built from each exists, and creates, edits, deletes and builds them; presets
   are edited nowhere else. The service checks
@@ -428,81 +448,170 @@ the app shows what passed and what was refused and why.
 3. **Host background layer**: xpra, GPU-less launch wrappers, PipeWire with
    lingering.
 4. **Guest image recipe** and **guest agent** (Rust, virtio-serial).
-5. **Setup from the app**: gse ships as one AppImage carrying the app,
-   `gse-service`, the systemd unit, the polkit action, the sysusers entry and
-   the default settings. No step needs a terminal:
+5. **Setup from the app**: gse ships as one AppImage carrying the app and
+   the `gse-service` and `gse-guest` programs; `gse-service` has the
+   systemd unit, the polkit action, the sysusers entry and the default
+   settings of `dist/` built in. No step needs a terminal:
    - On first start the app sees that the machine is not prepared and shows
-     what will be installed and why. One polkit prompt runs the bundled
-     `gse-service install`, which puts the service under `/usr/local` (on
-     Fedora Atomic systems such as Bazzite `/usr` is read-only and
-     `/usr/local` is the writable `/var/usrlocal`) and its settings under
-     `/etc/gse`, creates `gse-net`, enables the service, checks IOMMU and
-     VFIO, and reports each step to the app.
+     what will be installed and why. It copies the AppImage's
+     `usr/libexec/gse` to a directory root can read, since root cannot read
+     the AppImage's FUSE mount, and one polkit prompt runs
+     `gse-service install` from there. Install:
+     - checks the machine: `/dev/kvm`, IOMMU groups, `vfio-pci`, QEMU,
+       `qemu-img`, passt, nft and the UEFI firmware. What is missing is a
+       warning, not a failure; install changes no firmware setting or
+       kernel parameter;
+     - puts both programs into `/usr/local/libexec/gse` (on Fedora Atomic
+       systems such as Bazzite `/usr` is read-only and `/usr/local` is the
+       writable `/var/usrlocal`) and gives them their SELinux labels;
+     - writes the unit to `/etc/systemd/system/gse.service`, running the
+       service from there, the polkit action to
+       `/usr/share/polkit-1/actions` or, where `/usr` is read-only,
+       `/etc/polkit-1/actions` (read by polkit 126 and later), the
+       sysusers entry to `/etc/sysusers.d/gse.conf`, and
+       `/etc/gse/gse.toml` unless there are settings already; drop-ins of
+       the unit stay. polkit rereads its actions when a policy file
+       appears in a directory it watches, and finds a directory created
+       after it started only seconds later, so install puts the action's
+       file in place again until `pkaction` knows the action;
+     - creates `gse-net` with `systemd-sysusers`;
+     - enables the service and restarts it once any running environment
+       has stopped, then waits until it answers with the protocol version
+       of the program just installed.
+
+     It reports on stdout, one line each: `step <id>` as a step begins,
+     `warning <id> <text>` for what it found that does not stop it, and
+     `done <id>` or `failed <id> <reason>` as the step ends. The ids are
+     `check`, `programs`, `files`, `account` and `service`; a failed step
+     ends the install with a non-zero exit status. `--dry-run` reports
+     the same steps and changes nothing.
+   - The app then has the service build the base image (see "Guest
+     system") and the image of the `launchers` preset; the `desktop` preset
+     builds when a sandbox is first made from it.
    - A newer AppImage finds an older installed service through the
-     protocol handshake and updates it the same way.
+     protocol handshake and updates it the same way: install replaces the
+     programs and gse's files, keeps the settings, and restarts the
+     service.
    - App settings, General, has "Remove everything": it runs
      `gse-service uninstall` through polkit, which stops any environment,
      the service, and removes its unit, the polkit action, `gse-net`,
-     `/etc/gse`, `/var/lib/gse` (images and environments), the nftables
-     table, the state and sockets and the service's program; the app then
-     deletes its own settings and, if asked, the received files folder,
-     and closes. Nothing of gse stays on the system but the AppImage file.
-     Still to come: removing any kernel parameter setup that install
-     added.
+     `/etc/gse`, `/var/lib/gse` (images, environments and the downloaded
+     Fedora image), the nftables table, the state and sockets and the
+     programs; the app then deletes its own settings and, if asked, the
+     received files folder, and closes. Nothing of gse stays on the system
+     but the AppImage file.
    The development machine runs the same unit with a drop-in
-   (`scripts/dev/systemd/`) that starts the working tree's build.
+   (`scripts/dev/systemd/`) that starts a development build from
+   `/usr/local/sbin`. `scripts/dev/install-dev-service.sh` sets that up once;
+   after it, a new build gets there only through `gse-dev-install`, which
+   asks for an administrator password (the app's "Install service build" in
+   About and updates runs it). The service never takes a build out of the
+   working tree by itself: anything running as the developer can write
+   there.
 
 ## The app
 
-The app calls environments sandboxes. One window:
+The app calls environments sandboxes and presets "sets of apps". It is
+built on GPUI Kit (`gpui-kit`) with the patched `gpui-pre`, `gpui-pre-linux`
+and `gpui-component` in `vendor/`. It draws its own title bar like a KDE
+window: round corners, the Breeze window buttons in the order of
+`ButtonsOnRight` in `~/.config/kwinrc`, a double click to maximize and a
+right click for the window menu. A light and a dark palette lie over the
+Kit's theme (`ui::Theme::apply`), following the system unless settings pick
+one. One window:
 
-- **Left**: a search over the sandboxes' names and presets with a button
-  beside it that steps the order through newest first, by name and by
-  preset (names with numbers in natural order); the sandboxes with their
-  state (stopped, a start's stage, running, waiting for their image);
-  "Add sandbox" and the gear of app settings.
-- Actions that need no words are icons with a tooltip: settings, enter
-  (play), stop, reset, delete, the file moves.
-- **Right**, for the selected sandbox: its name and state; "Sandbox
-  settings" and "Enter", which starts it and opens its screen (a window
-  with "Full screen" when another GPU drives the desktop; on one GPU the
-  monitor switches to it), and Stop while it runs; the steps of a
-  start as a line (prepare, switch the GPU, boot, desktop), done steps
-  solid, the current one pulsing, the rest dashed; why it cannot start,
-  when that is so; and its journal. The journal's filter is a regular
-  expression over each line with its date and time, and `@` words keep a
-  time or a span of it (`@14:05`, `@14:00..14:30`, `@2026-11-01`).
-- **Add sandbox** opens a dialog with a preset already picked (one with a
-  ready image first): pick another (ready, building or not built; a long
-  list scrolls), name the sandbox (a name is suggested), or go to the
-  presets editor with "Create preset". With no preset at all it opens the
-  presets editor straight away.
-- **Sandbox settings** is a dialog with that sandbox's own settings: its
-  name (while it is stopped); the GPU, picked from the host's GPUs with their driver, monitor and switch
-  mode; the screen's resolution and frame rate (on a GPU that drives the
-  monitor, the monitor's own); and the internet. The GPU and the screen
-  apply from the next start, the internet at once. Reset and Delete are
-  there too, each asking a second time.
-- The **files** button beside it, while the sandbox runs, opens a dialog
-  with the Outbox and the Inbox: "Take files" puts what passes the checks
-  into a zip archive in the received files folder, "Choose files" and
-  "Choose a folder" send files of this computer in (see "Guest agent and
-  file bridge").
-- While a sandbox runs, its pane lists the programs of `guest` by the menu
-  entry that started them in a table with its memory and CPU time,
-  refreshed every few seconds; each process can be asked to quit or
-  killed, and a program killed with everything it started, without a
-  restart.
-- A click on a journal line copies it; a button beside the filter copies
-  every line the filter keeps.
-- **App settings** hold the presets editor; the settings new sandboxes
-  start with (`/etc/gse/gse.toml`); and, under General, the received files
-  folder (kept per user in `~/.config/gse/app.toml`) and "Remove
-  everything". Each sandbox keeps a copy of the start settings of its own
-  in `/var/lib/gse/environments/<name>/settings.toml`. The app keeps its
-  own Vulkan drawing off every GPU these settings name and picks those
-  GPUs when it starts, so a new one needs an app restart, which the app
-  offers.
+- **First start**: while the service socket or the base image is missing,
+  the window shows only "Getting this computer ready". "Prepare this
+  computer" copies `gse-service` and `gse-guest` out of the AppImage to a
+  temporary folder, runs `pkexec <that folder>/gse-service install` and
+  follows its `step`/`warning`/`done`/`failed` lines, then asks the service
+  to build the base image (`BuildBase`) and the `launchers` set. Each step
+  shows its latest build step; a failure says why and offers "Try again"
+  from the step it stopped at.
+- **Welcome tour**, after preparing, until it is skipped or done (kept in
+  `~/.config/gse/app.toml`, restarted from settings): what a sandbox is;
+  making the first sandbox from a set; then, on its page, a card pointing
+  at Play. "Skip the tour" ends it on any step.
+- **Left**: the sidebar, 272 px wide: a search over the sandboxes' names
+  and sets with a button beside it that steps the order through newest
+  first, by name and by set (names with numbers in natural order); each
+  sandbox with its cover colours and its state under its name (running, a
+  start's stage, "Preparing" with a percentage while its set builds, when it
+  last played); "New sandbox" and the gear
+  of settings. It collapses to a 64 px rail of covers, with a dot on the
+  running one, by itself while a sandbox's screen is open and by its own
+  button anywhere.
+- **Right**, for the selected sandbox: its cover with its set, the set's
+  first apps and its name, and what can be done now: Play; Show screen and
+  Stop while it runs; the start's steps as a line (prepare, hand over the
+  graphics card, boot, desktop) with Cancel; the build of its set as a line
+  whenever its set builds, a rebuild included, since nothing starts then;
+  "Build its apps" when nothing builds them.
+  Under it the facts: internet as a switch that applies at once, graphics,
+  screen, and the way into its settings. Under them the Activity,
+  Programs and Files tabs. A tab's list scrolled away from its top shrinks
+  the cover to a strip, which grows back at the top.
+- **Play** while another sandbox runs asks to stop that one first. On a GPU
+  that drives the monitor it says the desktop goes away and how to come
+  back, unless told not to again.
+- **Activity** is the journal. Its filter is a regular expression over each
+  line with its date and time, and `@` words keep a time or a span of it
+  (`@14:05`, `@14:00..14:30`, `@2026-11-01`); a menu beside it keeps the
+  last hour, today or this week. What the expression finds is marked in
+  each line. A click on a line copies it; a button copies every line shown.
+- **Programs**, while it runs, lists the programs of `guest` by the menu
+  entry that started them with each process's memory and CPU time,
+  refreshed every few seconds, with a search. A process can be asked to
+  quit or killed, and a program killed with everything it started.
+- **Files**, while it runs, is a panel at the right: "Take N files out"
+  puts what of the Outbox passes the checks into a zip archive in the
+  received files folder; "Choose files", "Choose a folder" or files dropped
+  on the panel go into the Inbox (see "Guest agent and file bridge").
+- **The screen** of a running sandbox replaces the page: a bar with a way
+  back to the sandbox's page ("Show screen" there returns), its name, the
+  mouse hint, the internet switch, Files (a panel at the right),
+  full screen and Stop; the screen; and its programs as cards beside it.
+- **New sandbox** opens a dialog with a set already picked (one that is
+  built first): pick another (each with its apps and whether it is built;
+  a long list scrolls), name the sandbox (a name is suggested), or go to
+  the sets editor with "Make your own set of apps". With no set at all it
+  opens the editor straight away.
+- **Sandbox settings** is a panel at the right with that sandbox's own
+  settings as rows that save as they change: its name, renamed in place
+  while it is stopped; the graphics card, screen size and frame rate as
+  menus (on a GPU that drives the monitor, the monitor's own mode); and the
+  internet as a switch. The GPU and the screen apply from the next start,
+  the internet at once. Reset and Delete sit in a danger zone below, each
+  asking a second time.
+- **Settings** replace the sidebar with their own menu:
+  - General: the look (system, light or dark), the received files folder
+    and the welcome tour, kept per user in `~/.config/gse/app.toml`, and
+    "Remove everything", which asks in a dialog that says what goes and how
+    much it takes, offers to keep the taken files, and waits for the word
+    `remove`.
+  - Sets of apps: each set as a row with its apps, how many sandboxes use
+    it, its state and Build, Rebuild or Stop, its build's steps as a line
+    while it builds; and the sandbox system every set is built on, with
+    Rebuild (`BuildBase`). Edit opens a page with the set's apps (each run
+    as `guest` or `sandbox`) beside where apps come from: a Flathub search
+    through Flathub's API, a Fedora package, or an AppImage file. "Save and
+    build" saves and builds at once. The page renames the set
+    (`RenamePreset`: its file, its image, and the sandboxes made from it,
+    their disks pointed at the renamed image) and deletes a set no sandbox
+    is made from.
+  - New sandboxes: the set the new sandbox dialog picks first (kept by the
+    app) and the settings new sandboxes start with (`/etc/gse/gse.toml`),
+    as the same rows as a sandbox's.
+  - About and updates: a newer release with its notes when there is one,
+    the version, whether the app checks by itself, the service's state and
+    when the app last checked. Each sandbox keeps a
+  copy of the start settings of its own in
+  `/var/lib/gse/environments/<name>/settings.toml`. The app keeps its own
+  Vulkan drawing off every GPU these settings name and picks those GPUs
+  when it starts, so a new one needs an app restart, which the app offers.
+- Messages that are no error appear at the bottom right until dismissed;
+  errors and what needs doing (an update, an older service, an app
+  restart) stand above the page.
 - Every long operation reports its progress as it goes: an image build
   its provisioning steps (the `=== <step>` lines and the `GSE-BUILD`
   verdict on the build VM's serial console), a start the GPU switch, the
@@ -514,20 +623,33 @@ The app calls environments sandboxes. One window:
   why, resets and new images. Lines from the guest agent will be marked
   as the guest's, since malware can write them.
 
+### Previews
+
+`GSE_PREVIEW=<state> gse` shows one page in one state, filled with made-up
+sandboxes, sets, programs and files, without the service
+(`crates/gse-app/src/preview.rs`; `GSE_PREVIEW=list` names the states). Its
+buttons mostly do nothing. `scripts/dev/preview-shots.sh` screenshots every
+state in a hidden nested KWin, which is how the pages are compared with the
+design's boards.
+
 ### What outlives the window
 
 The service runs sandboxes and builds, not the app, so closing the window
 stops neither.
 
-- Closing the window while a sandbox runs asks: stop it and close, keep it
-  running, or cancel. A kept sandbox goes on holding its GPU, sound and
+- Closing the window while a sandbox runs asks: stop it and close, close
+  and leave it running, or don't close. A kept sandbox goes on holding its GPU, sound and
   network; the app shows it as running when it opens again.
 - An image build goes on without the window. The app shows its steps so
   far when it opens again, from the service's record of the build.
-- A restart of the service (the app offers one when its protocol is older)
-  stops a running sandbox and an image build first. A build the service
+- When the service is older than the app (its protocol, or its release on
+  one protocol), an AppImage offers to update it: it installs the service
+  it carries, through the same password prompt as the first start, and the
+  install restarts the service. A development build offers a restart
+  instead. Either stops a running sandbox and an image build first. A build the service
   did not live to finish leaves nothing behind: the service clears
-  `/var/lib/gse/builds` when it starts, and the preset is shown as not
+  `/var/lib/gse/builds` and an unfinished download in
+  `/var/lib/gse/cache` when it starts, and the preset is shown as not
   built.
 - A host shutdown stops the service, which kills QEMU like any stop.
 - Still to come: stopping a user's sandbox when their session ends (its

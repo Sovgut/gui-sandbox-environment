@@ -1,0 +1,13 @@
+[package]
+name = "gse-protocol"
+description = "Messages between the gse service and its clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

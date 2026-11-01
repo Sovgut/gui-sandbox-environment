@@ -45,6 +45,8 @@ pub struct VmSpec {
     /// QEMU's human monitor, on a socket only root reaches, for inspecting a
     /// running VM.
     pub monitor_socket: PathBuf,
+    /// The guest agent's virtio-serial port, on a socket only root reaches.
+    pub agent_socket: Option<PathBuf>,
     pub serial_log: PathBuf,
     /// The account QEMU drops to once its devices are open.
     pub run_as: Option<String>,
@@ -197,6 +199,22 @@ impl VmSpec {
                 "virtio-sound-pci,audiodev=audio,streams=1",
             ]);
         }
+        if let Some(socket) = &self.agent_socket {
+            push(&[
+                "-device",
+                "virtio-serial-pci,id=serial",
+                "-chardev",
+                &format!(
+                    "socket,id=agent,path={},server=on,wait=off",
+                    socket.display()
+                ),
+                "-device",
+                &format!(
+                    "virtserialport,bus=serial.0,chardev=agent,name={}",
+                    gse_protocol::agent::PORT
+                ),
+            ]);
+        }
         if let Some(socket) = &self.input_socket {
             push(&[
                 "-device",
@@ -238,6 +256,7 @@ mod tests {
             vnc_display: None,
             screen: None,
             input_socket: None,
+            agent_socket: None,
             monitor_socket: "/run/gse/proto.monitor".into(),
             serial_log: "/vm/console.log".into(),
             run_as: Some("sovhut".into()),

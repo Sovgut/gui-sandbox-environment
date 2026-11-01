@@ -12,6 +12,57 @@ use tracing::{error, info};
 
 use crate::{STATE_DIR, is_root, state_path};
 
+/// Where distributions keep the PCI ID database, in the order tried.
+const PCI_IDS: [&str; 2] = ["/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids"];
+
+/// The vendor and device names `ids` (the `pci.ids` format) gives a device.
+fn pci_names(ids: &str, vendor: u16, device: u16) -> (Option<String>, Option<String>) {
+    let vendor_key = format!("{vendor:04x}  ");
+    let device_key = format!("\t{device:04x}  ");
+    let mut vendor_name = None;
+    for line in ids.lines() {
+        if vendor_name.is_none() {
+            if let Some(name) = line.strip_prefix(&vendor_key) {
+                vendor_name = Some(name.trim().to_owned());
+            }
+        } else if let Some(name) = line.strip_prefix(&device_key) {
+            return (vendor_name, Some(name.trim().to_owned()));
+        } else if !line.starts_with('\t') && !line.starts_with('#') && !line.is_empty() {
+            // The next vendor: this one has no entry for the device.
+            break;
+        }
+    }
+    (vendor_name, None)
+}
+
+/// Every GPU of the machine as the service's clients see it.
+pub fn describe(root: &Root) -> Result<Vec<gse_protocol::Gpu>> {
+    let ids = PCI_IDS
+        .iter()
+        .find_map(|path| fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    Ok(Gpu::discover(root)?
+        .iter()
+        .map(|gpu| {
+            let display = gpu.display();
+            let (vendor, device) = pci_names(&ids, display.vendor, display.device);
+            gse_protocol::Gpu {
+                address: display.address.to_string(),
+                vendor_id: display.vendor,
+                device_id: display.device,
+                vendor,
+                device,
+                driver: display.driver.clone(),
+                monitor: gpu.drives_display(),
+                mode: match Mode::for_gpu(gpu) {
+                    Mode::Single => gse_protocol::SwitchMode::Single,
+                    Mode::Secondary => gse_protocol::SwitchMode::Secondary,
+                },
+            }
+        })
+        .collect())
+}
+
 pub fn list(root: &Root) -> Result<()> {
     for gpu in Gpu::discover(root)? {
         let display = gpu.display();
@@ -55,6 +106,22 @@ pub fn holders(root: &Root, gpu: PciAddress) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The GPUs this service handed to vfio-pci and has not taken back.
+pub fn handed_over() -> Vec<PciAddress> {
+    fs::read_dir(STATE_DIR)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let file = e.file_name().to_string_lossy().into_owned();
+            file.strip_prefix("gpu-")?
+                .strip_suffix(".handoff")?
+                .parse()
+                .ok()
+        })
+        .collect()
 }
 
 fn handoff_path(gpu: PciAddress) -> PathBuf {
@@ -133,4 +200,38 @@ pub fn detach(root: &Root, gpu: PciAddress, dry_run: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IDS: &str = "\
+# comment
+8086  Intel Corporation
+\t56a5  DG2 [Arc A380]
+\t\t1234 5678  Some board
+10de  NVIDIA Corporation
+\t2484  GA104 [GeForce RTX 3070]
+10df  Emulex Corporation
+\t2485  Not a GPU
+C 03  Display controller
+";
+
+    #[test]
+    fn names_come_from_the_pci_id_database() {
+        assert_eq!(
+            pci_names(IDS, 0x10de, 0x2484),
+            (
+                Some("NVIDIA Corporation".into()),
+                Some("GA104 [GeForce RTX 3070]".into())
+            )
+        );
+        assert_eq!(
+            pci_names(IDS, 0x10de, 0x2485),
+            (Some("NVIDIA Corporation".into()), None)
+        );
+        assert_eq!(pci_names(IDS, 0x1234, 0x0001), (None, None));
+        assert_eq!(pci_names("", 0x10de, 0x2484), (None, None));
+    }
 }

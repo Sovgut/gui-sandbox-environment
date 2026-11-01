@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Who may use the gse service. The person at the machine may, without a
+     password; nobody else may, remote and inactive sessions included. -->
+<policyconfig>
+  <action id="io.github.sovgut.gse.manage">
+    <description>Manage GUI sandbox environments</description>
+    <message>Authentication is required to manage GUI sandbox environments</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

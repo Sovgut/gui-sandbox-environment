@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 gse-screen = { path = "../gse-screen" }
+gse-protocol = { path = "../gse-protocol" }
 thiserror.workspace = true
 tracing.workspace = true
 fatfs.workspace = true

@@ -1,0 +1,10 @@
+# /etc/gse/gse.toml: the machine's settings for the gse service.
+
+# The GPU environments get, as `gse-service gpu list` shows it.
+gpu = "0000:0e:00.0"
+
+# The environment screen's mode when it is shown in a window.
+screen_mode = "2560x1440@60"
+
+memory_mib = 12288
+cpus = 8

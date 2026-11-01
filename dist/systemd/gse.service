@@ -1,0 +1,14 @@
+[Unit]
+Description=GUI Sandbox Environment service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/libexec/gse/gse-service daemon
+# The app restarts the service to load a new build: the service stops any
+# environment, answers, and exits; systemd starts it again.
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

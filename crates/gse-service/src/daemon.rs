@@ -1,0 +1,1621 @@
+//! `daemon`: the service clients talk to over [`gse_protocol::SOCKET`].
+//!
+//! Every connection is served on a thread of its own. Who may use the
+//! service is polkit's decision: the action `io.github.sovgut.gse.manage`
+//! (`dist/polkit-1/actions`) is checked once per connection against the
+//! process on the other end, which the kernel names (`SO_PEERCRED`). The
+//! user behind that process owns any environment it starts: QEMU runs as
+//! them, and the screen memory, input socket and sound go to them.
+
+use std::fs;
+use std::io::{BufReader, Write as _};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
+
+use anyhow::{Context, Result, bail};
+use gse_host::Root;
+use gse_host::pci::PciAddress;
+use gse_host::preset::Preset as HostPreset;
+use gse_protocol::{
+    Build, Environment, Event, JournalEntry, MAX_LINE, Reply, Request, Running, SOCKET,
+    ScreenAccess, ScreenMode, Settings, Stage, receive, send, valid_name,
+};
+use serde::Deserialize;
+use tracing::{error, info, warn};
+
+use crate::agent::Agent;
+use crate::{checks, gpu, image, net, presets, vm};
+
+/// The polkit action every client needs.
+pub const ACTION: &str = "io.github.sovgut.gse.manage";
+const CONFIG: &str = "/etc/gse/gse.toml";
+const DATA: &str = "/var/lib/gse";
+/// The size past which an environment's journal drops its older lines,
+/// keeping at most [`JOURNAL_KEEP`] of the latest within half that size.
+const JOURNAL_MAX: usize = 256 * 1024;
+const JOURNAL_KEEP: usize = 1000;
+/// How many of its latest entries a journal request answers.
+const JOURNAL_SHOWN: usize = 500;
+
+/// `/etc/gse/gse.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// The GPU environments get.
+    #[serde(deserialize_with = "pci_address")]
+    pub gpu: PciAddress,
+    #[serde(default = "default_screen_mode")]
+    pub screen_mode: String,
+    #[serde(default = "default_internet")]
+    pub internet: bool,
+    #[serde(default = "default_memory")]
+    pub memory_mib: u32,
+    #[serde(default = "default_cpus")]
+    pub cpus: u16,
+    /// Development only: forward 127.0.0.1:PORT to each environment's SSH
+    /// port. Only development images run an SSH server.
+    #[serde(default)]
+    pub dev_ssh_port: Option<u16>,
+}
+
+fn pci_address<'de, D: serde::Deserializer<'de>>(from: D) -> Result<PciAddress, D::Error> {
+    let text = String::deserialize(from)?;
+    text.parse().map_err(serde::de::Error::custom)
+}
+
+fn default_screen_mode() -> String {
+    "2560x1440@60".into()
+}
+const fn default_internet() -> bool {
+    true
+}
+const fn default_memory() -> u32 {
+    12288
+}
+const fn default_cpus() -> u16 {
+    8
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let text =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// The file [`Config::load`] reads back as `self`.
+    fn to_toml(&self) -> String {
+        let dev = self
+            .dev_ssh_port
+            .map(|port| format!("\n# Development only.\ndev_ssh_port = {port}\n"))
+            .unwrap_or_default();
+        format!(
+            "# /etc/gse/gse.toml: the machine's settings for the gse service.\n\
+             \n\
+             # What a new environment starts with; each environment keeps its\n\
+             # own copy. The GPU is named as `gse-service gpu list` shows it,\n\
+             # and the screen mode applies when the screen is shown in a window.\n\
+             gpu = \"{}\"\n\
+             screen_mode = \"{}\"\n\
+             internet = {}\n\
+             \n\
+             memory_mib = {}\n\
+             cpus = {}\n{dev}",
+            self.gpu,
+            self.screen_mode.escape_default(),
+            self.internet,
+            self.memory_mib,
+            self.cpus
+        )
+    }
+
+    /// Replaces the file at `path` in one step: the new file is written next
+    /// to it and renamed over it, so a reader sees the old or the new file,
+    /// never a part.
+    fn save(&self, path: &Path) -> Result<()> {
+        replace_file(path, &self.to_toml())
+    }
+
+    fn settings(&self) -> Settings {
+        Settings {
+            gpu: self.gpu.to_string(),
+            screen_mode: self.screen_mode.clone(),
+            internet: self.internet,
+        }
+    }
+}
+
+/// Replaces the file at `path` with `text` in one step: the new file is
+/// written next to it and renamed over it, so a reader sees the old or the
+/// new file, never a part. The file is readable by everyone: the app reads
+/// the GPUs named in settings to stay off them.
+fn replace_file(path: &Path, text: &str) -> Result<()> {
+    let mut name = path.file_name().context("file path")?.to_owned();
+    name.push(".new");
+    let temp = path.with_file_name(name);
+    let write = || -> std::io::Result<()> {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(text.as_bytes())?;
+        file.set_permissions(fs::Permissions::from_mode(0o644))?;
+        file.sync_all()?;
+        fs::rename(&temp, path)
+    };
+    write().map_err(|e| {
+        fs::remove_file(&temp).ok();
+        anyhow::Error::new(e).context(format!("writing {}", path.display()))
+    })
+}
+
+/// Checks `settings` against the machine: the GPU must be one of `gpus` and
+/// a frame of the screen mode must fit a slot of the screen memory.
+fn validate(settings: &Settings, gpus: &[gse_protocol::Gpu]) -> Result<(PciAddress, ScreenMode)> {
+    let address: PciAddress = settings
+        .gpu
+        .parse()
+        .with_context(|| format!("'{}' is not a PCI address", settings.gpu))?;
+    if !gpus.iter().any(|g| g.address == address.to_string()) {
+        bail!("{address} is not a GPU of this machine");
+    }
+    let mode: ScreenMode = settings.screen_mode.parse().map_err(anyhow::Error::msg)?;
+    let frame = u64::from(mode.width) * u64::from(mode.height) * 4;
+    if frame > gse_screen::SLOT_SIZE as u64 {
+        bail!(
+            "a {}x{} frame does not fit the screen memory",
+            mode.width,
+            mode.height
+        );
+    }
+    Ok((address, mode))
+}
+
+/// Where images and environments live: `base.qcow2`, the base image presets
+/// build on; `images/<image>.qcow2`; `environments/<name>/` with the name
+/// of the environment's image, its `settings.toml` and `journal`, and once
+/// it has started, its disk, firmware variables and serial log;
+/// `presets/<preset>.toml`; and `builds/`, where an image is built
+/// before it replaces the one in `images/`.
+#[derive(Debug, Clone)]
+pub struct Store {
+    root: PathBuf,
+}
+
+impl Store {
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    fn images_dir(&self) -> PathBuf {
+        self.root.join("images")
+    }
+
+    fn environments_dir(&self) -> PathBuf {
+        self.root.join("environments")
+    }
+
+    fn presets_dir(&self) -> PathBuf {
+        self.root.join("presets")
+    }
+
+    fn builds_dir(&self) -> PathBuf {
+        self.root.join("builds")
+    }
+
+    fn base(&self) -> PathBuf {
+        self.root.join("base.qcow2")
+    }
+
+    fn image(&self, image: &str) -> PathBuf {
+        self.images_dir().join(format!("{image}.qcow2"))
+    }
+
+    fn dir(&self, name: &str) -> PathBuf {
+        self.environments_dir().join(name)
+    }
+
+    #[must_use]
+    pub fn disk(&self, name: &str) -> PathBuf {
+        self.dir(name).join("disk.qcow2")
+    }
+
+    fn sorted_names(dir: &Path, keep: impl Fn(&Path) -> Option<String>) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| keep(&e.path()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The images that exist; a link to an image that is gone is none.
+    pub fn images(&self) -> Vec<String> {
+        Self::sorted_names(&self.images_dir(), |p| {
+            (p.extension()? == "qcow2" && p.exists())
+                .then(|| p.file_stem()?.to_str().map(str::to_owned))
+                .flatten()
+        })
+    }
+
+    /// Every environment, with the image it was created from.
+    pub fn environments(&self) -> Vec<(String, String)> {
+        Self::sorted_names(&self.environments_dir(), |p| {
+            p.is_dir()
+                .then(|| p.file_name()?.to_str().map(str::to_owned))
+                .flatten()
+        })
+        .into_iter()
+        .map(|name| {
+            let image = fs::read_to_string(self.dir(&name).join("image"))
+                .map(|s| s.trim().to_owned())
+                .unwrap_or_default();
+            (name, image)
+        })
+        .collect()
+    }
+
+    /// A new environment on `image`, which exists or has a preset it will
+    /// be built from. Its disk comes with its first start.
+    pub fn create(&self, name: &str, image: &str, settings: &Settings) -> Result<()> {
+        if !valid_name(name) || !valid_name(image) {
+            bail!("names are 1-32 lowercase letters, digits and hyphens");
+        }
+        if !self.image(image).exists() && !presets::exists(&self.presets_dir(), image) {
+            bail!("no image or preset '{image}'");
+        }
+        let dir = self.dir(name);
+        if dir.exists() {
+            bail!("'{name}' exists");
+        }
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("image"), format!("{image}\n"))?;
+        self.set_settings(name, settings)
+    }
+
+    /// When `name` was created: its image file is written then, and never
+    /// again.
+    fn created(&self, name: &str) -> u64 {
+        fs::metadata(self.dir(name).join("image"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs())
+    }
+
+    fn image_of(&self, name: &str) -> Result<String> {
+        fs::read_to_string(self.dir(name).join("image"))
+            .map(|s| s.trim().to_owned())
+            .with_context(|| format!("no environment '{name}'"))
+    }
+
+    /// Makes the disk of `name` once its image exists: a fresh overlay on
+    /// the image, so every start after a reset begins from the image.
+    fn ensure_disk(&self, name: &str) -> Result<()> {
+        let disk = self.disk(name);
+        if disk.exists() {
+            return Ok(());
+        }
+        let image = self.image_of(name)?;
+        let base = self.image(&image);
+        if !base.exists() {
+            bail!("the image '{image}' is not built yet");
+        }
+        let status = Command::new("qemu-img")
+            .args(["create", "-q", "-f", "qcow2", "-F", "qcow2", "-b"])
+            .arg(base)
+            .arg(&disk)
+            .status()
+            .context("starting qemu-img")?;
+        if !status.success() {
+            bail!("qemu-img failed ({status})");
+        }
+        Ok(())
+    }
+
+    /// Throws away everything written into `name`; its next start begins
+    /// from its image again.
+    pub fn reset(&self, name: &str) -> Result<()> {
+        self.image_of(name)?;
+        let dir = self.dir(name);
+        fs::remove_file(self.disk(name)).ok();
+        fs::remove_file(dir.join("OVMF_VARS.qcow2")).ok();
+        fs::remove_file(dir.join("console.log")).ok();
+        Ok(())
+    }
+
+    /// The settings of `name`; one created without them gets `defaults`.
+    fn settings(&self, name: &str, defaults: &Settings) -> Settings {
+        fs::read_to_string(self.dir(name).join("settings.toml"))
+            .ok()
+            .and_then(|text| toml::from_str(&text).ok())
+            .unwrap_or_else(|| defaults.clone())
+    }
+
+    fn set_settings(&self, name: &str, settings: &Settings) -> Result<()> {
+        let text = toml::to_string(settings).context("writing the settings")?;
+        replace_file(&self.dir(name).join("settings.toml"), &text)
+    }
+
+    /// Adds `text` to the journal of `name`, dropping older lines once the
+    /// journal grows past [`JOURNAL_MAX`] bytes.
+    fn log(&self, name: &str, text: &str) -> Result<JournalEntry> {
+        let entry = JournalEntry {
+            time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            text: text.to_owned(),
+        };
+        let path = self.dir(name).join("journal");
+        let mut line = serde_json::to_string(&entry)?;
+        line.push('\n');
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        file.write_all(line.as_bytes())?;
+        if file.metadata()?.len() > JOURNAL_MAX as u64 {
+            let text = fs::read_to_string(&path)?;
+            let mut size = 0;
+            let mut kept: Vec<&str> = text
+                .lines()
+                .rev()
+                .take(JOURNAL_KEEP)
+                .take_while(|line| {
+                    size += line.len() + 1;
+                    size <= JOURNAL_MAX / 2
+                })
+                .collect();
+            kept.reverse();
+            replace_file(&path, &(kept.join("\n") + "\n"))?;
+        }
+        Ok(entry)
+    }
+
+    /// The latest [`JOURNAL_SHOWN`] entries of the journal of `name`.
+    fn journal(&self, name: &str) -> Result<Vec<JournalEntry>> {
+        self.image_of(name)?;
+        let text = fs::read_to_string(self.dir(name).join("journal")).unwrap_or_default();
+        let entries: Vec<JournalEntry> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        Ok(entries[entries.len().saturating_sub(JOURNAL_SHOWN)..].to_vec())
+    }
+
+    pub fn rename(&self, name: &str, to: &str) -> Result<()> {
+        self.image_of(name)?;
+        if !valid_name(to) {
+            bail!("names are 1-32 lowercase letters, digits and hyphens");
+        }
+        let target = self.dir(to);
+        if target.exists() {
+            bail!("'{to}' exists");
+        }
+        fs::rename(self.dir(name), target)?;
+        Ok(())
+    }
+
+    pub fn delete(&self, name: &str) -> Result<()> {
+        let dir = self.dir(name);
+        if !valid_name(name) || !dir.is_dir() {
+            bail!("no environment '{name}'");
+        }
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// Puts the freshly built `built` in place of the image `image`. An
+    /// overlay cannot outlive a change of the image under it, so every
+    /// environment created from `image` is reset onto the new one; their
+    /// names come back.
+    fn replace_image(&self, image: &str, built: &Path) -> Result<Vec<String>> {
+        fs::rename(built, self.image(image))
+            .with_context(|| format!("putting the image '{image}' in place"))?;
+        let mut reset = Vec::new();
+        for (name, _) in self
+            .environments()
+            .into_iter()
+            .filter(|(_, from)| from == image)
+        {
+            match self.reset(&name) {
+                Ok(()) => reset.push(name),
+                Err(e) => error!("resetting '{name}' onto the new image '{image}': {e:#}"),
+            }
+        }
+        Ok(reset)
+    }
+}
+
+/// The environment that runs, if any.
+struct Current {
+    name: String,
+    stage: Stage,
+    internet: bool,
+    owner: u32,
+    stop: Arc<AtomicBool>,
+    screen: ScreenAccess,
+}
+
+/// The image build in progress, if any.
+struct Building {
+    preset: String,
+    steps: Vec<String>,
+    stop: Arc<AtomicBool>,
+}
+
+/// What a build tells the connection that asked for it.
+enum BuildUpdate {
+    Step(String),
+    Finished(Result<(), String>),
+}
+
+struct Shared {
+    root: Root,
+    config: Config,
+    store: Store,
+    current: Option<Current>,
+    build: Option<Building>,
+    watchers: Vec<Sender<Event>>,
+    /// The connection to the running environment's agent, made on first use.
+    agent: Arc<Mutex<Option<Agent>>>,
+}
+
+#[derive(Clone)]
+struct Service(Arc<Mutex<Shared>>);
+
+impl Service {
+    fn lock(&self) -> MutexGuard<'_, Shared> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn broadcast(&self, event: &Event) {
+        self.lock()
+            .watchers
+            .retain(|w| w.send(event.clone()).is_ok());
+    }
+
+    /// Adds `text` to the journal of `name` and tells the watchers.
+    fn log(&self, name: &str, text: impl AsRef<str>) {
+        let store = self.lock().store.clone();
+        match store.log(name, text.as_ref()) {
+            Ok(entry) => self.broadcast(&Event::Journal {
+                name: name.to_owned(),
+                entry,
+            }),
+            Err(e) => warn!("journal of '{name}': {e:#}"),
+        }
+    }
+
+    fn list(&self) -> Vec<Environment> {
+        let shared = self.lock();
+        let defaults = shared.config.settings();
+        shared
+            .store
+            .environments()
+            .into_iter()
+            .map(|(name, image)| {
+                let running = shared
+                    .current
+                    .as_ref()
+                    .filter(|c| c.name == name)
+                    .map(|c| Running {
+                        stage: c.stage,
+                        internet: c.internet,
+                        screen: Some(c.screen.clone()),
+                    });
+                Environment {
+                    image_ready: shared.store.image(&image).exists(),
+                    created: shared.store.created(&name),
+                    settings: shared.store.settings(&name, &defaults),
+                    name,
+                    image,
+                    running,
+                }
+            })
+            .collect()
+    }
+
+    /// Starts `name` for `owner`; progress goes to `progress` and to every
+    /// watcher, and a start that fails ends `progress` with the reason.
+    fn start(&self, name: &str, owner: u32, progress: Sender<Result<Stage, String>>) -> Result<()> {
+        let (launch, stop, root) = {
+            let mut shared = self.lock();
+            if let Some(current) = &shared.current {
+                bail!("'{}' is running", current.name);
+            }
+            if let Some(build) = &shared.build {
+                bail!("the image '{}' is building", build.preset);
+            }
+            shared.store.ensure_disk(name)?;
+            let settings = shared.store.settings(name, &shared.config.settings());
+            let gpu: PciAddress = settings
+                .gpu
+                .parse()
+                .with_context(|| format!("'{}' is not a PCI address", settings.gpu))?;
+            let launch = vm::Launch {
+                name: name.to_owned(),
+                disk: shared.store.disk(name),
+                read_only_disks: Vec::new(),
+                gpu,
+                memory_mib: shared.config.memory_mib,
+                cpus: shared.config.cpus,
+                internet: settings.internet,
+                screen_mode: settings.screen_mode.clone(),
+                owner: vm::Owner::from_uid(owner)?,
+                dev_ssh_port: shared.config.dev_ssh_port,
+                dev_vnc: None,
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            shared.current = Some(Current {
+                name: name.to_owned(),
+                stage: Stage::Preparing,
+                internet: settings.internet,
+                owner,
+                stop: Arc::clone(&stop),
+                screen: ScreenAccess {
+                    memory: launch.screen_memory(),
+                    input: launch.input_socket(),
+                },
+            });
+            (launch, stop, shared.root.clone())
+        };
+
+        self.log(
+            name,
+            format!(
+                "Starting for {} on GPU {}, screen {}, internet {}",
+                launch.owner.name,
+                launch.gpu,
+                launch.screen_mode,
+                on_off(launch.internet)
+            ),
+        );
+        let service = self.clone();
+        thread::spawn(move || {
+            let name = launch.name.clone();
+            let outcome = vm::launch_environment(
+                &root,
+                &launch,
+                &stop,
+                &mut |stage| {
+                    if let Some(current) = service.lock().current.as_mut() {
+                        current.stage = stage;
+                    }
+                    progress.send(Ok(stage)).ok();
+                    service.broadcast(&Event::Progress {
+                        name: name.clone(),
+                        stage,
+                    });
+                    if stage != Stage::Preparing {
+                        service.log(&name, stage_entry(stage));
+                    }
+                },
+                false,
+            );
+            let error = outcome.err().map(|e| format!("{e:#}"));
+            if let Some(e) = &error {
+                error!("environment {name}: {e}");
+                progress.send(Err(e.clone())).ok();
+            }
+            let agent = {
+                let mut shared = service.lock();
+                shared.current = None;
+                Arc::clone(&shared.agent)
+            };
+            *agent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            service.log(
+                &name,
+                error
+                    .as_ref()
+                    .map_or_else(|| "Stopped".to_owned(), |e| format!("Stopped: {e}")),
+            );
+            service.broadcast(&Event::Stopped { name, error });
+        });
+        Ok(())
+    }
+
+    fn not_running(&self, name: &str) -> Result<()> {
+        if self.lock().current.as_ref().is_some_and(|c| c.name == name) {
+            bail!("'{name}' is running; stop it first");
+        }
+        Ok(())
+    }
+
+    /// Starts `name` and reports its progress to `out` until the desktop is
+    /// up; a start that fails ends with the reason.
+    fn start_and_report(&self, name: &str, peer: Peer, out: &mut UnixStream) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.start(name, peer.uid, tx)?;
+        for update in rx {
+            match update {
+                Ok(stage) => {
+                    send(out, &Reply::Progress { stage })?;
+                    if stage == Stage::Ready {
+                        return Ok(());
+                    }
+                }
+                Err(reason) => bail!(reason),
+            }
+        }
+        bail!("'{name}' stopped before it was ready")
+    }
+
+    /// Stops whatever runs, an environment or an image build, and waits
+    /// until it is over and the GPU is back with the host.
+    fn stop_everything(&self) {
+        {
+            let shared = self.lock();
+            if let Some(current) = shared.current.as_ref() {
+                current.stop.store(true, Ordering::SeqCst);
+            }
+            if let Some(build) = shared.build.as_ref() {
+                build.stop.store(true, Ordering::SeqCst);
+            }
+        }
+        for _ in 0..300 {
+            let shared = self.lock();
+            if shared.current.is_none() && shared.build.is_none() {
+                return;
+            }
+            drop(shared);
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+        warn!("the environment or image build did not stop in time");
+    }
+
+    /// Records that the build of `preset` reached `step` and tells the
+    /// watchers and `report`.
+    fn build_step(&self, preset: &str, step: String, report: &Sender<BuildUpdate>) {
+        if let Some(build) = self.lock().build.as_mut() {
+            build.steps.push(step.clone());
+        }
+        self.broadcast(&Event::Build {
+            preset: preset.to_owned(),
+            step: step.clone(),
+        });
+        report.send(BuildUpdate::Step(step)).ok();
+    }
+
+    /// Starts building the image of preset `name` for `peer` on a thread of
+    /// its own; its steps and its end go to `report` and to every watcher.
+    fn start_build(&self, name: &str, peer: Peer, report: Sender<BuildUpdate>) -> Result<()> {
+        let store = self.lock().store.clone();
+        let preset = presets::load(&store.presets_dir(), name)?;
+        let base = store.base();
+        if !base.exists() {
+            bail!("no base image; build or install one first");
+        }
+        let appimages = open_appimages(&preset, peer.uid)?;
+        let owner = vm::Owner::from_uid(peer.uid)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let mut shared = self.lock();
+            if let Some(current) = &shared.current {
+                bail!("'{}' is running; images build once it stops", current.name);
+            }
+            if let Some(build) = &shared.build {
+                bail!("the image '{}' is building", build.preset);
+            }
+            shared.build = Some(Building {
+                preset: name.to_owned(),
+                steps: Vec::new(),
+                stop: Arc::clone(&stop),
+            });
+        }
+        info!("building the image of preset '{name}' for {}", owner.name);
+
+        let service = self.clone();
+        let name = name.to_owned();
+        thread::spawn(move || {
+            service.build_step(&name, "prepare".into(), &report);
+            let (steps, reached) = mpsc::channel();
+            let forwarder = {
+                let (service, name, report) = (service.clone(), name.clone(), report.clone());
+                thread::spawn(move || {
+                    for step in reached {
+                        service.build_step(&name, step, &report);
+                    }
+                })
+            };
+            let job = image::Job {
+                stop: &stop,
+                run_as: Some(owner.name),
+                steps: Some(steps),
+            };
+            let out = store.builds_dir().join(format!("{name}.qcow2"));
+            fs::remove_file(&out).ok();
+            let outcome = image::build_preset_image(&preset, appimages, &base, &out, &job, false)
+                .and_then(|()| store.replace_image(&name, &out));
+            drop(job);
+            forwarder.join().ok();
+            for reset in outcome.as_deref().unwrap_or_default() {
+                service.log(
+                    reset,
+                    format!("The image {name} is new; the next start begins from it"),
+                );
+            }
+            let error = outcome.err().map(|e| format!("{e:#}"));
+            if let Some(e) = &error {
+                error!("building the image of preset '{name}': {e}");
+            } else {
+                info!("the image of preset '{name}' is ready");
+            }
+            service.lock().build = None;
+            service.broadcast(&Event::Changed);
+            service.broadcast(&Event::BuildFinished {
+                preset: name,
+                error: error.clone(),
+            });
+            report
+                .send(BuildUpdate::Finished(error.map_or(Ok(()), Err)))
+                .ok();
+        });
+        Ok(())
+    }
+
+    /// Builds the image of preset `name` and reports each step to `out`
+    /// until the build ends; a failed build ends with the reason.
+    fn build_and_report(&self, name: &str, peer: Peer, out: &mut UnixStream) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.start_build(name, peer, tx)?;
+        for update in rx {
+            match update {
+                BuildUpdate::Step(step) => send(out, &Reply::BuildStep { step })?,
+                BuildUpdate::Finished(Ok(())) => return Ok(()),
+                BuildUpdate::Finished(Err(reason)) => bail!(reason),
+            }
+        }
+        bail!("the build of '{name}' ended without a verdict")
+    }
+
+    /// Stops the running environment at once, if `peer` owns it.
+    fn stop(&self, peer: Peer) -> Result<()> {
+        let mut shared = self.lock();
+        let current = shared.current.as_mut().context("nothing is running")?;
+        if current.owner != peer.uid && peer.uid != 0 {
+            bail!("'{}' belongs to another user", current.name);
+        }
+        current.stop.store(true, Ordering::SeqCst);
+        current.stage = Stage::Stopping;
+        let name = current.name.clone();
+        drop(shared);
+        self.log(&name, stage_entry(Stage::Stopping));
+        self.broadcast(&Event::Progress {
+            name,
+            stage: Stage::Stopping,
+        });
+        Ok(())
+    }
+
+    /// Runs `work` with the agent of `name`, which must be running and up;
+    /// a failed call drops the connection, so the next one starts afresh.
+    fn with_agent<T>(&self, name: &str, work: impl FnOnce(&mut Agent) -> Result<T>) -> Result<T> {
+        let slot = {
+            let shared = self.lock();
+            let current = shared
+                .current
+                .as_ref()
+                .filter(|c| c.name == name)
+                .with_context(|| format!("'{name}' is not running"))?;
+            if current.stage != Stage::Ready {
+                bail!("'{name}' is not up yet");
+            }
+            Arc::clone(&shared.agent)
+        };
+        let mut slot = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(Agent::connect(&vm::agent_socket(name))?);
+        }
+        let outcome = work(slot.as_mut().expect("connected above"));
+        if outcome.is_err() {
+            *slot = None;
+        }
+        outcome
+    }
+
+    /// The requests about a running environment's programs and files.
+    fn handle_guest(&self, request: Request, peer: Peer, out: &mut UnixStream) -> Result<()> {
+        match request {
+            Request::Processes { name } => {
+                let apps = self.with_agent(&name, Agent::processes)?;
+                send(out, &Reply::Processes { apps })?;
+            }
+            Request::EndProcess { name, pid, force } => {
+                self.with_agent(&name, |a| a.end_process(pid, force))?;
+                let how = if force { "Killed" } else { "Asked to quit:" };
+                self.log(&name, format!("{how} process {pid}"));
+            }
+            Request::EndApp { name, unit } => {
+                // The journal names the program as the list showed it.
+                let title = self.with_agent(&name, |agent| {
+                    let title = agent
+                        .processes()?
+                        .into_iter()
+                        .find(|app| app.unit.as_deref() == Some(unit.as_str()))
+                        .map_or_else(|| unit.clone(), |app| app.title);
+                    agent.end_app(&unit)?;
+                    Ok(title)
+                })?;
+                self.log(&name, format!("Killed {title} with everything it started"));
+            }
+            Request::Files { name } => {
+                let files = self.with_agent(&name, Agent::files)?;
+                send(out, &Reply::Files { files })?;
+            }
+            Request::SendFiles { name, paths } => {
+                let files = host_files(&paths, peer.uid)?;
+                let count = files.len();
+                self.with_agent(&name, |agent| {
+                    for (path, mut file, size) in files {
+                        // An AppImage runs whether or not its download kept
+                        // the flag.
+                        let executable = file.metadata()?.mode() & 0o100 != 0
+                            || path.to_ascii_lowercase().ends_with(".appimage");
+                        agent.put(&path, &mut file, size, executable)?;
+                    }
+                    Ok(())
+                })?;
+                self.log(
+                    &name,
+                    format!("{count} file(s) from the host put into the Inbox"),
+                );
+            }
+            Request::TakeFiles { name } => {
+                let (passed, refused) = self.with_agent(&name, |agent| take(agent, out))?;
+                self.log(
+                    &name,
+                    format!("{passed} file(s) of the Outbox taken to the host, {refused} refused"),
+                );
+            }
+            _ => unreachable!("not a request about a running environment"),
+        }
+        Ok(())
+    }
+
+    /// Replaces the settings of `name`; the internet of a running
+    /// environment follows at once.
+    fn set_environment_settings(&self, name: &str, settings: &Settings) -> Result<()> {
+        let root = self.lock().root.clone();
+        let (address, mode) = validate(settings, &gpu::describe(&root)?)?;
+        let settings = Settings {
+            gpu: address.to_string(),
+            screen_mode: mode.to_string(),
+            internet: settings.internet,
+        };
+        let mut shared = self.lock();
+        let before = shared.store.settings(name, &shared.config.settings());
+        shared.store.image_of(name)?;
+        shared.store.set_settings(name, &settings)?;
+        let internet_changed = match shared.current.as_mut() {
+            Some(current) if current.name == name && current.internet != settings.internet => {
+                net::apply(settings.internet, false)?;
+                current.internet = settings.internet;
+                true
+            }
+            _ => false,
+        };
+        drop(shared);
+        if before.gpu != settings.gpu || before.screen_mode != settings.screen_mode {
+            self.log(
+                name,
+                format!(
+                    "Settings: GPU {}, screen {}; they apply from the next start",
+                    settings.gpu, settings.screen_mode
+                ),
+            );
+        }
+        if before.internet != settings.internet {
+            self.log(name, format!("Internet {}", on_off(settings.internet)));
+        }
+        if internet_changed {
+            self.broadcast(&Event::Internet {
+                on: settings.internet,
+            });
+        }
+        self.broadcast(&Event::Changed);
+        Ok(())
+    }
+
+    /// The requests about presets and their image builds.
+    fn handle_preset(&self, request: Request, peer: Peer, out: &mut UnixStream) -> Result<()> {
+        match request {
+            Request::Presets => {
+                let shared = self.lock();
+                let presets = presets::list(&shared.store.presets_dir());
+                let build = shared.build.as_ref().map(|b| Build {
+                    preset: b.preset.clone(),
+                    steps: b.steps.clone(),
+                });
+                drop(shared);
+                send(out, &Reply::Presets { presets, build })?;
+            }
+            Request::SavePreset { preset } => {
+                let dir = self.lock().store.presets_dir();
+                presets::save(&dir, &preset)?;
+                self.broadcast(&Event::PresetsChanged);
+            }
+            Request::DeletePreset { name } => {
+                let shared = self.lock();
+                if shared.build.as_ref().is_some_and(|b| b.preset == name) {
+                    bail!("'{name}' is building; stop the build first");
+                }
+                presets::delete(&shared.store.presets_dir(), &name)?;
+                drop(shared);
+                self.broadcast(&Event::PresetsChanged);
+            }
+            Request::BuildPreset { name } => self.build_and_report(&name, peer, out)?,
+            Request::StopBuild => {
+                let shared = self.lock();
+                let build = shared.build.as_ref().context("no image is building")?;
+                build.stop.store(true, Ordering::SeqCst);
+                info!("stopping the build of '{}'", build.preset);
+            }
+            _ => unreachable!("not a preset request"),
+        }
+        Ok(())
+    }
+
+    /// The requests that create, change and remove environments.
+    fn handle_lifecycle(&self, request: Request) -> Result<()> {
+        match request {
+            Request::Create { name, image } => {
+                let shared = self.lock();
+                shared
+                    .store
+                    .create(&name, &image, &shared.config.settings())?;
+                drop(shared);
+                self.log(&name, format!("Created from the preset {image}"));
+                self.broadcast(&Event::Changed);
+            }
+            Request::Reset { name } => {
+                self.not_running(&name)?;
+                self.lock().store.reset(&name)?;
+                self.log(&name, "Reset: the next start begins from the image");
+                self.broadcast(&Event::Changed);
+            }
+            Request::Rename { name, to } => {
+                self.not_running(&name)?;
+                self.lock().store.rename(&name, &to)?;
+                self.log(&to, format!("Renamed from {name}"));
+                self.broadcast(&Event::Changed);
+            }
+            Request::SetEnvironmentSettings { name, settings } => {
+                self.set_environment_settings(&name, &settings)?;
+            }
+            Request::Delete { name } => {
+                self.not_running(&name)?;
+                self.lock().store.delete(&name)?;
+                self.broadcast(&Event::Changed);
+            }
+            _ => unreachable!("not a lifecycle request"),
+        }
+        Ok(())
+    }
+
+    fn handle(&self, request: Request, peer: Peer, out: &mut UnixStream) -> Result<()> {
+        match request {
+            Request::Hello => send(
+                out,
+                &Reply::Hello {
+                    version: gse_protocol::VERSION,
+                    build: env!("CARGO_PKG_VERSION").into(),
+                },
+            )?,
+            Request::Restart => {
+                self.stop_everything();
+                send(out, &Reply::Done)?;
+                info!("restarting at a client's request");
+                std::process::exit(0);
+            }
+            Request::List => send(
+                out,
+                &Reply::Environments {
+                    environments: self.list(),
+                },
+            )?,
+            Request::Images => send(
+                out,
+                &Reply::Images {
+                    images: self.lock().store.images(),
+                },
+            )?,
+            request @ (Request::Create { .. }
+            | Request::Reset { .. }
+            | Request::Rename { .. }
+            | Request::Delete { .. }
+            | Request::SetEnvironmentSettings { .. }) => self.handle_lifecycle(request)?,
+            request @ (Request::Processes { .. }
+            | Request::EndProcess { .. }
+            | Request::EndApp { .. }
+            | Request::Files { .. }
+            | Request::SendFiles { .. }
+            | Request::TakeFiles { .. }) => self.handle_guest(request, peer, out)?,
+            Request::Journal { name } => {
+                let entries = self.lock().store.journal(&name)?;
+                send(out, &Reply::Journal { entries })?;
+            }
+            Request::Start { name } => self.start_and_report(&name, peer, out)?,
+            Request::Stop => self.stop(peer)?,
+            Request::Internet { on } => {
+                let name = self
+                    .lock()
+                    .current
+                    .as_ref()
+                    .context("nothing is running")?
+                    .name
+                    .clone();
+                let mut settings = self
+                    .list()
+                    .into_iter()
+                    .find(|e| e.name == name)
+                    .map(|e| e.settings)
+                    .context("the running environment is gone")?;
+                settings.internet = on;
+                self.set_environment_settings(&name, &settings)?;
+            }
+            request @ (Request::Presets
+            | Request::SavePreset { .. }
+            | Request::DeletePreset { .. }
+            | Request::BuildPreset { .. }
+            | Request::StopBuild) => self.handle_preset(request, peer, out)?,
+            Request::Watch => {
+                let (tx, rx) = mpsc::channel();
+                self.lock().watchers.push(tx);
+                return watch(&rx, out);
+            }
+            Request::Settings => {
+                let root = self.lock().root.clone();
+                let gpus = gpu::describe(&root)?;
+                let settings = self.lock().config.settings();
+                send(out, &Reply::Settings { settings, gpus })?;
+            }
+            Request::SetSettings { settings } => self.set_defaults(&settings)?,
+        }
+        send(out, &Reply::Done)?;
+        Ok(())
+    }
+
+    /// Replaces the settings new environments start with.
+    fn set_defaults(&self, settings: &Settings) -> Result<()> {
+        let root = self.lock().root.clone();
+        let (address, mode) = validate(settings, &gpu::describe(&root)?)?;
+        let mut shared = self.lock();
+        let config = Config {
+            gpu: address,
+            screen_mode: mode.to_string(),
+            internet: settings.internet,
+            ..shared.config.clone()
+        };
+        if config != shared.config {
+            config.save(Path::new(CONFIG))?;
+            info!(
+                "settings of new environments: GPU {address}, screen {mode}, internet {}",
+                on_off(settings.internet)
+            );
+            shared.config = config;
+            drop(shared);
+            self.broadcast(&Event::SettingsChanged);
+        }
+        Ok(())
+    }
+}
+
+/// Opens the AppImages of `preset` for a build that `uid` asked for. The
+/// service reads them as root, so each must be a file that user could read
+/// anyway: their own, or readable by everyone. The open files go to the
+/// build, so a path changed afterwards cannot swap in another file.
+fn open_appimages(preset: &HostPreset, uid: u32) -> Result<Vec<(String, fs::File)>> {
+    preset
+        .seed_files()
+        .into_iter()
+        .map(|(seed, path)| {
+            let file =
+                open_as(&path, uid).with_context(|| format!("AppImage {}", path.display()))?;
+            Ok((seed, file))
+        })
+        .collect()
+}
+
+/// Tells the client on `out` that the Outbox file `path` stays inside.
+fn refuse(out: &mut UnixStream, path: &str, reason: String) -> std::io::Result<()> {
+    send(
+        out,
+        &Reply::Refused {
+            path: path.to_owned(),
+            reason,
+        },
+    )
+}
+
+/// Copies the Outbox through `agent` to the client on `out`, file by file,
+/// past the checks for outbound files; counts what passed and what not.
+fn take(agent: &mut Agent, out: &mut UnixStream) -> Result<(usize, usize)> {
+    let files = agent.files()?;
+    let (mut passed, mut refused, mut total) = (0, 0, 0_u64);
+    for file in &files.outbox {
+        if passed + refused >= checks::MAX_TAKE_FILES {
+            refused += 1;
+            refuse(
+                out,
+                &file.path,
+                format!("a take holds at most {} files", checks::MAX_TAKE_FILES),
+            )?;
+            continue;
+        }
+        if let Some(reason) = checks::by_name(&file.path) {
+            refused += 1;
+            refuse(out, &file.path, reason)?;
+            continue;
+        }
+        let room = checks::MAX_TAKE.saturating_sub(total);
+        let mut forward = checks::Forward::new(out, &file.path, file.size);
+        let outcome = agent
+            .get(&file.path, &mut forward, room)
+            .and_then(|size| Ok((size, forward.finish()?)));
+        let (started, verdict) = (forward.started(), forward.refused.take());
+        match (outcome, verdict) {
+            (Ok((size, ())), None) => {
+                passed += 1;
+                total += size;
+            }
+            (Ok(_), Some(reason)) => {
+                refused += 1;
+                refuse(out, &file.path, reason)?;
+            }
+            // The client drops a file refused after it began.
+            (Err(e), _) => {
+                refused += 1;
+                let reason = if started {
+                    format!("it broke off: {e:#}")
+                } else {
+                    format!("{e:#}")
+                };
+                refuse(out, &file.path, reason)?;
+            }
+        }
+    }
+    Ok((passed, refused))
+}
+
+/// The files `paths` name for the Inbox, opened for `uid`: a file under its
+/// own name, a folder with every regular file below it under the folder's
+/// name. Links and anything else are left out.
+fn host_files(paths: &[PathBuf], uid: u32) -> Result<Vec<(String, fs::File, u64)>> {
+    let mut found = Vec::new();
+    let mut pending: Vec<(PathBuf, String, usize)> = Vec::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .with_context(|| format!("{} has no plain name", path.display()))?;
+        pending.push((path.clone(), name.to_owned(), 0));
+    }
+    while let Some((path, inbox_path, depth)) = pending.pop() {
+        let metadata =
+            fs::symlink_metadata(&path).with_context(|| format!("{}", path.display()))?;
+        if metadata.is_dir() {
+            if depth >= 16 {
+                bail!("{} goes deeper than 16 folders", path.display());
+            }
+            for entry in fs::read_dir(&path)?.flatten() {
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                pending.push((entry.path(), format!("{inbox_path}/{name}"), depth + 1));
+            }
+        } else if metadata.is_file() {
+            let file = open_as(&path, uid)?;
+            let size = file.metadata()?.len();
+            found.push((inbox_path, file, size));
+            if found.len() > checks::MAX_TAKE_FILES {
+                bail!("at most {} files at once", checks::MAX_TAKE_FILES);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Opens `path` for the user `uid` asks it for. The service reads as root,
+/// so the file must be one that user could read anyway: their own, or
+/// readable by everyone. The open file is checked, so a path changed in
+/// between cannot swap in another.
+fn open_as(path: &Path, uid: u32) -> Result<fs::File> {
+    let shown = path.display();
+    let metadata = fs::metadata(path).with_context(|| format!("{shown}"))?;
+    if !metadata.is_file() {
+        bail!("{shown} is not a file");
+    }
+    let file = fs::File::open(path).with_context(|| format!("{shown}"))?;
+    let metadata = file.metadata()?;
+    let mode = metadata.mode();
+    let readable = uid == 0 || (metadata.uid() == uid && mode & 0o400 != 0) || mode & 0o004 != 0;
+    if !metadata.is_file() || !readable {
+        bail!("{shown} is not a file you can read");
+    }
+    Ok(file)
+}
+
+/// The journal line of an environment start reaching `stage`.
+const fn stage_entry(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Preparing => "Preparing",
+        Stage::SwitchingGpu => "Switching the GPU",
+        Stage::Booting => "Booting",
+        Stage::Ready => "The desktop is up",
+        Stage::Stopping => "Stopping: QEMU is killed and the GPU goes back to the host",
+    }
+}
+
+const fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
+fn watch(events: &Receiver<Event>, out: &mut UnixStream) -> Result<()> {
+    for event in events {
+        send(out, &Reply::Event { event })?;
+    }
+    Ok(())
+}
+
+/// The process on the other end of a connection.
+#[derive(Debug, Clone, Copy)]
+struct Peer {
+    pid: i32,
+    uid: u32,
+}
+
+fn peer(stream: &UnixStream) -> Result<Peer> {
+    let cred = rustix::net::sockopt::socket_peercred(stream).context("reading peer credentials")?;
+    Ok(Peer {
+        pid: cred.pid.as_raw_nonzero().get(),
+        uid: cred.uid.as_raw(),
+    })
+}
+
+/// Whether polkit lets `peer` use the service. The process is named with its
+/// start time so a recycled pid cannot stand in for it.
+fn authorized(peer: Peer) -> bool {
+    if peer.uid == 0 {
+        return true;
+    }
+    let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", peer.pid)) else {
+        return false;
+    };
+    // Field 22, counted after the parenthesised command name, which may hold
+    // spaces.
+    let Some(start_time) = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(19))
+    else {
+        return false;
+    };
+    Command::new("pkcheck")
+        .args(["--action-id", ACTION, "--process"])
+        .arg(format!("{},{start_time},{}", peer.pid, peer.uid))
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn serve_connection(service: &Service, mut stream: UnixStream) -> Result<()> {
+    let peer = peer(&stream)?;
+    if !authorized(peer) {
+        send(
+            &mut stream,
+            &Reply::Error {
+                message: "not authorized".into(),
+            },
+        )?;
+        bail!("uid {} pid {} is not authorized", peer.uid, peer.pid);
+    }
+    let mut reader = BufReader::new(stream.try_clone()?);
+    while let Some(request) = receive::<Request>(&mut reader)? {
+        info!("uid {}: {request:?}", peer.uid);
+        if let Err(e) = service.handle(request, peer, &mut stream) {
+            send(
+                &mut stream,
+                &Reply::Error {
+                    message: format!("{e:#}"),
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Serves clients until the process is killed.
+pub fn serve(root: Root) -> Result<()> {
+    let config = Config::load(Path::new(CONFIG))?;
+    vm::recover(&root);
+    let store = Store::new(DATA);
+    fs::create_dir_all(store.images_dir())?;
+    fs::create_dir_all(store.environments_dir())?;
+    fs::create_dir_all(store.builds_dir())?;
+    // A build the service did not live to finish leaves its partial image.
+    for leftover in fs::read_dir(store.builds_dir())?.flatten() {
+        fs::remove_file(leftover.path()).ok();
+    }
+    presets::seed(&store.presets_dir())?;
+    let socket = Path::new(SOCKET);
+    fs::create_dir_all(socket.parent().context("socket path")?)?;
+    fs::remove_file(socket).ok();
+    let listener =
+        UnixListener::bind(socket).with_context(|| format!("listening on {}", socket.display()))?;
+    // Anyone may connect; polkit decides who is served.
+    fs::set_permissions(socket, fs::Permissions::from_mode(0o666))?;
+    info!(
+        "serving {} for GPU {} ({} images, {} environments)",
+        socket.display(),
+        config.gpu,
+        store.images().len(),
+        store.environments().len()
+    );
+    let service = Service(Arc::new(Mutex::new(Shared {
+        root,
+        config,
+        store,
+        current: None,
+        build: None,
+        watchers: Vec::new(),
+        agent: Arc::default(),
+    })));
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("accepting: {e}");
+                continue;
+            }
+        };
+        let service = service.clone();
+        thread::spawn(move || {
+            if let Err(e) = serve_connection(&service, stream) {
+                warn!("connection: {e:#}");
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Makes sure nothing a client sends can be larger than the protocol allows
+/// before it reaches the parser.
+const _: () = assert!(MAX_LINE <= 1 << 20);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_needs_only_the_gpu() {
+        let config: Config = toml::from_str("gpu = \"0000:0e:00.0\"\n").unwrap();
+        assert_eq!(config.gpu.to_string(), "0000:0e:00.0");
+        assert_eq!(config.screen_mode, "2560x1440@60");
+        assert!(toml::from_str::<Config>("gpu = \"0000:0e:00.0\"\nmystery = 1\n").is_err());
+    }
+
+    #[test]
+    fn config_saves_what_it_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gse.toml");
+        let config = Config {
+            gpu: "0000:0e:00.0".parse().unwrap(),
+            screen_mode: "1920x1080@144".into(),
+            internet: false,
+            memory_mib: 4096,
+            cpus: 2,
+            dev_ssh_port: Some(2222),
+        };
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), config);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(config.save(&dir.path().join("missing/gse.toml")).is_err());
+    }
+
+    #[test]
+    fn settings_must_name_a_gpu_and_a_mode_that_fits() {
+        let gpus = [gse_protocol::Gpu {
+            address: "0000:0e:00.0".into(),
+            vendor_id: 0x10de,
+            device_id: 0x2484,
+            vendor: None,
+            device: None,
+            driver: Some("nouveau".into()),
+            monitor: false,
+            mode: gse_protocol::SwitchMode::Secondary,
+        }];
+        let settings = |gpu: &str, screen_mode: &str| Settings {
+            gpu: gpu.into(),
+            screen_mode: screen_mode.into(),
+            internet: true,
+        };
+        let (address, mode) = validate(&settings("0e:00.0", "3840x2160@120"), &gpus).unwrap();
+        assert_eq!(address.to_string(), "0000:0e:00.0");
+        assert_eq!(mode.to_string(), "3840x2160@120");
+        assert!(validate(&settings("0000:07:00.0", "1920x1080@60"), &gpus).is_err());
+        assert!(validate(&settings("nonsense", "1920x1080@60"), &gpus).is_err());
+        assert!(validate(&settings("0000:0e:00.0", "1920x1080@300"), &gpus).is_err());
+        assert!(validate(&settings("0000:0e:00.0", "7680x4320@60"), &gpus).is_err());
+    }
+
+    #[test]
+    fn store_lists_images_and_environments() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        fs::create_dir_all(store.images_dir()).unwrap();
+        fs::write(store.image("launchers"), b"").unwrap();
+        fs::write(store.images_dir().join("notes.txt"), b"").unwrap();
+        assert_eq!(store.images(), ["launchers"]);
+
+        fs::create_dir_all(store.dir("test")).unwrap();
+        fs::write(store.dir("test").join("image"), "launchers\n").unwrap();
+        assert_eq!(
+            store.environments(),
+            [("test".to_owned(), "launchers".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_new_image_resets_the_environments_created_from_it() {
+        if Command::new("qemu-img").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        fs::create_dir_all(store.images_dir()).unwrap();
+        fs::create_dir_all(store.builds_dir()).unwrap();
+        let qcow2 = |path: &Path| {
+            assert!(
+                Command::new("qemu-img")
+                    .args(["create", "-q", "-f", "qcow2"])
+                    .arg(path)
+                    .arg("1M")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        qcow2(&store.image("launchers"));
+        qcow2(&store.image("other"));
+        store.create("a", "launchers", &defaults()).unwrap();
+        store.create("b", "other", &defaults()).unwrap();
+        store.ensure_disk("a").unwrap();
+        store.ensure_disk("b").unwrap();
+        fs::write(store.dir("a").join("console.log"), "old").unwrap();
+        fs::write(store.dir("b").join("console.log"), "old").unwrap();
+
+        let built = store.builds_dir().join("launchers.qcow2");
+        qcow2(&built);
+        assert_eq!(store.replace_image("launchers", &built).unwrap(), ["a"]);
+        assert!(!built.exists());
+        assert!(!store.disk("a").exists());
+        assert!(!store.dir("a").join("console.log").exists());
+        assert!(store.disk("b").exists());
+        assert!(store.dir("b").join("console.log").exists());
+        store.ensure_disk("a").unwrap();
+        assert!(store.disk("a").exists());
+        assert!(store.replace_image("launchers", &built).is_err());
+    }
+
+    fn defaults() -> Settings {
+        Settings {
+            gpu: "0000:0e:00.0".into(),
+            screen_mode: "2560x1440@60".into(),
+            internet: true,
+        }
+    }
+
+    #[test]
+    fn an_environment_waits_for_its_preset_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        fs::create_dir_all(store.presets_dir()).unwrap();
+        fs::write(store.presets_dir().join("games.toml"), "name = \"games\"\n").unwrap();
+        store.create("later", "games", &defaults()).unwrap();
+        assert!(store.ensure_disk("later").is_err());
+        assert!(!store.disk("later").exists());
+        assert!(store.create("other", "missing", &defaults()).is_err());
+    }
+
+    #[test]
+    fn settings_belong_to_each_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        fs::create_dir_all(store.images_dir()).unwrap();
+        fs::write(store.image("launchers"), b"").unwrap();
+        store.create("a", "launchers", &defaults()).unwrap();
+        let own = Settings {
+            gpu: "0000:07:00.0".into(),
+            screen_mode: "1920x1080@144".into(),
+            internet: false,
+        };
+        store.set_settings("a", &own).unwrap();
+        assert_eq!(store.settings("a", &defaults()), own);
+        store.create("b", "launchers", &defaults()).unwrap();
+        assert!(store.rename("a", "b").is_err());
+        assert!(store.rename("a", "Bad").is_err());
+        store.rename("a", "c").unwrap();
+        assert_eq!(store.settings("c", &defaults()), own);
+        assert!(!store.dir("a").exists());
+
+        fs::create_dir_all(store.dir("old")).unwrap();
+        fs::write(store.dir("old").join("image"), "launchers\n").unwrap();
+        assert_eq!(store.settings("old", &defaults()), defaults());
+    }
+
+    #[test]
+    fn the_journal_keeps_its_latest_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        fs::create_dir_all(store.images_dir()).unwrap();
+        fs::write(store.image("launchers"), b"").unwrap();
+        store.create("a", "launchers", &defaults()).unwrap();
+        assert_eq!(store.journal("a").unwrap(), []);
+        let long = "x".repeat(400);
+        for i in 0..1200 {
+            store.log("a", &format!("{i} {long}")).unwrap();
+        }
+        assert!(
+            fs::metadata(store.dir("a").join("journal")).unwrap().len() <= JOURNAL_MAX as u64 + 512
+        );
+        let entries = store.journal("a").unwrap();
+        assert_eq!(entries.len(), JOURNAL_SHOWN);
+        assert!(entries.last().unwrap().text.starts_with("1199 "));
+        assert!(store.journal("missing").is_err());
+    }
+
+    #[test]
+    fn appimages_must_be_readable_by_whoever_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("app.appimage");
+        fs::write(&file, b"ELF").unwrap();
+        let preset = HostPreset::parse(&format!(
+            "name = \"x\"\n[[app]]\nname = \"App\"\nappimage = \"{}\"\n",
+            file.display()
+        ))
+        .unwrap();
+        let me = fs::metadata(&file).unwrap().uid();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(open_appimages(&preset, me).unwrap().len(), 1);
+        assert!(open_appimages(&preset, me + 1).is_err());
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(open_appimages(&preset, me + 1).is_ok());
+
+        let missing = HostPreset::parse(
+            "name = \"x\"\n[[app]]\nname = \"App\"\nappimage = \"/nonexistent/a.appimage\"\n",
+        )
+        .unwrap();
+        assert!(open_appimages(&missing, 0).is_err());
+        let directory = HostPreset::parse(&format!(
+            "name = \"x\"\n[[app]]\nname = \"App\"\nappimage = \"{}\"\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        assert!(open_appimages(&directory, 0).is_err());
+    }
+
+    #[test]
+    fn store_refuses_bad_names_and_missing_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        assert!(store.create("../x", "launchers", &defaults()).is_err());
+        assert!(store.create("test", "missing", &defaults()).is_err());
+        assert!(store.rename("test", "other").is_err());
+        assert!(store.delete("test").is_err());
+    }
+}

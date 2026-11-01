@@ -1,15 +1,22 @@
 //! gse's root service.
 //!
-//! The commands here are the service's operations, callable directly while
-//! the service grows its socket interface.
+//! `daemon` serves the app over a socket; the other commands are the same
+//! operations run directly from a terminal, for development and repair.
 
+mod agent;
+mod checks;
+mod daemon;
 mod gpu;
 mod image;
 mod net;
+mod presets;
+mod setup;
 mod vm;
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -32,6 +39,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serve clients on the service socket.
+    Daemon,
+    /// Remove everything gse put on this machine: the service, its settings,
+    /// images and environments, the network rules and account.
+    Uninstall,
     /// GPUs and their hand-over to environments.
     Gpu {
         #[command(subcommand)]
@@ -118,6 +130,15 @@ fn main() {
 fn run(cli: &Cli) -> Result<()> {
     let root = Root::system();
     match &cli.command {
+        Command::Daemon => {
+            require_root(false)?;
+            daemon::serve(root)
+        }
+        Command::Uninstall => {
+            require_root(cli.dry_run)?;
+            setup::uninstall(cli.dry_run);
+            Ok(())
+        }
         Command::Gpu { action } => match action {
             GpuAction::List => gpu::list(&root),
             GpuAction::Holders { gpu } => gpu::holders(&root, *gpu),
@@ -133,17 +154,17 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Vm { action } => match action {
             VmAction::Run(args) => {
                 require_root(cli.dry_run)?;
-                vm::run(&root, args, cli.dry_run)
+                vm::run(&root, args, &*stop_on_ctrl_c()?, cli.dry_run)
             }
         },
         Command::Image { action } => match action {
             ImageAction::BuildBase(args) => {
                 require_root(cli.dry_run)?;
-                image::build_base(args, cli.dry_run)
+                image::build_base(args, &*stop_on_ctrl_c()?, cli.dry_run)
             }
             ImageAction::BuildPreset(args) => {
                 require_root(cli.dry_run)?;
-                image::build_preset(args, cli.dry_run)
+                image::build_preset(args, &*stop_on_ctrl_c()?, cli.dry_run)
             }
         },
         Command::Net { action } => match action {
@@ -158,6 +179,15 @@ fn run(cli: &Cli) -> Result<()> {
             NetAction::Rules => net::print_rules(),
         },
     }
+}
+
+/// A flag Ctrl+C sets, for commands that run a VM until it is stopped.
+fn stop_on_ctrl_c() -> Result<Arc<AtomicBool>> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let requested = Arc::clone(&stop);
+    ctrlc::set_handler(move || requested.store(true, Ordering::SeqCst))
+        .context("installing the signal handler")?;
+    Ok(stop)
 }
 
 fn state_path(name: &str) -> PathBuf {

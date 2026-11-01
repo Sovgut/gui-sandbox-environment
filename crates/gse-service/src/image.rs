@@ -8,11 +8,12 @@
 //! compressed qcow2 that no longer depends on the image it was built from.
 
 use std::fs;
-use std::io::{BufRead as _, BufReader, Seek as _, SeekFrom};
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,11 +26,36 @@ use tracing::info;
 use crate::{state_path, vm};
 
 const VERDICT: &str = "GSE-BUILD: ";
+/// The step reported once the guest passed, while its disk is flattened
+/// into the image.
+const FLATTEN: &str = "flatten";
 /// The guest-side program, installed by the provisioning script from the seed.
 const GUEST_BIN: &str = "gse-guest";
 /// Room for the driver build and the desktop; the environment's own overlay grows on
 /// top of this.
 const BUILD_DISK: &str = "40G";
+
+/// How a build runs and where it reports.
+pub struct Job<'a> {
+    /// Set to stop the build; the image is not written then.
+    pub stop: &'a AtomicBool,
+    /// The account the build VM's QEMU drops to.
+    pub run_as: Option<String>,
+    /// Receives each provisioning step (an `=== <step>` line of the guest)
+    /// as it reaches the console.
+    pub steps: Option<Sender<String>>,
+}
+
+impl<'a> Job<'a> {
+    /// A build from the terminal, run for the user who ran sudo or pkexec.
+    fn invoked(stop: &'a AtomicBool) -> Self {
+        Self {
+            stop,
+            run_as: vm::Owner::invoking().map(|o| o.name),
+            steps: None,
+        }
+    }
+}
 
 #[derive(clap::Args)]
 pub struct BuildBaseArgs {
@@ -59,7 +85,7 @@ pub struct BuildPresetArgs {
     out: PathBuf,
 }
 
-pub fn build_base(args: &BuildBaseArgs, dry_run: bool) -> Result<()> {
+pub fn build_base(args: &BuildBaseArgs, stop: &AtomicBool, dry_run: bool) -> Result<()> {
     let key = args
         .dev_ssh_key
         .as_ref()
@@ -77,19 +103,47 @@ pub fn build_base(args: &BuildBaseArgs, dry_run: bool) -> Result<()> {
         &args.out,
         &user_data,
         &[(GUEST_BIN.to_owned(), guest)],
+        &Job::invoked(stop),
         dry_run,
     )
 }
 
 /// Installs a preset on the base image. The preset's AppImages travel on the
 /// seed volume.
-pub fn build_preset(args: &BuildPresetArgs, dry_run: bool) -> Result<()> {
+pub fn build_preset(args: &BuildPresetArgs, stop: &AtomicBool, dry_run: bool) -> Result<()> {
     let text = fs::read_to_string(&args.preset)
         .with_context(|| format!("preset {}", args.preset.display()))?;
     let preset = Preset::parse(&text)?;
-    let mut files = Vec::new();
+    let mut appimages = Vec::new();
     for (name, path) in preset.seed_files() {
-        let data = fs::read(&path).with_context(|| format!("AppImage {}", path.display()))?;
+        let file = fs::File::open(&path).with_context(|| format!("AppImage {}", path.display()))?;
+        appimages.push((name, file));
+    }
+    build_preset_image(
+        &preset,
+        appimages,
+        &args.base,
+        &args.out,
+        &Job::invoked(stop),
+        dry_run,
+    )
+}
+
+/// Installs `preset` on the image `base` into `out`. `appimages` are the
+/// preset's AppImages, opened, under their seed file names.
+pub fn build_preset_image(
+    preset: &Preset,
+    appimages: Vec<(String, fs::File)>,
+    base: &Path,
+    out: &Path,
+    job: &Job<'_>,
+    dry_run: bool,
+) -> Result<()> {
+    let mut files = Vec::new();
+    for (name, mut file) in appimages {
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)
+            .with_context(|| format!("reading the AppImage for {name}"))?;
         files.push((name, data));
     }
     info!(
@@ -99,7 +153,7 @@ pub fn build_preset(args: &BuildPresetArgs, dry_run: bool) -> Result<()> {
     );
     // No accounts: the base image already has every account it needs.
     let user_data = seed::cloud_config(&preset.script()?, None);
-    build(&args.base, &args.out, &user_data, &files, dry_run)
+    build(base, out, &user_data, &files, job, dry_run)
 }
 
 /// Builds `out` from `from` by booting it once with a seed carrying
@@ -109,6 +163,7 @@ fn build(
     out: &Path,
     user_data: &str,
     files: &[(String, Vec<u8>)],
+    job: &Job<'_>,
     dry_run: bool,
 ) -> Result<()> {
     let from = fs::canonicalize(from).with_context(|| format!("base image {}", from.display()))?;
@@ -136,9 +191,10 @@ fn build(
         vnc_display: None,
         screen: None,
         input_socket: None,
+        agent_socket: None,
         monitor_socket: state_path("build.monitor"),
         serial_log: console.clone(),
-        run_as: vm::invoking_user(),
+        run_as: job.run_as.clone(),
         image_build: true,
     };
     if dry_run {
@@ -180,11 +236,21 @@ fn build(
     );
 
     let done = Arc::new(AtomicBool::new(false));
-    let follower = follow_console(console.clone(), Arc::clone(&done));
-    let outcome = vm::run_networked("build", true, None, spec_for);
+    let follower = follow_console(console.clone(), Arc::clone(&done), job.steps.clone());
+    let mut watch = vm::Watch {
+        owner: None,
+        progress: &mut |_| {},
+    };
+    let outcome = vm::run_networked("build", true, None, job.stop, &mut watch, spec_for);
     done.store(true, Ordering::SeqCst);
     follower.join().ok();
     outcome?;
+    if job.stop.load(Ordering::SeqCst) {
+        bail!(
+            "the build was stopped; its files are kept in {}",
+            work.display()
+        );
+    }
 
     let verdict = last_verdict(&console)?;
     if verdict != "OK" {
@@ -232,8 +298,13 @@ fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Logs the provisioning steps and the verdict as they reach the console.
-fn follow_console(console: PathBuf, done: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+/// Logs the provisioning steps and the verdict as they reach the console,
+/// and hands each step's name to `steps`.
+fn follow_console(
+    console: PathBuf,
+    done: Arc<AtomicBool>,
+    steps: Option<Sender<String>>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut position = 0;
         while !done.load(Ordering::SeqCst) {
@@ -251,12 +322,26 @@ fn follow_console(console: PathBuf, done: Arc<AtomicBool>) -> thread::JoinHandle
                     if text.starts_with("=== ") || text.starts_with(VERDICT) {
                         info!("guest: {text}");
                     }
+                    if let Some(steps) = &steps {
+                        if let Some(step) = step_name(text) {
+                            steps.send(step.to_owned()).ok();
+                        } else if text.ends_with(&format!("{VERDICT}OK")) {
+                            steps.send(FLATTEN.to_owned()).ok();
+                        }
+                    }
                     line.clear();
                 }
             }
             thread::sleep(Duration::from_secs(1));
         }
     })
+}
+
+/// The step an `=== <step>` console line names. The console also carries
+/// the guest's own output, so a step name is kept short and printable.
+fn step_name(line: &str) -> Option<&str> {
+    let step = line.strip_prefix("=== ")?.trim();
+    (!step.is_empty() && step.len() <= 80 && !step.chars().any(char::is_control)).then_some(step)
 }
 
 fn last_verdict(console: &Path) -> Result<String> {
@@ -278,5 +363,32 @@ fn give_to_invoking_user(path: &Path) {
         .and_then(|uid| uid.parse().ok());
     if let Some(uid) = owner {
         std::os::unix::fs::chown(path, Some(uid), Some(uid)).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steps_come_from_marked_console_lines() {
+        assert_eq!(step_name("=== packages"), Some("packages"));
+        assert_eq!(step_name("=== nvidia driver "), Some("nvidia driver"));
+        assert_eq!(step_name("==="), None);
+        assert_eq!(step_name("=== "), None);
+        assert_eq!(step_name("[  OK  ] Started cloud-init"), None);
+        assert_eq!(step_name(&format!("=== {}", "x".repeat(81))), None);
+    }
+
+    #[test]
+    fn the_last_verdict_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("console.log");
+        fs::write(&log, "=== packages\nGSE-BUILD: FAILED 12\nnoise\n").unwrap();
+        assert_eq!(last_verdict(&log).unwrap(), "FAILED 12");
+        fs::write(&log, "=== cleanup\n\x1b[0mGSE-BUILD: OK\n").unwrap();
+        assert_eq!(last_verdict(&log).unwrap(), "OK");
+        fs::write(&log, "=== packages\n").unwrap();
+        assert!(last_verdict(&log).is_err());
     }
 }

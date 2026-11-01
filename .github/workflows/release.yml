@@ -1,0 +1,74 @@
+# Publishes a release when a tag `v<version>` is pushed: builds the AppImage,
+# signs it with the release key and attaches both to a GitHub release, where
+# the app looks for updates (crates/gse-app/src/update.rs).
+#
+# The signing key is the secret GSE_SIGNING_KEY: an ed25519 private key in
+# PEM. The app holds its public half and installs no update that this key
+# did not sign.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  appimage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tag names the workspace version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "the tag $GITHUB_REF_NAME does not match the version $version in Cargo.toml"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Libraries the app builds against
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libfontconfig-dev libfreetype-dev libwayland-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
+            libvulkan-dev libzstd-dev
+
+      - name: appimagetool
+        run: |
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.0/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+
+      - name: Build the AppImage
+        env:
+          # The runner has no FUSE; appimagetool unpacks itself instead.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          APPIMAGETOOL: ${{ github.workspace }}/appimagetool
+        run: scripts/release/build-appimage.sh
+
+      - name: Sign it
+        env:
+          GSE_SIGNING_KEY: ${{ secrets.GSE_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$GSE_SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          image=target/appimage/gse-x86_64.AppImage
+          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/key.pem" -rawin -in "$image" -out "$image.sig"
+          openssl pkey -in "$RUNNER_TEMP/key.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/public.pem" -rawin \
+            -in "$image" -sigfile "$image.sig"
+          rm "$RUNNER_TEMP/key.pem"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            target/appimage/gse-x86_64.AppImage \
+            target/appimage/gse-x86_64.AppImage.sig \
+            --title "gse $GITHUB_REF_NAME" --generate-notes

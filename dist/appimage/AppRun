@@ -1,0 +1,4 @@
+#!/bin/sh
+# Starts the app from wherever the AppImage is mounted.
+here=$(dirname "$(readlink -f "$0")")
+exec "$here/usr/bin/gse" "$@"

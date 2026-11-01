@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=GUI Sandbox Environment
+Comment=Untrusted apps in a VM with the whole GPU
+Exec=gse
+Icon=gse
+Categories=System;Emulator;
+StartupWMClass=io.github.sovgut.gse

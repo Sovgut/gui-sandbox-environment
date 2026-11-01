@@ -96,6 +96,7 @@ pub fn build_base(args: &BuildBaseArgs, dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
+    let _lock = vm::lock()?;
     if work.exists() {
         fs::remove_dir_all(&work)?;
     }

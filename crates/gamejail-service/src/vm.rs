@@ -24,6 +24,23 @@ use crate::{STATE_DIR, gpu, net, state_path};
 /// is killed.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(60);
 
+/// Held for as long as a VM runs. Every VM, a jail or an image build, shares
+/// the one jail network ruleset and the host's memory, so a second one is
+/// refused rather than started beside it.
+pub struct RunLock(#[allow(dead_code)] fs::File);
+
+/// Takes the run lock, or fails if another VM is running.
+pub fn lock() -> Result<RunLock> {
+    fs::create_dir_all(STATE_DIR)?;
+    let path = state_path("vm.lock");
+    let file = fs::File::create(&path).with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(RunLock(file)),
+        Err(fs::TryLockError::WouldBlock) => bail!("another jail or image build is running"),
+        Err(fs::TryLockError::Error(e)) => Err(e).context("locking"),
+    }
+}
+
 #[derive(clap::Args)]
 pub struct RunArgs {
     /// The GPU to hand to the VM.
@@ -68,6 +85,7 @@ pub fn run(root: &Root, args: &RunArgs, dry_run: bool) -> Result<()> {
         .iter()
         .map(|p| fs::canonicalize(p).with_context(|| format!("disk {}", p.display())))
         .collect::<Result<Vec<_>>>()?;
+    let _lock = if dry_run { None } else { Some(lock()?) };
     let attached = gpu::attach(root, args.gpu, dry_run)?;
     let spec_for = |socket: PathBuf| VmSpec {
         name: name.clone(),
@@ -100,7 +118,8 @@ pub fn run(root: &Root, args: &RunArgs, dry_run: bool) -> Result<()> {
 }
 
 /// Brings up the jail network, runs the VM `spec_for` describes once passt's
-/// socket exists, and takes the network down again.
+/// socket exists, and takes the network down again. The caller holds the
+/// [`lock`].
 pub fn run_networked(
     name: &str,
     internet: bool,

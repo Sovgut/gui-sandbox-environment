@@ -18,7 +18,7 @@ jobs:
   appimage:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: The tag names the workspace version
         run: |
@@ -30,13 +30,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Libraries the app builds against
+      - name: Libraries the app builds against, and what appimagetool runs
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config clang libfontconfig-dev libfreetype-dev libwayland-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
-            libvulkan-dev libzstd-dev
+            libvulkan-dev libzstd-dev desktop-file-utils
 
       - name: appimagetool
         run: |

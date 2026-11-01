@@ -187,9 +187,12 @@ if [ "${GAMEJAIL_DEV:-0}" != 1 ]; then
     rm -f /etc/sudoers.d/90-cloud-init-users
 fi
 dnf clean all
-# The image boots without a seed from now on; cloud-init would only wait for
-# one.
-touch /etc/cloud/cloud-init.disabled
+# cloud-init only looks for a NoCloud seed volume. A jail boots without one,
+# and cloud-init then turns itself off for that boot without waiting; a preset
+# build attaches one, and cloud-init runs the preset's script.
+cat > /etc/cloud/cloud.cfg.d/90-gamejail.cfg <<'EOF'
+datasource_list: [ NoCloud ]
+EOF
 truncate -s 0 /etc/machine-id
 
 trap - ERR

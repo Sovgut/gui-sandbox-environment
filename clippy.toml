@@ -1,1 +1,1 @@
-doc-valid-idents = ["SELinux", "KWin", "NoCloud", ".."]
+doc-valid-idents = ["SELinux", "KWin", "NoCloud", "AppImage", "AppImages", "Flatpak", "Flathub", ".."]

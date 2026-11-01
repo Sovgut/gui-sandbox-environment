@@ -1,10 +1,11 @@
 //! Building jail images.
 //!
-//! An image is built inside a VM without a GPU, from a Fedora Cloud image and a
+//! An image is built inside a VM without a GPU, from an existing image (the
+//! Fedora Cloud image for the base, the base image for a preset) and a
 //! cloud-init seed carrying the provisioning script. The build VM uses the jail
 //! network, so it reaches package mirrors and nothing local. Its verdict comes
 //! back on the serial console; a passing build is flattened into one
-//! compressed qcow2 that no longer depends on the cloud image.
+//! compressed qcow2 that no longer depends on the image it was built from.
 
 use std::fs;
 use std::io::{BufRead as _, BufReader, Seek as _, SeekFrom};
@@ -16,6 +17,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use gamejail_host::preset::Preset;
 use gamejail_host::seed;
 use gamejail_host::vm::{Network, VmSpec};
 use tracing::info;
@@ -45,17 +47,19 @@ pub struct BuildBaseArgs {
     guest_bin: Option<PathBuf>,
 }
 
+#[derive(clap::Args)]
+pub struct BuildPresetArgs {
+    /// The base image to build on.
+    #[arg(long)]
+    base: PathBuf,
+    /// The preset file (TOML).
+    #[arg(long)]
+    preset: PathBuf,
+    /// Where to write the preset image.
+    out: PathBuf,
+}
+
 pub fn build_base(args: &BuildBaseArgs, dry_run: bool) -> Result<()> {
-    let from = fs::canonicalize(&args.from)
-        .with_context(|| format!("base image {}", args.from.display()))?;
-    let out = absolute(&args.out)?;
-    if out.exists() {
-        bail!("{} already exists", out.display());
-    }
-    let stem = out
-        .file_stem()
-        .map_or_else(|| "image".into(), |s| s.to_string_lossy().into_owned());
-    let work = out.with_file_name(format!(".build-{stem}"));
     let key = args
         .dev_ssh_key
         .as_ref()
@@ -67,6 +71,55 @@ pub fn build_base(args: &BuildBaseArgs, dry_run: bool) -> Result<()> {
     };
     let guest =
         fs::read(&guest_bin).with_context(|| format!("guest binary {}", guest_bin.display()))?;
+    let user_data = seed::cloud_config(seed::BASE_PROVISION, key.as_deref());
+    build(
+        &args.from,
+        &args.out,
+        &user_data,
+        &[(GUEST_BIN.to_owned(), guest)],
+        dry_run,
+    )
+}
+
+/// Installs a preset on the base image. The preset's AppImages travel on the
+/// seed volume.
+pub fn build_preset(args: &BuildPresetArgs, dry_run: bool) -> Result<()> {
+    let text = fs::read_to_string(&args.preset)
+        .with_context(|| format!("preset {}", args.preset.display()))?;
+    let preset = Preset::parse(&text)?;
+    let mut files = Vec::new();
+    for (name, path) in preset.seed_files() {
+        let data = fs::read(&path).with_context(|| format!("AppImage {}", path.display()))?;
+        files.push((name, data));
+    }
+    info!(
+        "preset '{}': {} applications",
+        preset.name,
+        preset.apps.len()
+    );
+    // No accounts: the base image already has every account it needs.
+    let user_data = seed::cloud_config(&preset.script()?, None);
+    build(&args.base, &args.out, &user_data, &files, dry_run)
+}
+
+/// Builds `out` from `from` by booting it once with a seed carrying
+/// `user_data` and `files`, then flattening the result.
+fn build(
+    from: &Path,
+    out: &Path,
+    user_data: &str,
+    files: &[(String, Vec<u8>)],
+    dry_run: bool,
+) -> Result<()> {
+    let from = fs::canonicalize(from).with_context(|| format!("base image {}", from.display()))?;
+    let out = absolute(out)?;
+    if out.exists() {
+        bail!("{} already exists", out.display());
+    }
+    let stem = out
+        .file_stem()
+        .map_or_else(|| "image".into(), |s| s.to_string_lossy().into_owned());
+    let work = out.with_file_name(format!(".build-{stem}"));
 
     let overlay = work.join("disk.qcow2");
     let seed_img = work.join("seed.img");
@@ -107,12 +160,15 @@ pub fn build_base(args: &BuildBaseArgs, dry_run: bool) -> Result<()> {
         &[&from, &overlay],
         &[BUILD_DISK],
     )?;
-    let user_data = seed::cloud_config(seed::BASE_PROVISION, key.as_deref());
+    let seed_files: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, data)| (name.as_str(), data.as_slice()))
+        .collect();
     seed::write_nocloud(
         &seed_img,
         &format!("gamejail-{stem}-{}", now()),
-        &user_data,
-        &[(GUEST_BIN, &guest)],
+        user_data,
+        &seed_files,
     )?;
     info!(
         "building {}; guest console: {}",

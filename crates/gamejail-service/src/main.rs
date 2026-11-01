@@ -59,6 +59,8 @@ enum ImageAction {
     /// Build the base image every jail shares: NVIDIA driver, desktop and the
     /// `friend` and `jail` accounts, in a VM without a GPU.
     BuildBase(image::BuildBaseArgs),
+    /// Build a preset image: the base image with a preset's applications.
+    BuildPreset(image::BuildPresetArgs),
 }
 
 #[derive(Subcommand)]
@@ -138,6 +140,10 @@ fn run(cli: &Cli) -> Result<()> {
             ImageAction::BuildBase(args) => {
                 require_root(cli.dry_run)?;
                 image::build_base(args, cli.dry_run)
+            }
+            ImageAction::BuildPreset(args) => {
+                require_root(cli.dry_run)?;
+                image::build_preset(args, cli.dry_run)
             }
         },
         Command::Net { action } => match action {

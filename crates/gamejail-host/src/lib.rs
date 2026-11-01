@@ -11,6 +11,7 @@ pub mod holders;
 pub mod net;
 pub mod pci;
 pub mod plan;
+pub mod preset;
 pub mod root;
 pub mod seed;
 pub mod session;

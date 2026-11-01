@@ -204,12 +204,26 @@ voice activation does.
 
 ## Presets and reset
 
-- A preset is a declarative list of what a jail contains: Fedora/RPM Fusion
-  packages, Flathub apps, local files (AppImages), trusted apps for `friend`,
-  and VM resources.
-- Each preset is built into a read-only golden image in a temporary VM without
-  a GPU, before any untrusted code runs. Building does not require switching
-  away from the host desktop.
+- A preset is a TOML file listing applications (`presets/games.toml`,
+  format in `crates/gamejail-host/src/preset.rs`). Each comes from exactly one
+  source: Fedora/RPM Fusion packages (`dnf`, with a `command`), a Flathub ID
+  (`flatpak`) or a local AppImage (`appimage`). Applications run as `jail`
+  unless marked `trusted`, which makes them run as `friend`.
+- Each preset is built into a read-only golden image on top of the base image
+  in a temporary VM without a GPU, before any untrusted code runs
+  (`gamejail-service image build-preset`). The base image keeps cloud-init
+  with only the NoCloud datasource: a jail boots without a seed volume and
+  cloud-init stays idle, a preset build attaches one carrying the generated
+  script and the AppImages. Building does not require switching away from the
+  host desktop.
+- The generated script installs the packages and Flatpaks, the Flatpak NVIDIA
+  GL extension matching the image's driver package (Flatpak would otherwise
+  pick it by the loaded module, which the build VM lacks), and extracts each
+  AppImage into `/opt/gamejail/apps/<name>` so the guest needs no FUSE. It
+  then writes a menu entry for every application into `friend`'s
+  `~/.local/share/applications`, overriding the package's own entry: jail
+  applications start through `gamejail-guest run` and carry "(jail)" in their
+  name, so clicking one never starts it as `friend`.
 - A jail is a qcow2 overlay on its preset's golden image. **Reset deletes the
   overlay**: everything, including Discord login and downloaded games, is gone,
   and the preset's software is there again in seconds.
@@ -224,8 +238,7 @@ Shipped as a linuxdeploy type-2 AppImage (Tauri, WebKitGTK 4.1, EOS SDK, own
 libraries). Data lives in `~/.local/share/com.epicgames.eglv2` and
 `~/.cache/com.epicgames.eglv2`. For Windows builds it downloads a pinned
 GE-Proton from GitHub and checks its SHA-512; `EGL_PROTON_PIN` overrides the
-version. A preset installs it as a local-file entry, extracted at image build
-time so the guest needs no FUSE, for user `jail`.
+version. A preset installs it as an `appimage` entry.
 
 ## File bridge
 

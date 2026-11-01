@@ -1,0 +1,36 @@
+# Game launchers and the tools around them. Everything runs as `jail` except
+# Discord, which runs as `friend` so it stays out of reach of the games.
+name = "games"
+
+[[app]]
+name = "Steam"
+dnf = ["steam"]
+desktop = "steam.desktop"
+command = ["steam"]
+
+[[app]]
+name = "Lutris"
+dnf = ["lutris"]
+desktop = "net.lutris.Lutris.desktop"
+command = ["lutris"]
+
+[[app]]
+name = "Heroic"
+flatpak = "com.heroicgameslauncher.hgl"
+
+[[app]]
+name = "ProtonPlus"
+flatpak = "com.vysp3r.ProtonPlus"
+
+[[app]]
+name = "Faugus Launcher"
+flatpak = "io.github.Faugus.faugus-launcher"
+
+[[app]]
+name = "Epic Games Launcher"
+appimage = "/home/sovhut/AppImages/epic_games_launcher.appimage"
+
+[[app]]
+name = "Discord"
+flatpak = "com.discordapp.Discord"
+trusted = true

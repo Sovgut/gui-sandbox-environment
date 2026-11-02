@@ -63,6 +63,20 @@ pub fn describe(root: &Root) -> Result<Vec<gse_protocol::Gpu>> {
         .collect())
 }
 
+/// The GPU a new machine's settings name: an NVIDIA or AMD card that
+/// drives no monitor if there is one, else one that does (the single-GPU
+/// case), else the first GPU.
+pub fn default_gpu(root: &Root) -> Option<String> {
+    let gpus = Gpu::discover(root).ok()?;
+    let discrete = |gpu: &&Gpu| matches!(gpu.display().vendor, 0x10de | 0x1002);
+    gpus.iter()
+        .filter(discrete)
+        .find(|gpu| !gpu.drives_display())
+        .or_else(|| gpus.iter().find(discrete))
+        .or_else(|| gpus.first())
+        .map(|gpu| gpu.display().address.to_string())
+}
+
 pub fn list(root: &Root) -> Result<()> {
     for gpu in Gpu::discover(root)? {
         let display = gpu.display();

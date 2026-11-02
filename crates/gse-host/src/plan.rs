@@ -124,7 +124,19 @@ pub enum Step {
         user: String,
         unit: String,
     },
+    /// Ends a graphical session. Like [`Step::StopUserUnit`] it may find
+    /// the session gone already, once the display manager stopped; the
+    /// executor only warns then, and [`Step::ReleaseGpu`] decides.
     TerminateSession(String),
+    /// Detaches the text consoles from the framebuffer of the host driver,
+    /// which otherwise keeps `nvidia_drm` (with `fbdev`) in use.
+    UnbindConsoles,
+    /// Attaches the framebuffer consoles again.
+    BindConsoles,
+    /// Waits for every graphical session to end, so a display manager
+    /// started again does not log in beside a session still letting go of
+    /// the GPU.
+    AwaitSessionsEnd(Duration),
     /// Waits for user processes to let go of the GPU, and fails if any still
     /// hold it at the end: unbinding the driver from a GPU with live buffers
     /// corrupts kernel memory. Leftovers are signalled when
@@ -163,6 +175,13 @@ impl fmt::Display for Step {
             Self::StartUnit(u) => write!(f, "start {u}"),
             Self::StopUserUnit { user, unit } => write!(f, "stop {unit} of {user}"),
             Self::TerminateSession(s) => write!(f, "terminate session {s}"),
+            Self::UnbindConsoles => f.write_str("unbind the framebuffer consoles"),
+            Self::BindConsoles => f.write_str("bind the framebuffer consoles"),
+            Self::AwaitSessionsEnd(wait) => write!(
+                f,
+                "wait up to {}s for the graphical sessions to end",
+                wait.as_secs()
+            ),
             Self::ReleaseGpu {
                 wait,
                 signal_leftovers,
@@ -259,6 +278,7 @@ pub fn attach(snapshot: &Snapshot) -> (Plan, Handoff) {
                 signal_leftovers: true,
                 allow_idle_compositor: false,
             });
+            steps.push(Step::UnbindConsoles);
             let unload = unload_modules(host_driver);
             if !unload.is_empty() {
                 steps.push(Step::UnloadModules(unload));
@@ -343,8 +363,12 @@ pub fn detach(handoff: &Handoff) -> Plan {
             });
         }
     }
+    if handoff.mode == Mode::Single {
+        steps.push(Step::BindConsoles);
+    }
     steps.extend(handoff.gpu_services.iter().cloned().map(Step::StartUnit));
     if handoff.display_manager_was_active {
+        steps.push(Step::AwaitSessionsEnd(Duration::from_secs(15)));
         steps.push(Step::StartUnit(DISPLAY_MANAGER.into()));
     }
     let gpu = handoff.drivers.first().map_or(
@@ -476,6 +500,10 @@ mod tests {
         );
         assert!(position("terminate session 2") < position("stop nvidia-powerd.service"));
         assert!(
+            position("unbind the framebuffer consoles")
+                < position("unload nvidia_drm nvidia_modeset nvidia_uvm nvidia")
+        );
+        assert!(
             position("unload nvidia_drm nvidia_modeset nvidia_uvm nvidia")
                 < position("load vfio-pci")
         );
@@ -491,8 +519,16 @@ mod tests {
         assert!(steps.contains(&"load nvidia nvidia_modeset nvidia_drm nvidia_uvm".to_owned()));
         assert!(steps.contains(&"0000:09:00.0: expect nvidia".to_owned()));
         assert!(steps.contains(&"0000:09:00.1: expect snd_hda_intel".to_owned()));
-        assert_eq!(steps[steps.len() - 2], "start nvidia-powerd.service");
-        assert_eq!(steps[steps.len() - 1], "start display-manager.service");
+        let tail: Vec<&str> = steps[steps.len() - 4..].iter().map(String::as_str).collect();
+        assert_eq!(
+            tail,
+            [
+                "bind the framebuffer consoles",
+                "start nvidia-powerd.service",
+                "wait up to 15s for the graphical sessions to end",
+                "start display-manager.service",
+            ]
+        );
     }
 
     #[test]

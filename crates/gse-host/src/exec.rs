@@ -93,16 +93,39 @@ impl Executor<'_> {
         match step {
             Step::StopUnit(unit) => self.system.run("systemctl", &["stop", unit]).map(drop),
             Step::StartUnit(unit) => self.system.run("systemctl", &["start", unit]).map(drop),
+            // Once the display manager stopped, the session and its user
+            // manager may be ending already and refuse; that is no failure.
             Step::StopUserUnit { user, unit } => {
                 let machine = format!("--machine={user}@");
-                self.system
+                if let Err(e) = self
+                    .system
                     .run("systemctl", &["--user", &machine, "stop", unit])
-                    .map(drop)
+                {
+                    warn!("{e}");
+                }
+                Ok(())
             }
-            Step::TerminateSession(id) => self
-                .system
-                .run("loginctl", &["terminate-session", id])
-                .map(drop),
+            Step::TerminateSession(id) => {
+                if let Err(e) = self.system.run("loginctl", &["terminate-session", id]) {
+                    warn!("{e}");
+                }
+                Ok(())
+            }
+            Step::UnbindConsoles => {
+                self.bind_consoles(false);
+                Ok(())
+            }
+            Step::BindConsoles => {
+                self.bind_consoles(true);
+                Ok(())
+            }
+            Step::AwaitSessionsEnd(wait) => {
+                let left = wait_until_empty(*wait, || self.graphical_sessions());
+                if !left.is_empty() {
+                    warn!("graphical sessions still open: {}", left.join(" "));
+                }
+                Ok(())
+            }
             Step::ReleaseGpu {
                 wait,
                 signal_leftovers,
@@ -227,6 +250,41 @@ impl Executor<'_> {
             )));
         }
         Ok(())
+    }
+}
+
+impl Executor<'_> {
+    /// Binds or unbinds every text console that sits on a framebuffer.
+    fn bind_consoles(&self, bind: bool) {
+        for console in self.root.list("/sys/class/vtconsole") {
+            let dir = std::path::Path::new("/sys/class/vtconsole").join(&console);
+            let on_framebuffer = self
+                .root
+                .read_opt(dir.join("name"))
+                .is_some_and(|name| name.contains("frame buffer"));
+            if on_framebuffer
+                && let Err(e) = self.root.write(dir.join("bind"), if bind { "1" } else { "0" })
+            {
+                warn!("{console}: {e}");
+            }
+        }
+    }
+
+    /// The ids of the graphical sessions open now.
+    fn graphical_sessions(&self) -> Vec<String> {
+        let Ok(list) = self.system.run("loginctl", &["list-sessions", "--no-legend"]) else {
+            return Vec::new();
+        };
+        session::parse_session_ids(&list)
+            .into_iter()
+            .filter(|id| {
+                self.system
+                    .run("loginctl", &["show-session", id, "-p", "Type", "-p", "Name"])
+                    .ok()
+                    .and_then(|properties| session::parse_graphical_session(id, &properties))
+                    .is_some()
+            })
+            .collect()
     }
 }
 

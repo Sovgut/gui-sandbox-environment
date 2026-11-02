@@ -33,7 +33,13 @@ The service therefore has two GPU switch modes, chosen from the hardware:
   and the plasma user units. KWin and plasmashell are units of the user's
   systemd instance, so the switch stops `graphical-session.target` there and
   then ends the session with `loginctl terminate-session`; nothing has to be
-  signalled after that. Measured on the target machine
+  signalled after that. Both may find the session already ending once the
+  display manager stopped, and refuse: the switch goes on, and whether the
+  GPU is free decides. The text consoles are unbound from the framebuffer
+  first, since with `nvidia-drm.fbdev` they keep `nvidia_drm` in use, and
+  bound again on the way back. Returning the GPU waits for the old sessions
+  to end before the display manager starts, so a new login does not meet a
+  session still letting go of the GPU. Measured on the target machine
   (`scripts/target/single-gpu-switch-test.sh`): the desktop is gone and the
   GPU free in about 2 s, unloading the proprietary driver and binding
   `vfio-pci` takes under a second, and reloading the driver (about 4.5 s)

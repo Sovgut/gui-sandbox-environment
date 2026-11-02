@@ -356,12 +356,33 @@ fn install_files(warning: &mut dyn FnMut(String), dry_run: bool) -> Result<()> {
     if settings.exists() {
         info!("keeping the settings in {}", settings.display());
     } else {
-        put(settings, SETTINGS_TEXT, dry_run)?;
+        put(settings, &default_settings(), dry_run)?;
         written.push(settings.to_owned());
     }
     let written: Vec<&Path> = written.iter().map(PathBuf::as_path).collect();
     relabel(&written, warning, dry_run);
     await_policy(&policy, warning, dry_run)
+}
+
+/// The settings a new machine starts with: [`SETTINGS_TEXT`] with the GPU
+/// this machine has in place of the example one.
+fn default_settings() -> String {
+    let Some(gpu) = crate::gpu::default_gpu(&gse_host::Root::system()) else {
+        return SETTINGS_TEXT.to_owned();
+    };
+    info!("the new settings name the GPU {gpu}");
+    SETTINGS_TEXT
+        .lines()
+        .map(|line| {
+            if line.starts_with("gpu = ") {
+                format!("gpu = \"{gpu}\"")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
 /// Waits until polkit knows the gse action, without which the service

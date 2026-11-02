@@ -1,6 +1,7 @@
 # /etc/gse/gse.toml: the machine's settings for the gse service.
 
-# The GPU environments get, as `gse-service gpu list` shows it.
+# The GPU environments get, as `gse-service gpu list` shows it; the
+# install puts in this machine's own.
 gpu = "0000:0e:00.0"
 
 # The environment screen's mode when it is shown in a window.

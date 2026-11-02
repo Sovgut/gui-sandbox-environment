@@ -2926,7 +2926,7 @@ dependencies = [
 
 [[package]]
 name = "gse-app"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -2949,7 +2949,7 @@ dependencies = [
 
 [[package]]
 name = "gse-guest"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -2965,7 +2965,7 @@ dependencies = [
 
 [[package]]
 name = "gse-host"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "fatfs",
  "gse-protocol",
@@ -2979,7 +2979,7 @@ dependencies = [
 
 [[package]]
 name = "gse-protocol"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -2987,7 +2987,7 @@ dependencies = [
 
 [[package]]
 name = "gse-screen"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "ash",
  "memmap2",
@@ -2997,7 +2997,7 @@ dependencies = [
 
 [[package]]
 name = "gse-service"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -3019,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "gse-viewer"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "clap",

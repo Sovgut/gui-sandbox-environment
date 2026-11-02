@@ -660,7 +660,11 @@ impl Home {
                     }
                     Err(e) => {
                         home.connected = Some(false);
-                        home.say(format!("{e:#}"), true);
+                        // A service that restarts is briefly gone; that is
+                        // no error.
+                        if !home.restarting {
+                            home.say(format!("{e:#}"), true);
+                        }
                     }
                 }
                 home.settings_loaded(settings.map_err(|e| settings::explain(&e)));

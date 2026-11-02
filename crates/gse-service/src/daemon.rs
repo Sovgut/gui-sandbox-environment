@@ -619,6 +619,41 @@ impl Store {
         fs::remove_file(self.failure_path(image)).ok();
     }
 
+    /// Removes the image `image` with the records beside it.
+    fn forget_image(&self, image: &str) {
+        for path in [
+            self.image(image),
+            self.on_base_path(image),
+            self.failure_path(image),
+        ] {
+            match fs::remove_file(&path) {
+                Ok(()) => info!("removed {}", path.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!("removing {}: {e}", path.display()),
+            }
+        }
+    }
+
+    /// Whether a preset file names `image`.
+    fn has_preset(&self, image: &str) -> bool {
+        self.presets_dir().join(format!("{image}.toml")).exists()
+    }
+
+    /// Removes the images no preset names and no environment stands on,
+    /// left by a set deleted while its image stayed.
+    fn prune_images(&self) {
+        let used: Vec<String> = self
+            .environments()
+            .into_iter()
+            .map(|(_, image)| image)
+            .collect();
+        for image in self.images() {
+            if !self.has_preset(&image) && !used.contains(&image) {
+                self.forget_image(&image);
+            }
+        }
+    }
+
     /// The last failed build of each of `images` that has one.
     fn failures<'a>(&self, images: impl IntoIterator<Item = &'a str>) -> Vec<FailedBuild> {
         images
@@ -635,9 +670,9 @@ impl Store {
             .collect()
     }
 
-    /// The images built on another base image than the one in place, by
-    /// the fingerprints recorded at their builds; none while the base image
-    /// has no fingerprint.
+    /// The images of presets built on another base image than the one in
+    /// place, by the fingerprints recorded at their builds; none while the
+    /// base image has no fingerprint.
     fn stale_images(&self) -> Vec<String> {
         let Ok(base) = fs::read_to_string(self.base_fingerprint_path()) else {
             return Vec::new();
@@ -645,7 +680,9 @@ impl Store {
         self.images()
             .into_iter()
             .filter(|image| {
-                fs::read_to_string(self.on_base_path(image)).ok().as_deref() != Some(base.as_str())
+                self.has_preset(image)
+                    && fs::read_to_string(self.on_base_path(image)).ok().as_deref()
+                        != Some(base.as_str())
             })
             .collect()
     }
@@ -1483,8 +1520,16 @@ impl Service {
                 if shared.build.as_ref().is_some_and(|b| b.preset == name) {
                     bail!("'{name}' is building; stop the build first");
                 }
+                if let Some((environment, _)) = shared
+                    .store
+                    .environments()
+                    .into_iter()
+                    .find(|(_, from)| *from == name)
+                {
+                    bail!("the sandbox '{environment}' is made from '{name}'; delete it first");
+                }
                 presets::delete(&shared.store.presets_dir(), &name)?;
-                shared.store.forget_failure(&name);
+                shared.store.forget_image(&name);
                 drop(shared);
                 self.broadcast(&Event::PresetsChanged);
             }
@@ -1925,6 +1970,7 @@ pub fn serve(root: Root) -> Result<()> {
     }
     fedora::remove_partial(&store.cache_dir());
     presets::seed(&store.presets_dir())?;
+    store.prune_images();
     let socket = Path::new(SOCKET);
     fs::create_dir_all(socket.parent().context("socket path")?)?;
     fs::remove_file(socket).ok();
@@ -2067,6 +2113,27 @@ mod tests {
             store.environments(),
             [("test".to_owned(), "launchers".to_owned())]
         );
+    }
+
+    #[test]
+    fn images_without_a_set_are_neither_stale_nor_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        fs::create_dir_all(store.images_dir()).unwrap();
+        fs::create_dir_all(store.presets_dir()).unwrap();
+        fs::write(store.base_fingerprint_path(), "new\n").unwrap();
+        for image in ["games", "orphan", "used"] {
+            fs::write(store.image(image), b"").unwrap();
+            fs::write(store.on_base_path(image), "old\n").unwrap();
+        }
+        fs::write(store.presets_dir().join("games.toml"), b"").unwrap();
+        fs::create_dir_all(store.dir("test")).unwrap();
+        fs::write(store.dir("test").join("image"), "used\n").unwrap();
+        assert_eq!(store.stale_images(), ["games"]);
+
+        store.prune_images();
+        assert_eq!(store.images(), ["games", "used"]);
+        assert!(!store.on_base_path("orphan").exists());
     }
 
     #[test]

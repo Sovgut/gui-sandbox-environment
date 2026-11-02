@@ -523,14 +523,15 @@ the app shows what passed and what was refused and why.
        `/etc/polkit-1/actions` (read by polkit 126 and later), the
        sysusers entry to `/etc/sysusers.d/gse.conf`, and
        `/etc/gse/gse.toml` unless there are settings already; drop-ins of
-       the unit stay. polkit rereads its actions when a policy file
+       the unit stay, except the development one (`dev.conf`), which would
+       start another build. polkit rereads its actions when a policy file
        appears in a directory it watches, and finds a directory created
        after it started only seconds later, so install puts the action's
        file in place again until `pkaction` knows the action;
      - creates `gse-net` with `systemd-sysusers`;
      - enables the service and restarts it once any running environment
        has stopped, then waits until it answers with the protocol version
-       of the program just installed.
+       and build of the program just installed.
 
      It reports on stdout, one line each: `step <id>` as a step begins,
      `warning <id> <text>` for what it found that does not stop it, and
@@ -694,7 +695,9 @@ one. One window:
     with: a new set takes the name of the recommended set it starts from
     while that is free, otherwise one made from its title (`wow-addons` for
     "WoW addons"). No two sets share a title. The page deletes a set no
-    sandbox is made from.
+    sandbox is made from, and the service refuses to delete one a sandbox
+    is made from; its image goes with it. At its start the service removes
+    images that no set names and no sandbox stands on.
   - New sandboxes: the set the new sandbox dialog picks first (kept by the
     app) and the settings new sandboxes start with (`/etc/gse/gse.toml`),
     as the same rows as a sandbox's.

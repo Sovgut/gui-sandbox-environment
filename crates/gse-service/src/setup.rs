@@ -345,10 +345,12 @@ fn install_programs(warning: &mut dyn FnMut(String), dry_run: bool) -> Result<()
 
 /// Writes the unit, the polkit action, the sysusers entry and, unless
 /// there are settings already, the default settings; then waits until
-/// polkit knows the action.
+/// polkit knows the action. The development drop-in goes: it starts a
+/// build from /usr/local/sbin in place of the one this install puts in.
 fn install_files(warning: &mut dyn FnMut(String), dry_run: bool) -> Result<()> {
     let unit = unit_running(&Path::new(PROGRAM_DIR).join(PROGRAMS[0]))?;
     put(Path::new(UNIT), &unit, dry_run)?;
+    remove(Path::new(&format!("{UNIT}.d/dev.conf")), dry_run);
     let policy = install_policy(dry_run)?;
     put(Path::new(SYSUSERS), SYSUSERS_TEXT, dry_run)?;
     let mut written = vec![PathBuf::from(UNIT), policy.clone(), PathBuf::from(SYSUSERS)];
@@ -612,16 +614,17 @@ fn command(program: &str, args: &[&str], dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// Waits until the service answers on its socket with this program's
-/// protocol version, for up to [`START_TIMEOUT`].
+/// Waits until the service answers on its socket as this program, its
+/// protocol version and build, for up to [`START_TIMEOUT`].
 fn wait_for_service() -> Result<()> {
     let deadline = Instant::now() + START_TIMEOUT;
+    let own = env!("CARGO_PKG_VERSION");
     loop {
         let problem = match hello() {
-            Ok(version) if version == VERSION => return Ok(()),
-            Ok(version) => bail!(
-                "the service speaks protocol version {version}, not {VERSION}: a drop-in in \
-                 {UNIT}.d may start another program"
+            Ok((version, build)) if version == VERSION && build == own => return Ok(()),
+            Ok((version, build)) => bail!(
+                "the service answers as {build} with protocol version {version}, not as {own} \
+                 with {VERSION}: a drop-in in {UNIT}.d may start another program"
             ),
             Err(e) => format!("{e:#}"),
         };
@@ -637,14 +640,14 @@ fn wait_for_service() -> Result<()> {
     }
 }
 
-/// The protocol version the service on its socket answers with.
-fn hello() -> Result<u32> {
+/// The protocol version and build the service on its socket answers with.
+fn hello() -> Result<(u32, String)> {
     let mut stream = UnixStream::connect(gse_protocol::SOCKET)
         .with_context(|| format!("connecting to {}", gse_protocol::SOCKET))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     send(&mut stream, &Request::Hello)?;
     match receive::<Reply>(&mut BufReader::new(stream))? {
-        Some(Reply::Hello { version, .. }) => Ok(version),
+        Some(Reply::Hello { version, build }) => Ok((version, build)),
         other => bail!("it answered {other:?}"),
     }
 }

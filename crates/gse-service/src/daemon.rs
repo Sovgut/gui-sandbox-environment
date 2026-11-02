@@ -30,7 +30,7 @@ use serde::Deserialize;
 use tracing::{error, info, warn};
 
 use crate::agent::Agent;
-use crate::{checks, fedora, gpu, image, net, presets, vm};
+use crate::{checks, fedora, gpu, image, mailbox, net, presets, vm};
 
 /// The polkit action every client needs.
 pub const ACTION: &str = "io.github.sovgut.gse.manage";
@@ -98,6 +98,13 @@ fn screen_words(root: &Root, gpu: &str, mode: &str) -> String {
             .map_or_else(|| "the monitor's own".to_owned(), str::to_owned),
         _ => mode.to_owned(),
     }
+}
+
+/// Whether the GPU at `gpu` drives the monitor, so an environment on it
+/// takes the monitor and the host session goes.
+fn takes_monitor(root: &Root, gpu: PciAddress) -> bool {
+    gse_host::pci::Gpu::read(root, gpu)
+        .is_ok_and(|gpu| gse_host::plan::Mode::for_gpu(&gpu) == gse_host::plan::Mode::Single)
 }
 
 /// How large an environment's /home may grow.
@@ -819,6 +826,7 @@ impl Service {
                 on_off(launch.internet)
             ),
         );
+        let single = takes_monitor(&root, launch.gpu);
         let service = self.clone();
         thread::spawn(move || {
             let name = launch.name.clone();
@@ -837,6 +845,9 @@ impl Service {
                     });
                     if stage != Stage::Preparing {
                         service.log(&name, stage_entry(stage));
+                    }
+                    if stage == Stage::Ready {
+                        service.tend_mailbox(&name, single);
                     }
                 },
                 false,
@@ -1155,6 +1166,58 @@ impl Service {
         outcome
     }
 
+    /// Whether `name` runs and its agent answers.
+    fn is_up(&self, name: &str) -> bool {
+        self.lock()
+            .current
+            .as_ref()
+            .is_some_and(|c| c.name == name && c.stage == Stage::Ready)
+    }
+
+    /// The folder of the environment `name`, which must exist.
+    fn environment_dir(&self, name: &str) -> Result<PathBuf> {
+        let shared = self.lock();
+        shared.store.image_of(name)?;
+        Ok(shared.store.dir(name))
+    }
+
+    /// Once `name` is up: what waits for its Inbox goes in, and on a single
+    /// GPU, where the app is gone while it runs, its Outbox is taken into
+    /// the spool every [`mailbox::COLLECT_EVERY`] until it stops.
+    fn tend_mailbox(&self, name: &str, single: bool) {
+        let service = self.clone();
+        let name = name.to_owned();
+        thread::spawn(move || {
+            let Ok(dir) = service.environment_dir(&name) else {
+                return;
+            };
+            if !mailbox::waiting(&dir).is_empty() {
+                match service.with_agent(&name, |agent| mailbox::deliver(&dir, agent)) {
+                    Ok(count) => service.log(
+                        &name,
+                        format!("{count} file(s) that waited put into the Inbox"),
+                    ),
+                    Err(e) => warn!("{name}: delivering the waiting files: {e:#}"),
+                }
+            }
+            if !single {
+                return;
+            }
+            let mut seen = std::collections::HashSet::new();
+            while service.is_up(&name) {
+                match service.with_agent(&name, |agent| mailbox::collect(&dir, agent, &mut seen)) {
+                    Ok(0) => {}
+                    Ok(count) => service.log(
+                        &name,
+                        format!("{count} file(s) of the Outbox taken, for the host after the run"),
+                    ),
+                    Err(e) => warn!("{name}: taking the Outbox: {e:#}"),
+                }
+                thread::sleep(mailbox::COLLECT_EVERY);
+            }
+        });
+    }
+
     /// The requests about a running environment's programs and files.
     fn handle_guest(&self, request: Request, peer: Peer, out: &mut UnixStream) -> Result<()> {
         match request {
@@ -1180,9 +1243,27 @@ impl Service {
                 })?;
                 self.log(&name, format!("Killed {title} with everything it started"));
             }
+            Request::Files { name } if !self.is_up(&name) => {
+                let dir = self.environment_dir(&name)?;
+                let files = gse_protocol::GuestFiles {
+                    inbox: mailbox::waiting(&dir),
+                    outbox: mailbox::taken(&dir),
+                };
+                send(out, &Reply::Files { files })?;
+            }
             Request::Files { name } => {
                 let files = self.with_agent(&name, Agent::files)?;
                 send(out, &Reply::Files { files })?;
+            }
+            Request::SendFiles { name, paths } if !self.is_up(&name) => {
+                let dir = self.environment_dir(&name)?;
+                let count = mailbox::queue(&dir, host_files(&paths, peer.uid)?)?;
+                self.log(
+                    &name,
+                    format!(
+                        "{count} file(s) from the host wait for the next start to go into the Inbox"
+                    ),
+                );
             }
             Request::SendFiles { name, paths } => {
                 let files = host_files(&paths, peer.uid)?;
@@ -1202,7 +1283,19 @@ impl Service {
                     format!("{count} file(s) from the host put into the Inbox"),
                 );
             }
+            Request::TakeFiles { name } if !self.is_up(&name) => {
+                let dir = self.environment_dir(&name)?;
+                let count = mailbox::hand_over(&dir, out)?;
+                self.log(
+                    &name,
+                    format!(
+                        "{count} file(s) taken out of the Outbox while it ran handed to the host"
+                    ),
+                );
+            }
             Request::TakeFiles { name } => {
+                let dir = self.environment_dir(&name)?;
+                mailbox::hand_over(&dir, out)?;
                 let (passed, refused) = self.with_agent(&name, |agent| take(agent, out))?;
                 self.log(
                     &name,
@@ -1484,7 +1577,7 @@ fn open_appimages(preset: &HostPreset, uid: u32) -> Result<Vec<(String, fs::File
 }
 
 /// Tells the client on `out` that the Outbox file `path` stays inside.
-fn refuse(out: &mut UnixStream, path: &str, reason: String) -> std::io::Result<()> {
+fn refuse(out: &mut dyn std::io::Write, path: &str, reason: String) -> std::io::Result<()> {
     send(
         out,
         &Reply::Refused {
@@ -1498,9 +1591,21 @@ fn refuse(out: &mut UnixStream, path: &str, reason: String) -> std::io::Result<(
 /// past the checks for outbound files; counts what passed and what not.
 fn take(agent: &mut Agent, out: &mut UnixStream) -> Result<(usize, usize)> {
     let files = agent.files()?;
-    let (mut passed, mut refused, mut total) = (0, 0, 0_u64);
-    for file in &files.outbox {
-        if passed + refused >= checks::MAX_TAKE_FILES {
+    let (passed, refused) = take_files(agent, out, &files.outbox)?;
+    Ok((passed.len(), refused))
+}
+
+/// Copies `files` of the Outbox through `agent` onto `out`, file by file,
+/// with the outbound checks; returns the files that passed and how many
+/// were refused.
+pub fn take_files(
+    agent: &mut Agent,
+    out: &mut dyn std::io::Write,
+    files: &[gse_protocol::GuestFile],
+) -> Result<(Vec<gse_protocol::GuestFile>, usize)> {
+    let (mut passed, mut refused, mut total) = (Vec::new(), 0, 0_u64);
+    for file in files {
+        if passed.len() + refused >= checks::MAX_TAKE_FILES {
             refused += 1;
             refuse(
                 out,
@@ -1522,7 +1627,10 @@ fn take(agent: &mut Agent, out: &mut UnixStream) -> Result<(usize, usize)> {
         let (started, verdict) = (forward.started(), forward.refused.take());
         match (outcome, verdict) {
             (Ok((size, ())), None) => {
-                passed += 1;
+                passed.push(gse_protocol::GuestFile {
+                    path: file.path.clone(),
+                    size,
+                });
                 total += size;
             }
             (Ok(_), Some(reason)) => {

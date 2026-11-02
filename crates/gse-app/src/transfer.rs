@@ -1,9 +1,11 @@
-//! Moving files in and out of a running sandbox from one dialog. Files and
-//! folders of this computer go into `guest`'s `~/Inbox` as they are.
+//! Moving files in and out of a sandbox from one dialog. Files and folders
+//! of this computer go into `guest`'s `~/Inbox` as they are; sent while the
+//! sandbox is stopped, they wait with the service for its next start.
 //! Everything in `guest`'s `~/Outbox` that passes the service's checks comes
-//! out as one zip archive in the received files folder of app settings. The
-//! app writes the archive itself, as the user, and never opens what it
-//! holds.
+//! out as one zip archive in the received files folder of app settings;
+//! what the service took while a sandbox owned the screen comes out the
+//! same way after the run. The app writes the archive itself, as the user,
+//! and never opens what it holds.
 
 use std::fs::{self, File};
 use std::io::{self, Write as _};
@@ -313,7 +315,7 @@ impl Home {
         &self,
         name: &str,
         outbox: &[GuestFile],
-        busy: bool,
+        (busy, up): (bool, bool),
         cx: &mut Context<Self>,
     ) -> Div {
         let take = name.to_owned();
@@ -334,12 +336,28 @@ impl Home {
             .gap_3()
             .child(section(
                 "Take out",
-                format!(
-                    "What is in the sandbox's Outbox comes to {folder} as one zip. Programs, \
-                     scripts and archives stay inside."
-                ),
+                if up {
+                    format!(
+                        "What is in the sandbox's Outbox comes to {folder} as one zip. \
+                         Programs, scripts and archives stay inside."
+                    )
+                } else {
+                    format!(
+                        "What its Outbox held while it ran on the whole screen was taken out \
+                         then, and comes to {folder} as one zip. Programs, scripts and archives \
+                         stayed inside."
+                    )
+                },
             ))
-            .child(file_list("outbox-files", outbox, "The Outbox is empty."))
+            .child(file_list(
+                "outbox-files",
+                outbox,
+                if up {
+                    "The Outbox is empty."
+                } else {
+                    "Nothing was taken out of it."
+                },
+            ))
             .child(
                 button(
                     "take-files",
@@ -379,16 +397,23 @@ impl Home {
             }))
     }
 
-    fn send_section(name: &str, inbox: &[GuestFile], busy: bool, cx: &mut Context<Self>) -> Div {
+    fn send_section(
+        name: &str,
+        inbox: &[GuestFile],
+        (busy, up): (bool, bool),
+        cx: &mut Context<Self>,
+    ) -> Div {
         let (send_files, send_folders) = (name.to_owned(), name.to_owned());
+        let place = if up {
+            "In the Inbox now"
+        } else {
+            "Waiting for the next start"
+        };
         let now = match inbox {
-            [] => "The Inbox is empty.".to_owned(),
-            [one] => format!(
-                "In the Inbox now: {} \u{b7} {}",
-                one.path,
-                size_text(one.size)
-            ),
-            many => format!("In the Inbox now: {} items", many.len()),
+            [] if up => "The Inbox is empty.".to_owned(),
+            [] => "Nothing waits to go in.".to_owned(),
+            [one] => format!("{place}: {} \u{b7} {}", one.path, size_text(one.size)),
+            many => format!("{place}: {} items", many.len()),
         };
         div()
             .flex()
@@ -396,9 +421,14 @@ impl Home {
             .gap_3()
             .child(section(
                 "Send in",
-                "Files and folders land in the sandbox's Inbox, where its programs open and \
-                 run them."
-                    .to_owned(),
+                if up {
+                    "Files and folders land in the sandbox's Inbox, where its programs open and \
+                     run them."
+                } else {
+                    "Files and folders wait here and land in the sandbox's Inbox when it next \
+                     starts, where its programs open and run them."
+                }
+                .to_owned(),
             ))
             .child(
                 div()
@@ -467,6 +497,12 @@ impl Home {
             None => (&[][..], &[][..], None),
         };
         let drop_to = name.to_owned();
+        let up = self.environments.iter().any(|e| {
+            e.name == name
+                && e.running
+                    .as_ref()
+                    .is_some_and(|r| r.stage == gse_protocol::Stage::Ready)
+        });
         div()
             .id("files-body")
             .flex()
@@ -484,8 +520,8 @@ impl Home {
                 }),
             )
             .children(problem.map(|p| div().text_sm().text_color(Theme::warning()).child(p)))
-            .child(self.take_section(name, outbox, busy, cx))
-            .child(Self::send_section(name, inbox, busy, cx))
+            .child(self.take_section(name, outbox, (busy, up), cx))
+            .child(Self::send_section(name, inbox, (busy, up), cx))
             .when(busy, |body| {
                 body.child(
                     div()

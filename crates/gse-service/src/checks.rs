@@ -6,7 +6,6 @@
 //! reaches the client.
 
 use std::io::{self, Write};
-use std::os::unix::net::UnixStream;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -60,11 +59,12 @@ pub fn by_content(head: &[u8]) -> Option<String> {
         .map(|(_, what)| format!("it is {what}"))
 }
 
-/// Hands a file to the client as it arrives, once its start passed
-/// [`by_content`]. A refused file is read to its end and thrown away, so
-/// the agent's answers stay in step.
+/// Hands a file on as it arrives, once its start passed [`by_content`]:
+/// to the client, or into an environment's spool of files taken while it
+/// ran. A refused file is read to its end and thrown away, so the agent's
+/// answers stay in step.
 pub struct Forward<'a> {
-    out: &'a mut UnixStream,
+    out: &'a mut dyn io::Write,
     path: String,
     size: u64,
     head: Vec<u8>,
@@ -73,7 +73,7 @@ pub struct Forward<'a> {
 }
 
 impl<'a> Forward<'a> {
-    pub fn new(out: &'a mut UnixStream, path: &str, size: u64) -> Self {
+    pub fn new(out: &'a mut dyn io::Write, path: &str, size: u64) -> Self {
         Self {
             out,
             path: path.to_owned(),
@@ -167,7 +167,7 @@ mod tests {
     }
 
     fn take(content: &[u8]) -> (Vec<Reply>, Option<String>) {
-        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
         let mut forward = Forward::new(&mut ours, "slot.sav", content.len() as u64);
         for piece in content.chunks(10) {
             forward.write_all(piece).unwrap();

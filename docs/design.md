@@ -411,6 +411,14 @@ version. A preset installs it as an `appimage` entry.
   service, and it needs no host kernel module or address the way vsock
   does. QEMU serves the host end on a socket only root reaches
   (`/run/gse/<name>.agent`).
+- **Files outside a run** (`crates/gse-service/src/mailbox.rs`): on a
+  single GPU the app is gone while the environment owns the screen, so the
+  service carries files itself. Sent in while the environment is stopped,
+  files wait in its folder (`inbox-waiting/`) and go into the Inbox once it
+  is up. While a single-GPU environment runs, the service takes what is new
+  in its Outbox every 20 s, past the same checks as a take, into a spool of
+  the lines a take sends (`outbox-taken`); the app's Files panel lists and
+  takes it after the run like a live Outbox.
 - **The host always initiates**; the agent only answers. The protocol is
   JSON lines (`gse_protocol::agent`): every call carries an id its answers
   repeat, lines are capped, a file travels in base64 chunks of 32 KiB with

@@ -13,6 +13,7 @@ mod gpu;
 mod hostinput;
 mod image;
 mod logs;
+mod mailbox;
 mod net;
 mod presets;
 mod setup;

@@ -670,7 +670,7 @@ impl FromStr for ScreenMode {
 }
 
 /// Writes `message` as one line.
-pub fn send(to: &mut impl Write, message: &impl Serialize) -> io::Result<()> {
+pub fn send(to: &mut (impl Write + ?Sized), message: &impl Serialize) -> io::Result<()> {
     let mut line = serde_json::to_vec(message)?;
     line.push(b'\n');
     to.write_all(&line)?;

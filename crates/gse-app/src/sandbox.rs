@@ -1075,9 +1075,10 @@ impl Home {
             .gap_4()
             .child(div().text_sm().text_color(Theme::muted()).child(
                 "This computer has one graphics card, so the sandbox takes it whole, with your \
-                 keyboard and mouse. Your desktop session closes as if you logged out: save \
-                 your work and close your apps first. When the sandbox stops, the login screen \
-                 comes back.",
+                 keyboard, mouse and sound. Your desktop session closes as if you logged out: \
+                 save your work and close your apps first. When the sandbox stops, the login \
+                 screen comes back. Files you put in its Outbox meanwhile wait in its Files \
+                 tab; files sent in before it starts are in its Inbox.",
             ))
             .child(
                 div()

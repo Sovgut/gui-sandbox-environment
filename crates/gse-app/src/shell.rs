@@ -1136,9 +1136,8 @@ impl Home {
                 cx.listener(move |home, _, _, cx| {
                     // Files open as a panel at the right, over the page.
                     if tab == PanelTab::Files {
-                        match home.selected_up() {
-                            Some(name) => home.open_transfer(&name, cx),
-                            None => home.say("Files move in and out while the sandbox runs", false),
+                        if let Some(name) = home.selected.clone() {
+                            home.open_transfer(&name, cx);
                         }
                         cx.notify();
                         return;

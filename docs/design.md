@@ -703,6 +703,16 @@ makes the same archive from a terminal when the window does not open.
 
 ## Releases and updates
 
+- gse supports two Fedora releases at once, the current one and the one
+  before (now 44 and 45), on the host and in the guest: users stay on a
+  release for months, and Fedora Atomic systems such as Bazzite follow the
+  older one. Where their tools differ, the service asks the tool what it
+  has rather than assuming one release: QEMU 11 has `-object monitor-qmp`,
+  QEMU 10 only `-mon`, and the service picks by `qemu-system-x86_64 -object
+  help`. `scripts/dev/qemu-compat.sh` runs the exact passt and QEMU command
+  lines the service builds (`crates/gse-host/examples/qemu_lines.rs`) and
+  its nftables ruleset on each release's tools in a container; run it
+  before a release that changes how QEMU, passt or nftables are called.
 - A release is a GitHub release of the project, made by the workflow
   `.github/workflows/release.yml` when a tag `v<version>` matching the
   workspace version is pushed. It builds the AppImage

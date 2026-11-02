@@ -76,9 +76,31 @@ enum Report {
     Ended(Result<()>),
 }
 
-/// Whether the computer still needs preparing, and from which step.
+/// Programs the service runs, which its install puts on the machine.
+const TOOLS: [&str; 4] = ["qemu-system-x86_64", "qemu-img", "passt", "nft"];
+/// Where systemd finds them.
+const TOOL_DIRS: [&str; 4] = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin"];
+/// Files of the installed packages that no program shows: the UEFI firmware
+/// and QEMU's PulseAudio backend.
+const TOOL_FILES: [&str; 2] = [
+    "/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2",
+    "/usr/lib64/qemu/audio-pa.so",
+];
+
+/// Whether something the service runs is missing, which the install puts
+/// in place.
+fn tools_missing() -> bool {
+    TOOLS
+        .iter()
+        .any(|tool| !TOOL_DIRS.iter().any(|dir| Path::new(dir).join(tool).exists()))
+        || TOOL_FILES.iter().any(|file| !Path::new(file).exists())
+}
+
+/// Whether the computer still needs preparing, and from which step. A
+/// machine that lacks what the service runs goes through the install again,
+/// which installs it.
 pub fn needed() -> Option<Step> {
-    if !Path::new(gse_protocol::SOCKET).exists() {
+    if !Path::new(gse_protocol::SOCKET).exists() || tools_missing() {
         return Some(Step::Check);
     }
     if !Path::new(BASE_PATH).exists() {
@@ -255,9 +277,11 @@ impl Home {
             Report::Ended(Err(e)) => {
                 setup.running = false;
                 setup.failed = Some(format!("{e:#}"));
-                // The service may be in place now even if a later step failed.
+                // Try again starts where the computer stands now: past the
+                // install once the service is in place, back at it while
+                // something it installs is missing.
                 if let Some(next) = needed() {
-                    setup.step = setup.step.max(next);
+                    setup.step = next;
                 }
                 Self::reload(cx);
             }

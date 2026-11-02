@@ -36,7 +36,8 @@ const STEPS: [(Step, &str, &str); 4] = [
     (
         Step::Check,
         "Check this computer",
-        "Virtualization, the graphics card hand-over and the tools sandboxes run on.",
+        "Virtualization, the graphics card hand-over, and the tools sandboxes run on, \
+         installed if missing.",
     ),
     (
         Step::Service,
@@ -236,7 +237,7 @@ impl Home {
         match report {
             Report::Begun(step) => {
                 setup.step = match step.as_str() {
-                    "check" => Step::Check,
+                    "packages" | "check" => Step::Check,
                     "system" => Step::System,
                     "launchers" => Step::Launchers,
                     _ => Step::Service,
@@ -406,6 +407,7 @@ impl Home {
                          few system parts first; after that everything happens on its own.",
                     )),
             )
+            .children(self.update_notice(cx))
             .child(steps)
             .children(
                 setup

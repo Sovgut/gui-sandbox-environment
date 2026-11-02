@@ -56,6 +56,22 @@ const SYSUSERS_TEXT: &str = include_str!("../../../dist/sysusers.d/gse.conf");
 /// The settings a machine starts with, at [`daemon::CONFIG`].
 const SETTINGS_TEXT: &str = include_str!("../../../dist/gse/gse.toml");
 
+/// The Fedora packages that hold what the service runs: QEMU with the
+/// PulseAudio sound backend it plays through, the UEFI firmware, passt with
+/// its SELinux policy, and nftables.
+const PACKAGES: [&str; 7] = [
+    "qemu-system-x86-core",
+    "qemu-img",
+    "qemu-audio-pa",
+    "edk2-ovmf",
+    "passt",
+    "passt-selinux",
+    "nftables",
+];
+/// Present on an rpm-ostree system (Fedora Atomic, Bazzite), where packages
+/// are layered onto the image rather than installed with dnf.
+const OSTREE_BOOTED: &str = "/run/ostree-booted";
+
 /// Programs the service runs that a machine may lack.
 const TOOLS: [&str; 4] = [QEMU, "qemu-img", PASST, "nft"];
 /// Where systemd finds the programs a service runs.
@@ -93,6 +109,8 @@ const FILES: [&str; 5] = [
 /// A step of `install`, named by the id its report lines carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
+    /// The packages the service runs, installed when missing.
+    Packages,
     /// What environments need from the machine; what is missing is only
     /// reported.
     Check,
@@ -109,6 +127,7 @@ enum Step {
 impl Step {
     const fn id(self) -> &'static str {
         match self {
+            Self::Packages => "packages",
             Self::Check => "check",
             Self::Programs => "programs",
             Self::Files => "files",
@@ -167,6 +186,7 @@ fn run_step(step: Step, work: impl FnOnce(&mut dyn FnMut(String)) -> Result<()>)
 /// order, `check`, `programs`, `files`, `account` and `service`; a failed
 /// step ends the install. Logs go to stderr.
 pub fn install(dry_run: bool) -> Result<()> {
+    run_step(Step::Packages, |warning| install_packages(warning, dry_run))?;
     run_step(Step::Check, |warning| {
         check(warning);
         Ok(())
@@ -177,6 +197,43 @@ pub fn install(dry_run: bool) -> Result<()> {
     run_step(Step::Service, |_| start_service(dry_run))?;
     info!("gse is installed");
     Ok(())
+}
+
+/// Installs the [`PACKAGES`] the machine lacks: with dnf, or layered live
+/// onto an rpm-ostree image. Elsewhere it only says what to install.
+fn install_packages(warning: &mut dyn FnMut(String), dry_run: bool) -> Result<()> {
+    if !Path::new("/usr/bin/rpm").exists() {
+        warning(
+            "this is not a Fedora-family system: install QEMU for x86_64 with qemu-img and \
+             PulseAudio sound, the OVMF UEFI firmware, passt and nftables yourself"
+                .into(),
+        );
+        return Ok(());
+    }
+    let missing: Vec<&str> = PACKAGES
+        .into_iter()
+        .filter(|package| {
+            !Command::new("rpm")
+                .args(["-q", "--quiet", package])
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    info!("installing {}", missing.join(" "));
+    if Path::new(OSTREE_BOOTED).exists() {
+        let mut args = vec!["install", "--idempotent", "--apply-live"];
+        args.extend(&missing);
+        return command("rpm-ostree", &args, dry_run).context(
+            "the packages could not be added to the running system; restart the computer \
+             and try again",
+        );
+    }
+    let mut args = vec!["install", "-y"];
+    args.extend(&missing);
+    command("dnf", &args, dry_run)
 }
 
 /// Looks at what environments need from the machine. The service installs

@@ -457,6 +457,12 @@ the app shows what passed and what was refused and why.
      `usr/libexec/gse` to a directory root can read, since root cannot read
      the AppImage's FUSE mount, and one polkit prompt runs
      `gse-service install` from there. Install:
+     - installs the Fedora packages the service runs when they are missing
+       (`qemu-system-x86-core`, `qemu-img`, `qemu-audio-pa`, `edk2-ovmf`,
+       `passt`, `passt-selinux`, `nftables`): with dnf, or layered live
+       with `rpm-ostree install --apply-live` on Fedora Atomic systems,
+       which ask for a restart when that fails. Elsewhere it names what
+       to install;
      - checks the machine: `/dev/kvm`, IOMMU groups, `vfio-pci`, QEMU,
        `qemu-img`, passt, nft and the UEFI firmware. What is missing is a
        warning, not a failure; install changes no firmware setting or
@@ -482,7 +488,7 @@ the app shows what passed and what was refused and why.
      It reports on stdout, one line each: `step <id>` as a step begins,
      `warning <id> <text>` for what it found that does not stop it, and
      `done <id>` or `failed <id> <reason>` as the step ends. The ids are
-     `check`, `programs`, `files`, `account` and `service`; a failed step
+     `packages`, `check`, `programs`, `files`, `account` and `service`; a failed step
      ends the install with a non-zero exit status. `--dry-run` reports
      the same steps and changes nothing.
    - The app then has the service build the base image (see "Guest

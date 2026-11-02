@@ -47,7 +47,11 @@ pub struct VmSpec {
     pub monitor_socket: PathBuf,
     /// The guest agent's virtio-serial port, on a socket only root reaches.
     pub agent_socket: Option<PathBuf>,
+    /// The guest's serial console, appended to.
     pub serial_log: PathBuf,
+    /// The guest's journal, which it streams over a virtio-serial port
+    /// beside the agent's, appended to. Needs `agent_socket`.
+    pub journal_log: Option<PathBuf>,
     /// The account QEMU drops to once its devices are open.
     pub run_as: Option<String>,
     /// An image build: the guest learns it through the `fw_cfg` item
@@ -157,7 +161,14 @@ impl VmSpec {
         if self.image_build {
             push(&["-fw_cfg", "name=opt/gse/build,string=1"]);
         }
-        push(&["-serial", &format!("file:{}", self.serial_log.display())]);
+        // Appended to, so the service can start a log over that grew too
+        // large while QEMU goes on writing.
+        push(&[
+            "-chardev",
+            &format!("file,id=console,path={},append=on", self.serial_log.display()),
+            "-serial",
+            "chardev:console",
+        ]);
         push(&[
             "-monitor",
             &format!("unix:{},server,nowait", self.monitor_socket.display()),
@@ -214,6 +225,17 @@ impl VmSpec {
                     gse_protocol::agent::PORT
                 ),
             ]);
+            if let Some(journal) = &self.journal_log {
+                push(&[
+                    "-chardev",
+                    &format!("file,id=journal,path={},append=on", journal.display()),
+                    "-device",
+                    &format!(
+                        "virtserialport,bus=serial.0,chardev=journal,name={}",
+                        gse_protocol::agent::JOURNAL_PORT
+                    ),
+                ]);
+            }
         }
         if let Some(socket) = &self.input_socket {
             push(&[
@@ -259,6 +281,7 @@ mod tests {
             agent_socket: None,
             monitor_socket: "/run/gse/proto.monitor".into(),
             serial_log: "/vm/console.log".into(),
+            journal_log: None,
             run_as: Some("sovhut".into()),
             image_build: false,
         }

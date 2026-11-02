@@ -289,6 +289,23 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 systemctl enable gse-agent.service
+# The guest's journal goes to the host as it is written, over a port of its
+# own, so a sandbox that misbehaves leaves a record outside it. Only an
+# environment has the port; without it after a minute (an image build) the
+# unit ends.
+cat > /etc/systemd/system/gse-journal.service <<'EOF'
+[Unit]
+Description=Stream the journal to the host
+
+[Service]
+ExecStart=/bin/sh -c 'port=/dev/virtio-ports/io.github.sovgut.gse.journal; for i in $(seq 60); do [ -e $port ] && exec journalctl -b -f --no-tail -o short-iso-precise > $port; sleep 1; done'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable gse-journal.service
 install -d -o guest -g guest -m 0755 /home/guest/Inbox /home/guest/Outbox
 # `sandbox` cannot look into `guest`'s home, so the desktop's Inbox and
 # Outbox open a file manager as `guest`: files reach the Outbox from

@@ -11,6 +11,7 @@ mod daemon;
 mod fedora;
 mod gpu;
 mod image;
+mod logs;
 mod net;
 mod presets;
 mod setup;
@@ -25,7 +26,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use gse_host::Root;
 use gse_host::pci::PciAddress;
-use tracing::error;
+use tracing::{error, info};
 
 /// Runtime state; cleared on reboot, which also returns every GPU to the host.
 const STATE_DIR: &str = "/run/gse";
@@ -124,16 +125,36 @@ enum VmAction {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-    if let Err(e) = run(&Cli::parse()) {
+    let cli = Cli::parse();
+    init_logging(matches!(cli.command, Command::Daemon));
+    if let Err(e) = run(&cli) {
         error!("{e:#}");
         std::process::exit(1);
+    }
+}
+
+/// Logs to stderr, which the journal keeps for the service; the daemon also
+/// logs to [`logs::SERVICE`], which a user reads without the journal.
+fn init_logging(daemon: bool) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let file = daemon
+        .then(|| logs::open_service_log().ok())
+        .flatten()
+        .map(|file| {
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+        });
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(file)
+        .init();
+    if daemon {
+        info!("gse-service {} starting", env!("CARGO_PKG_VERSION"));
     }
 }
 

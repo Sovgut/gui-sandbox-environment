@@ -387,6 +387,9 @@ pub mod agent {
 
     /// The port's name; the guest sees it as `/dev/virtio-ports/<PORT>`.
     pub const PORT: &str = "io.github.sovgut.gse.agent";
+    /// The port the guest streams its journal to, one way; the host only
+    /// keeps what arrives, capped, and never parses it.
+    pub const JOURNAL_PORT: &str = "io.github.sovgut.gse.journal";
     pub const VERSION: u32 = 1;
     /// Raw bytes per chunk of a file; in base64 a chunk stays well under
     /// [`crate::MAX_LINE`].

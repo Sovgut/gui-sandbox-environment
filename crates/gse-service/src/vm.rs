@@ -197,6 +197,11 @@ pub fn launch_environment(
             return Err(e);
         }
     };
+    let (console, journal) = if dry_run {
+        (dir.join("console.log"), dir.join("guest.log"))
+    } else {
+        crate::logs::start_environment_logs(dir, launch.owner.uid)?
+    };
     let spec_for = |socket: PathBuf| VmSpec {
         name: launch.name.clone(),
         disk: launch.disk.clone(),
@@ -215,7 +220,8 @@ pub fn launch_environment(
         input_socket: Some(launch.input_socket()),
         agent_socket: Some(launch.agent_socket()),
         monitor_socket: state_path(&format!("{}.monitor", launch.name)),
-        serial_log: dir.join("console.log"),
+        serial_log: console.clone(),
+        journal_log: Some(journal.clone()),
         run_as: Some(launch.owner.name.clone()),
         image_build: false,
     };
@@ -476,9 +482,16 @@ fn run_qemu(spec: &VmSpec, stop: &AtomicBool, watch: &mut Watch<'_>) -> Result<(
     let mut ready = ReadyWatch::new(&spec.serial_log);
     let mut ready_reported = false;
     let mut input_handed_over = spec.input_socket.is_none() || watch.owner.is_none();
+    let mut turns: u32 = 0;
     let status: ExitStatus = loop {
         if let Some(status) = child.try_wait()? {
             break status;
+        }
+        turns = turns.wrapping_add(1);
+        if turns.is_multiple_of(25) {
+            for log in std::iter::once(&spec.serial_log).chain(&spec.journal_log) {
+                crate::logs::cap(log, crate::logs::RUNNING_LIMIT);
+            }
         }
         if !input_handed_over && let (Some(socket), Some(uid)) = (&spec.input_socket, watch.owner) {
             input_handed_over = hand_over(socket, uid);

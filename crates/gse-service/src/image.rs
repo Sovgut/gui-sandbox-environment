@@ -272,6 +272,7 @@ fn build(
         agent_socket: None,
         monitor_socket: state_path("build.monitor"),
         serial_log: console.clone(),
+        journal_log: None,
         run_as: job.run_as.clone(),
         image_build: true,
     };
@@ -322,6 +323,8 @@ fn build(
     let outcome = vm::run_networked("build", true, None, job.stop, &mut watch, spec_for);
     done.store(true, Ordering::SeqCst);
     follower.join().ok();
+    let ok = outcome.is_ok() && last_verdict(&console).is_ok_and(|v| v == "OK");
+    crate::logs::keep_build_console(&stem, &console, ok);
     outcome?;
     if job.stop.load(Ordering::SeqCst) {
         bail!(

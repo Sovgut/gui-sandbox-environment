@@ -154,6 +154,34 @@ pub struct Gpu {
     pub connectors: Vec<Connector>,
 }
 
+/// Sound cards a VM can take whole along with `gpu` on a single-GPU machine:
+/// HD Audio controllers (class `0x0403`) other than the GPU's own, each
+/// alone in its IOMMU group but for bridges, so that moving it moves
+/// nothing else. The host's speakers and microphone on the board's jacks
+/// are on one of them.
+#[must_use]
+pub fn movable_sound_cards(root: &Root, gpu: &Gpu) -> Vec<PciFunction> {
+    let all: Vec<PciFunction> = root
+        .list(PCI_DEVICES)
+        .into_iter()
+        .filter_map(|name| name.parse::<PciAddress>().ok())
+        .filter_map(|address| PciFunction::read(root, address).ok())
+        .collect();
+    let is_bridge = |f: &PciFunction| f.class >> 16 == 0x06;
+    all.iter()
+        .filter(|f| f.class >> 8 == 0x0403)
+        .filter(|f| !gpu.functions.iter().any(|g| g.address == f.address))
+        .filter(|f| {
+            f.iommu_group.is_some_and(|group| {
+                all.iter()
+                    .filter(|o| o.iommu_group == Some(group) && o.address != f.address)
+                    .all(is_bridge)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 impl Gpu {
     /// Reads the GPU whose display function sits in `address`'s slot.
     pub fn read(root: &Root, address: PciAddress) -> Result<Self> {

@@ -212,18 +212,19 @@ impl VmSpec {
                 "ivshmem-plain,memdev=screen",
                 "-fw_cfg",
                 &format!("name=opt/gse/screen,string={}", screen.mode),
-                // One playback stream and no capture: the guest gets no
-                // input from the host's microphones. virtio-sound rather
+                // A playback and a capture stream: the host's microphone
+                // reaches the guest, for voice chat. virtio-sound rather
                 // than an emulated Intel HDA, whose DMA timing the guest's
                 // PipeWire follows unevenly and plays with dropouts.
                 "-audiodev",
                 &format!(
-                    "pa,id=audio,server=unix:{},out.stream-name=gse-{}",
+                    "pa,id=audio,server=unix:{},out.stream-name=gse-{},in.stream-name=gse-{}",
                     screen.sound_server.display(),
+                    self.name,
                     self.name
                 ),
                 "-device",
-                "virtio-sound-pci,audiodev=audio,streams=1",
+                "virtio-sound-pci,audiodev=audio,streams=2",
             ]);
         }
         if let Some(socket) = &self.agent_socket {
@@ -433,9 +434,11 @@ mod tests {
         );
         assert_eq!(
             after(&args, "-audiodev"),
-            ["pa,id=audio,server=unix:/run/user/1000/pulse/native,out.stream-name=gse-proto"]
+            [
+                "pa,id=audio,server=unix:/run/user/1000/pulse/native,out.stream-name=gse-proto,in.stream-name=gse-proto"
+            ]
         );
-        assert!(after(&args, "-device").contains(&"virtio-sound-pci,audiodev=audio,streams=1"));
+        assert!(after(&args, "-device").contains(&"virtio-sound-pci,audiodev=audio,streams=2"));
     }
 
     #[test]

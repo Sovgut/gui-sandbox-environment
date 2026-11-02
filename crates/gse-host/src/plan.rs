@@ -55,6 +55,9 @@ pub struct Snapshot {
     pub graphical_sessions: Vec<Session>,
     /// Running units from [`GPU_SERVICES`].
     pub gpu_services: Vec<String>,
+    /// Sound cards that go with the GPU in single mode (see
+    /// [`crate::pci::movable_sound_cards`]).
+    pub sound_cards: Vec<crate::pci::PciFunction>,
 }
 
 /// What the host had before the GPU left it, so detaching can restore it.
@@ -307,8 +310,19 @@ pub fn attach(snapshot: &Snapshot) -> (Plan, Handoff) {
         }
     }
 
+    // With one GPU the host session is gone, so its sound card is free too
+    // and goes with it: the speakers and microphone on the board's jacks.
+    let moved: Vec<&crate::pci::PciFunction> = gpu
+        .functions
+        .iter()
+        .chain(if mode == Mode::Single {
+            snapshot.sound_cards.iter()
+        } else {
+            [].iter()
+        })
+        .collect();
     steps.push(Step::LoadModules(vec![VFIO_PCI.into()]));
-    for function in &gpu.functions {
+    for function in &moved {
         let address = function.address;
         steps.push(Step::SetOverride {
             function: address,
@@ -333,11 +347,7 @@ pub fn attach(snapshot: &Snapshot) -> (Plan, Handoff) {
         } else {
             Vec::new()
         },
-        drivers: gpu
-            .functions
-            .iter()
-            .map(|f| (f.address, f.driver.clone()))
-            .collect(),
+        drivers: moved.iter().map(|f| (f.address, f.driver.clone())).collect(),
     };
     (
         Plan {
@@ -411,6 +421,7 @@ mod tests {
                 user: "sovhut".into(),
             }],
             gpu_services: Vec::new(),
+            sound_cards: Vec::new(),
         };
         (dir, snapshot)
     }
@@ -460,6 +471,7 @@ mod tests {
                 user: "dreamer".into(),
             }],
             gpu_services: vec!["nvidia-powerd.service".into()],
+            sound_cards: Vec::new(),
         };
         (dir, snapshot)
     }
@@ -525,6 +537,52 @@ mod tests {
                 < position("load vfio-pci")
         );
         assert!(position("load vfio-pci") < position("0000:09:00.0: driver_override = vfio-pci"));
+    }
+
+    #[test]
+    fn single_mode_takes_the_free_sound_card_and_gives_it_back() {
+        let (dir, mut snapshot) = rtx_target();
+        let root = crate::Root::at(dir.path());
+        fixture::add(
+            &root,
+            &Function {
+                address: "0000:0b:00.4",
+                vendor: 0x1022,
+                device: 0x1487,
+                class: 0x04_0300,
+                driver: Some("snd_hda_intel"),
+                group: 22,
+                boot_vga: false,
+            },
+        );
+        snapshot.sound_cards = crate::pci::movable_sound_cards(&root, &snapshot.gpu);
+        assert_eq!(snapshot.sound_cards.len(), 1);
+        let (plan, handoff) = attach(&snapshot);
+        assert!(rendered(&plan).contains(&"0000:0b:00.4: expect vfio-pci".to_owned()));
+        assert!(
+            rendered(&detach(&handoff)).contains(&"0000:0b:00.4: expect snd_hda_intel".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_sound_card_sharing_its_group_stays() {
+        let (dir, snapshot) = rtx_target();
+        let root = crate::Root::at(dir.path());
+        for (address, class) in [("0000:0b:00.3", 0x0c_0330), ("0000:0b:00.4", 0x04_0300)] {
+            fixture::add(
+                &root,
+                &Function {
+                    address,
+                    vendor: 0x1022,
+                    device: 0x1487,
+                    class,
+                    driver: None,
+                    group: 22,
+                    boot_vga: false,
+                },
+            );
+        }
+        assert_eq!(crate::pci::movable_sound_cards(&root, &snapshot.gpu), Vec::new());
     }
 
     #[test]

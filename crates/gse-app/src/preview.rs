@@ -162,7 +162,7 @@ fn sets() -> Vec<Preset> {
                 app("Heroic", flatpak("com.heroicgameslauncher.hgl"), false),
                 app("Bottles", flatpak("com.usebottles.bottles"), false),
                 app("ProtonPlus", flatpak("com.vysp3r.ProtonPlus"), false),
-                app("Firefox", flatpak("org.mozilla.firefox"), false),
+                app("Chrome", flatpak("com.google.Chrome"), false),
                 app("Discord", flatpak("com.discordapp.Discord"), true),
             ],
         },

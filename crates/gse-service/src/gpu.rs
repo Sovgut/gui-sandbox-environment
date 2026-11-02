@@ -143,9 +143,10 @@ fn handoff_path(gpu: PciAddress) -> PathBuf {
     state_path(&format!("gpu-{gpu}.handoff"))
 }
 
-/// Hands the GPU to vfio-pci and returns it as it was before, so callers know
-/// every function that moved. A failed attach returns the GPU to the host.
-pub fn attach(root: &Root, gpu: PciAddress, dry_run: bool) -> Result<Gpu> {
+/// Hands the GPU to vfio-pci, with a free sound card in single mode, and
+/// returns the GPU as it was before and every function that moved. A
+/// failed attach returns them to the host.
+pub fn attach(root: &Root, gpu: PciAddress, dry_run: bool) -> Result<(Gpu, Vec<PciAddress>)> {
     let system = HostSystem;
     let snapshot = exec::snapshot(root, &system, gpu)?;
     let gpu = snapshot.gpu.display().address;
@@ -177,7 +178,8 @@ pub fn attach(root: &Root, gpu: PciAddress, dry_run: bool) -> Result<Gpu> {
     if let (false, Some(group)) = (dry_run, snapshot.gpu.iommu_group()) {
         info!("{gpu} is on {VFIO_PCI}: /dev/vfio/{group}");
     }
-    Ok(snapshot.gpu)
+    let moved = handoff.drivers.iter().map(|(address, _)| *address).collect();
+    Ok((snapshot.gpu, moved))
 }
 
 pub fn detach(root: &Root, gpu: PciAddress, dry_run: bool) -> Result<()> {

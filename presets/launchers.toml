@@ -32,8 +32,8 @@ name = "Faugus Launcher"
 flatpak = "io.github.Faugus.faugus-launcher"
 
 [[app]]
-name = "Firefox"
-flatpak = "org.mozilla.firefox"
+name = "Chrome"
+flatpak = "com.google.Chrome"
 
 [[app]]
 name = "Discord"

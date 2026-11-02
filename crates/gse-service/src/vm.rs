@@ -190,7 +190,7 @@ pub fn launch_environment(
         create_screen(&screen, launch.owner.uid)?;
     }
     progress(Stage::SwitchingGpu);
-    let attached = match gpu::attach(root, launch.gpu, dry_run) {
+    let (attached, moved) = match gpu::attach(root, launch.gpu, dry_run) {
         Ok(attached) => attached,
         Err(e) => {
             fs::remove_file(&screen).ok();
@@ -228,7 +228,7 @@ pub fn launch_environment(
         firmware_vars: dir.join("OVMF_VARS.qcow2"),
         memory_mib: launch.memory_mib,
         cpus: launch.cpus,
-        passthrough: attached.functions.iter().map(|f| f.address).collect(),
+        passthrough: moved.clone(),
         network: Network::Passt { socket },
         vnc_display: launch.dev_vnc,
         screen: (!single).then(|| Screen {

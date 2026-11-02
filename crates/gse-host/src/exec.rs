@@ -57,7 +57,9 @@ pub fn snapshot(root: &Root, system: &dyn System, gpu: PciAddress) -> Result<Sna
         )?;
         graphical_sessions.extend(session::parse_graphical_session(&id, &properties));
     }
+    let sound_cards = crate::pci::movable_sound_cards(root, &gpu);
     Ok(Snapshot {
+        sound_cards,
         gpu,
         display_manager_active: active(DISPLAY_MANAGER),
         graphical_sessions,

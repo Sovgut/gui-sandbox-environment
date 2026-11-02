@@ -33,7 +33,7 @@ const SANDBOX_FILES: [&str; 8] = [
 
 /// What the computer is and how gse stands on it, by the commands that say
 /// so; each runs as the user and may be missing.
-const HOST_COMMANDS: [(&str, &[&str]); 15] = [
+const HOST_COMMANDS: [(&str, &[&str]); 16] = [
     ("uname", &["-a"]),
     ("cat", &["/etc/os-release"]),
     ("cat", &["/proc/cmdline"]),
@@ -54,6 +54,13 @@ const HOST_COMMANDS: [(&str, &[&str]); 15] = [
     ),
     ("lspci", &["-nnk"]),
     ("sh", &["-c", "ls /sys/kernel/iommu_groups | wc -l"]),
+    (
+        "sh",
+        &[
+            "-c",
+            "for d in /sys/kernel/iommu_groups/*/devices/*; do echo \"${d#/sys/kernel/iommu_groups/}\"; done",
+        ],
+    ),
     ("ls", &["-l", "/dev/kvm", "/dev/vfio"]),
     ("sh", &["-c", "lsmod | grep -E 'vfio|nvidia|nouveau|amdgpu|i915|xe|kvm'"]),
     ("nvidia-smi", &["-L"]),

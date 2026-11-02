@@ -104,7 +104,7 @@ cat > /usr/share/glib-2.0/schemas/30_gse.gschema.override <<'EOF'
 layout='gse'
 
 [com.solus-project.icon-tasklist]
-pinned-launchers=['org.mozilla.firefox.desktop', 'nemo.desktop']
+pinned-launchers=['com.google.Chrome.desktop', 'org.mozilla.firefox.desktop', 'nemo.desktop']
 
 [org.gnome.desktop.interface:Budgie]
 color-scheme='prefer-dark'
@@ -270,6 +270,19 @@ Restart=always
 RestartSec=1
 EOF
 ln -s ../gse-xwayland.service ../gse-launch.service "$units/default.target.wants/"
+# The portals let `guest`'s programs ask where to save a file and show it in
+# its folder. They wait for a graphical session, which `guest` never has: it
+# draws on the desktop of `sandbox`. Without them Firefox and Chrome save
+# into ~/Downloads unasked and cannot open it.
+for portal in xdg-desktop-portal xdg-desktop-portal-gtk; do
+    install -d "$units/$portal.service.d"
+    cat > "$units/$portal.service.d/gse.conf" <<'EOF'
+[Unit]
+Requisite=
+PartOf=
+After=
+EOF
+done
 
 # The agent answers the host about `guest`'s programs and its Inbox and
 # Outbox, as root, on a virtio-serial port only root opens
@@ -306,18 +319,23 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 systemctl enable gse-journal.service
-install -d -o guest -g guest -m 0755 /home/guest/Inbox /home/guest/Outbox
+install -d -o guest -g guest -m 0755 /home/guest/Inbox /home/guest/Outbox \
+    /home/guest/Downloads
 # `sandbox` cannot look into `guest`'s home, so the desktop's Inbox and
 # Outbox open a file manager as `guest`: files reach the Outbox from
 # wherever `guest`'s programs keep them, and what arrives in the Inbox is
 # there to take.
 install -d -o sandbox -g sandbox /home/sandbox/Desktop
-for box in Inbox Outbox; do
+for box in Inbox Outbox Downloads; do
+    case $box in
+        Downloads) about="where guest's browsers save what they download" ;;
+        *) about="guest's ~/$box, which the host fills or empties" ;;
+    esac
     cat > "/home/sandbox/Desktop/gse-$box.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=$box
-Comment=guest's ~/$box, which the host fills or empties
+Comment=$about
 Icon=folder
 Exec=/usr/libexec/gse/gse-guest run --title $box --icon folder nemo /home/guest/$box
 EOF
@@ -338,9 +356,9 @@ chown -R guest:guest /home/guest/.config
 
 # Sound for `guest` comes from the desktop's sound server through a second
 # PulseAudio socket beside the display. Its clients are "restricted", which
-# WirePlumber turns into read-only access, and they may not record (no
-# microphone, no monitor of what others play) or change any volume. `guest`
-# has no other way to PipeWire.
+# WirePlumber turns into read-only access, and they may not change any
+# volume. They may record, so voice chat works: the host's microphone
+# reaches the guest. `guest` has no other way to PipeWire.
 mkdir -p /etc/pipewire/pipewire-pulse.conf.d
 cat > /etc/pipewire/pipewire-pulse.conf.d/gse.conf <<'EOF'
 pulse.properties = {
@@ -354,7 +372,7 @@ pulse.rules = [
     {
         matches = [ { pipewire.client.access = "restricted" } ]
         actions = {
-            quirks = [ block-record-stream block-source-volume block-sink-volume ]
+            quirks = [ block-source-volume block-sink-volume ]
         }
     }
 ]

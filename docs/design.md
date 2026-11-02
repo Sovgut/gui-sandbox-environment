@@ -662,6 +662,29 @@ stops neither.
   sound goes to that session), and releasing keys the guest still holds
   pressed when the app goes away without letting them go.
 
+## Logs and diagnostics
+
+Everything gse does is written down in plain files a user can read without
+the service or the app, so a failure of either still leaves a record:
+
+| What | Where |
+| :--- | :--- |
+| The app: start, requests and their outcomes, events, first-start steps, updates, the screen, and a crash with its backtrace | `~/.cache/gse/app.log`, the previous start's in `app.previous.log` |
+| The service install: what it ran and what dnf or rpm-ostree printed | `~/.cache/gse/install.log` |
+| The service | `/var/log/gse/service.log` and `service.previous.log`, besides the systemd journal |
+| Each image build: the guest's console, ok or failed | `/var/log/gse/builds/<time>-<image>-<ok or failed>.log`, the last 12 |
+| Each sandbox: its activity, its guest console, and the guest's journal streamed out as it is written (`gse-journal.service` on the `io.github.sovgut.gse.journal` port) | `/var/lib/gse/environments/<name>/`: `journal`, `console.log`, `guest.log`, and the previous run's `*.previous.log`; the guest logs belong to the sandbox's owner alone |
+
+QEMU appends to a running sandbox's logs; past 64 MiB one starts over, since
+the guest writes them and a hostile one could fill the disk. The host keeps
+what the guest's journal says and never parses it.
+
+"Save diagnostics" (About and updates, and a stopped first start) puts all
+of it, the settings and what the computer is (system, kernel, packages,
+GPUs and drivers, IOMMU, the service's journal) into one zip archive in the
+received files folder. `gse --diagnostics`, or the AppImage with that flag,
+makes the same archive from a terminal when the window does not open.
+
 ## Releases and updates
 
 - A release is a GitHub release of the project, made by the workflow

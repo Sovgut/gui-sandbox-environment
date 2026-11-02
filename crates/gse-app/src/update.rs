@@ -194,6 +194,11 @@ impl crate::Home {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let found = cx.background_executor().spawn(async { newer() }).await;
+            match &found {
+                Ok(Some(release)) => tracing::info!("update available: {}", release.version),
+                Ok(None) => tracing::info!("no newer release"),
+                Err(e) => tracing::warn!("looking for updates: {e:#}"),
+            }
             this.update(cx, |home, cx| {
                 home.update_checked = Some(chrono::Local::now());
                 home.update = match found {
@@ -213,6 +218,7 @@ impl crate::Home {
             return;
         };
         let release = release.clone();
+        tracing::info!("installing {} over {}", release.version, appimage.display());
         self.update = State::Installing(release.version.clone());
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -223,6 +229,7 @@ impl crate::Home {
             this.update(cx, |home, cx| match outcome {
                 Ok(()) => cx.quit(),
                 Err(e) => {
+                    tracing::warn!("installing the update: {e:#}");
                     home.update = State::Failed(format!("{e:#}"));
                     cx.notify();
                 }
@@ -372,6 +379,25 @@ impl crate::Home {
 
     /// App settings, About and updates: a newer release when there is one,
     /// what it brings, and how the app looks for updates.
+    /// When the app last looked for a newer version, or what came of it.
+    fn checked_text(&self) -> String {
+        match &self.update {
+            State::Checking => "Looking for a newer version...".to_owned(),
+            State::Failed(e) => format!("Looking failed: {e}"),
+            _ => self.update_checked.map_or_else(
+                || "Not checked yet".to_owned(),
+                |at| {
+                    let today = chrono::Local::now().date_naive() == at.date_naive();
+                    if today {
+                        format!("Last checked today at {}", at.format("%H:%M"))
+                    } else {
+                        format!("Last checked {}", at.format("%-d %b at %H:%M"))
+                    }
+                },
+            ),
+        }
+    }
+
     pub(crate) fn updates_card(&self, cx: &mut gpui::Context<Self>) -> gpui::Div {
         use crate::settings::{group, row};
         use crate::ui::{Kind, Theme, button};
@@ -387,21 +413,7 @@ impl crate::Home {
         if let Some(release) = release {
             page = page.child(self.release_news(release, appimage, cx));
         }
-        let checked = match &self.update {
-            State::Checking => "Looking for a newer version...".to_owned(),
-            State::Failed(e) => format!("Looking failed: {e}"),
-            _ => self.update_checked.map_or_else(
-                || "Not checked yet".to_owned(),
-                |at| {
-                    let today = chrono::Local::now().date_naive() == at.date_naive();
-                    if today {
-                        format!("Last checked today at {}", at.format("%H:%M"))
-                    } else {
-                        format!("Last checked {}", at.format("%-d %b at %H:%M"))
-                    }
-                },
-            ),
-        };
+        let checked = self.checked_text();
         let (service, service_color) = match self.service {
             crate::client::Match::Same => ("Up to date", Theme::good()),
             crate::client::Match::ServiceOlder if crate::setup::carries_service() => {
@@ -446,6 +458,21 @@ impl crate::Home {
                     "Background service",
                     Some(format!("Protocol {}", gse_protocol::VERSION)),
                     div().text_sm().text_color(service_color).child(service),
+                ),
+                row(
+                    "Diagnostics",
+                    Some(
+                        "The logs of the app, the service, image builds and sandboxes, with what \
+                         this computer is, in one archive to send when something goes wrong"
+                            .to_owned(),
+                    ),
+                    button(
+                        "save-diagnostics",
+                        "Save diagnostics",
+                        Kind::Secondary,
+                        true,
+                        cx.listener(|home, _, _, cx| home.save_diagnostics(cx)),
+                    ),
                 ),
                 row(
                     "Updates",

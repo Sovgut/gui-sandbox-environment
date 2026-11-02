@@ -272,6 +272,13 @@ impl Home {
     }
 
     fn setup_report(&mut self, report: Report, cx: &mut Context<Self>) {
+        match &report {
+            Report::Begun(step) => tracing::info!("preparing: {step}"),
+            Report::Warning(text) => tracing::warn!("preparing: {text}"),
+            Report::Failed(reason) => tracing::warn!("preparing failed: {reason}"),
+            Report::Ended(Ok(())) => tracing::info!("preparing done"),
+            Report::Ended(Err(e)) => tracing::warn!("preparing stopped: {e:#}"),
+        }
         let Some(setup) = self.setup.as_mut() else {
             return;
         };
@@ -445,6 +452,15 @@ impl Home {
                         .text_color(Theme::muted())
                         .child("Your password is asked once, to install the service."),
                 )
+                .when(setup.failed.is_some(), |row| {
+                    row.child(button(
+                        "setup-diagnostics",
+                        "Save diagnostics",
+                        Kind::Secondary,
+                        true,
+                        cx.listener(|home, _, _, cx| home.save_diagnostics(cx)),
+                    ))
+                })
         }
     }
 
@@ -497,7 +513,17 @@ impl Home {
                     setup.warnings.join(" \u{b7} "),
                 )
             }))
-            .child(action);
+            .child(action)
+            .children(self.status.as_ref().map(|status| {
+                div()
+                    .text_sm()
+                    .text_color(if status.error {
+                        Theme::danger()
+                    } else {
+                        Theme::muted()
+                    })
+                    .child(status.text.clone())
+            }));
         Some(
             div()
                 .flex()

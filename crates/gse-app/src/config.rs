@@ -58,7 +58,7 @@ fn home() -> PathBuf {
     std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
 }
 
-fn path() -> PathBuf {
+pub(crate) fn path() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map_or_else(|| home().join(".config"), PathBuf::from)
         .join("gse/app.toml")

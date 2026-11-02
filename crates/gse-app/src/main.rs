@@ -4,9 +4,11 @@
 //! sandboxes start with. Everything goes through the gse service; the app
 //! itself needs no privileges.
 
+mod applog;
 mod client;
 mod config;
 mod devservice;
+mod diagnostics;
 mod flathub;
 mod gpu;
 mod icons;
@@ -425,8 +427,14 @@ impl Home {
     }
 
     fn say(&mut self, text: impl Into<SharedString>, error: bool) {
+        let text = text.into();
+        if error {
+            tracing::warn!("shown: {text}");
+        } else {
+            tracing::info!("shown: {text}");
+        }
         self.status = Some(Status {
-            text: text.into(),
+            text,
             error,
             at: std::time::Instant::now(),
         });
@@ -434,6 +442,9 @@ impl Home {
 
     /// Puts an event worth telling into the status line.
     fn note(&mut self, event: &Event) {
+        if !matches!(event, Event::Journal { .. }) {
+            tracing::info!("event {event:?}");
+        }
         match event {
             Event::Stopped {
                 name,
@@ -470,6 +481,13 @@ impl Home {
                 })
                 .await;
             this.update(cx, |home, cx| {
+                match &service {
+                    Ok(found) if *found != home.service => {
+                        tracing::info!("service: {found:?}");
+                    }
+                    Err(e) => tracing::warn!("service: {e:#}"),
+                    Ok(_) => {}
+                }
                 if let Ok(service) = service {
                     home.service = service;
                     home.restarting &= service != client::Match::Same;
@@ -509,11 +527,15 @@ impl Home {
         work: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        tracing::info!("{key}: {doing}");
         self.busy.insert(key.clone(), doing);
         self.confirm = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let outcome = cx.background_executor().spawn(async move { work() }).await;
+            if let Err(e) = &outcome {
+                tracing::warn!("{key}: {e:#}");
+            }
             this.update(cx, |home, cx| {
                 home.busy.remove(&key);
                 if let Err(e) = outcome {
@@ -534,6 +556,7 @@ impl Home {
         request: Request,
         cx: &mut Context<Self>,
     ) {
+        tracing::info!("request {request:?}");
         self.run(key, doing, move || client::command(&request), cx);
     }
 
@@ -568,6 +591,7 @@ impl Home {
     /// Shows the screen of `name`, which must be running with its screen
     /// on the host.
     fn open_screen(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        tracing::info!("opening the screen of {name}");
         let access = self
             .environments
             .iter()
@@ -611,7 +635,8 @@ impl Home {
 
     /// Leaves the screen: keys go back to the app and the pointer is free.
     fn close_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.screen.take().is_some() {
+        if let Some((name, _)) = self.screen.take() {
+            tracing::info!("leaving the screen of {name}");
             self.sidebar_collapsed = false;
             window
                 .set_raw_key_handler(None::<fn(&gpui::RawKeyEvent, &mut Window, &mut App) -> bool>);
@@ -1286,6 +1311,17 @@ fn preview_desktop(name: &str) -> gpui::AnyElement {
 fn main() {
     if preview::state().as_deref() == Some("list") {
         print!("{}", preview::list());
+        return;
+    }
+    applog::init();
+    if std::env::args().any(|a| a == "--diagnostics") {
+        match diagnostics::save() {
+            Ok(path) => println!("{}", path.display()),
+            Err(e) => {
+                eprintln!("diagnostics were not saved: {e:#}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
     gpu::stay_off_reserved_gpu();

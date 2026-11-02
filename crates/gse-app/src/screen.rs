@@ -103,7 +103,12 @@ impl Screen {
 
     fn sent(&mut self, outcome: Result<()>) {
         if let Err(e) = outcome {
-            self.error = Some(format!("{e:#}"));
+            let text = format!("{e:#}");
+            // Input goes out many times a second; one line per new error.
+            if self.error.as_deref() != Some(&text) {
+                tracing::warn!("screen input: {text}");
+            }
+            self.error = Some(text);
         }
     }
 
@@ -142,6 +147,7 @@ impl Screen {
     }
 
     fn set_captured(&mut self, captured: bool, window: &mut Window) {
+        tracing::info!("mouse {}", if captured { "captured" } else { "freed" });
         self.captured = captured;
         self.residue = (0.0, 0.0);
         window.set_pointer_lock(captured);

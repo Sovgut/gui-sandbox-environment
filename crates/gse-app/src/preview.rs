@@ -19,10 +19,14 @@ use crate::text_input::TextInput;
 use crate::{AppTab, Home, Modal, Page, client};
 
 /// Every state a preview can show, with what it is.
-pub const STATES: [(&str, &str); 28] = [
+pub const STATES: [(&str, &str); 29] = [
     ("main", "a stopped sandbox, Activity tab"),
     ("setup", "first start: preparing the computer"),
     ("setup-failed", "first start: a step failed"),
+    (
+        "setup-packages",
+        "first start: installing what sandboxes run on",
+    ),
     ("tour-welcome", "welcome tour, step 1"),
     ("tour-first", "welcome tour, step 2: the first sandbox"),
     ("tour-play", "welcome tour, step 3: press Play"),
@@ -323,18 +327,31 @@ impl Home {
         }
     }
 
+    /// The first-start page, preparing or stopped.
+    fn preview_setup(&mut self, state: &str) {
+        if state == "setup-packages" {
+            self.setup = Some(Setup {
+                step: Step::Check,
+                running: true,
+                warnings: Vec::new(),
+                failed: None,
+                activity: Some("installing what sandboxes run on: QEMU, the UEFI firmware, passt"),
+            });
+            return;
+        }
+        self.setup = Some(Setup {
+            step: Step::System,
+            running: state == "setup",
+            warnings: Vec::new(),
+            failed: (state == "setup-failed")
+                .then(|| "listing the cloud images of Fedora 45: status code 403".to_owned()),
+            activity: None,
+        });
+    }
+
     fn show(&mut self, state: &str, cx: &mut Context<Self>) {
         match state {
-            "setup" | "setup-failed" => {
-                self.setup = Some(Setup {
-                    step: Step::System,
-                    running: state == "setup",
-                    warnings: Vec::new(),
-                    failed: (state == "setup-failed").then(|| {
-                        "listing the cloud images of Fedora 45: status code 403".to_owned()
-                    }),
-                });
-            }
+            "setup" | "setup-failed" | "setup-packages" => self.preview_setup(state),
             "tour-welcome" => self.tour = Some(Tour::Welcome),
             "tour-first" => {
                 self.start_tour(cx);

@@ -32,6 +32,7 @@ pub enum Icon {
     Monitor,
     Fullscreen,
     ExitFullscreen,
+    Loader,
     WindowMinimize,
     WindowMaximize,
     WindowRestore,
@@ -39,7 +40,7 @@ pub enum Icon {
 }
 
 impl Icon {
-    const ALL: [Self; 26] = [
+    const ALL: [Self; 27] = [
         Self::Settings,
         Self::Sliders,
         Self::Play,
@@ -62,6 +63,7 @@ impl Icon {
         Self::Monitor,
         Self::Fullscreen,
         Self::ExitFullscreen,
+        Self::Loader,
         Self::WindowMinimize,
         Self::WindowMaximize,
         Self::WindowRestore,
@@ -92,6 +94,7 @@ impl Icon {
             Self::Monitor => "monitor",
             Self::Fullscreen => "fullscreen",
             Self::ExitFullscreen => "exit-fullscreen",
+            Self::Loader => "loader",
             Self::WindowMinimize => "window-minimize",
             Self::WindowMaximize => "window-maximize",
             Self::WindowRestore => "window-restore",
@@ -144,6 +147,8 @@ impl Icon {
             }
             Self::Fullscreen => r#"<path d="M4 9V4H9M20 9V4H15M4 15V20H9M20 15V20H15"/>"#,
             Self::ExitFullscreen => r#"<path d="M9 4V9H4M15 4V9H20M4 15H9V20M20 15H15V20"/>"#,
+            // Three quarters of a ring, turned while something runs.
+            Self::Loader => r#"<path d="M12 3A9 9 0 1 1 3 12"/>"#,
             // The window buttons, drawn the way KDE's Breeze draws them.
             Self::WindowMinimize => r#"<path d="M6 9.5L12 15.5L18 9.5"/>"#,
             Self::WindowMaximize => r#"<path d="M6 14.5L12 8.5L18 14.5"/>"#,

@@ -443,7 +443,9 @@ impl Home {
     /// place of the app's mark.
     fn sidebar_rail(&self, full_screen: bool, cx: &mut Context<Self>) -> Div {
         let top = if full_screen {
-            div().mb_2().child(leave_full_screen("rail-leave-full", 44.))
+            div()
+                .mb_2()
+                .child(leave_full_screen("rail-leave-full", 44.))
         } else {
             div().mb_2().child(mark(30.))
         };

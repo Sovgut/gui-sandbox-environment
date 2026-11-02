@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, Result, bail};
 use futures::StreamExt as _;
-use gpui::{Context, Div, FontWeight, div, prelude::*, px};
+use gpui::{AnimationExt as _, Context, Div, FontWeight, div, prelude::*, px};
 use gse_protocol::BASE_IMAGE;
 
 use crate::client;
@@ -66,6 +66,8 @@ pub struct Setup {
     pub warnings: Vec<String>,
     /// Why the last attempt stopped.
     pub failed: Option<String>,
+    /// What the step in progress is doing now, as the install reports it.
+    pub activity: Option<&'static str>,
 }
 
 /// What the service install reports, line by line.
@@ -90,10 +92,11 @@ const TOOL_FILES: [&str; 2] = [
 /// Whether something the service runs is missing, which the install puts
 /// in place.
 fn tools_missing() -> bool {
-    TOOLS
-        .iter()
-        .any(|tool| !TOOL_DIRS.iter().any(|dir| Path::new(dir).join(tool).exists()))
-        || TOOL_FILES.iter().any(|file| !Path::new(file).exists())
+    TOOLS.iter().any(|tool| {
+        !TOOL_DIRS
+            .iter()
+            .any(|dir| Path::new(dir).join(tool).exists())
+    }) || TOOL_FILES.iter().any(|file| !Path::new(file).exists())
 }
 
 /// Whether the computer still needs preparing, and from which step. A
@@ -133,6 +136,22 @@ fn stage() -> Result<PathBuf> {
     Ok(to)
 }
 
+/// Where the install's log goes: what it ran and what dnf or rpm-ostree
+/// said, for when it stops or stalls. Each install replaces the last one's.
+pub fn install_log_path() -> PathBuf {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    cache.join("gse").join("install.log")
+}
+
+fn install_log() -> Stdio {
+    let path = install_log_path();
+    path.parent().map(std::fs::create_dir_all);
+    std::fs::File::create(&path).map_or_else(|_| Stdio::null(), Stdio::from)
+}
+
 /// Runs the install through polkit and hands each line it reports to
 /// `report`.
 fn install(report: &futures::channel::mpsc::UnboundedSender<Report>) -> Result<()> {
@@ -141,7 +160,7 @@ fn install(report: &futures::channel::mpsc::UnboundedSender<Report>) -> Result<(
         .arg(staged.join("gse-service"))
         .arg("install")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(install_log())
         .spawn()
         .context("starting pkexec")?;
     let stdout = child.stdout.take().context("the install's output")?;
@@ -258,11 +277,21 @@ impl Home {
         };
         match report {
             Report::Begun(step) => {
-                setup.step = match step.as_str() {
-                    "packages" | "check" => Step::Check,
-                    "system" => Step::System,
-                    "launchers" => Step::Launchers,
-                    _ => Step::Service,
+                (setup.step, setup.activity) = match step.as_str() {
+                    "packages" => (
+                        Step::Check,
+                        Some("installing what sandboxes run on: QEMU, the UEFI firmware, passt"),
+                    ),
+                    "check" => (
+                        Step::Check,
+                        Some("checking virtualization and the graphics card"),
+                    ),
+                    "system" => (Step::System, None),
+                    "launchers" => (Step::Launchers, None),
+                    "files" => (Step::Service, Some("writing its settings")),
+                    "account" => (Step::Service, Some("creating its network account")),
+                    "service" => (Step::Service, Some("starting it")),
+                    _ => (Step::Service, Some("copying the service")),
                 };
             }
             Report::Warning(text) => setup.warnings.push(text),
@@ -321,6 +350,22 @@ impl Home {
                     )
                 } else if current && setup.failed.is_some() {
                     m.bg(Theme::danger())
+                } else if current && setup.running {
+                    m.child(
+                        ui::kit_icon(Icon::Loader)
+                            .size(px(22.))
+                            .text_color(Theme::accent())
+                            .with_animation(
+                                "setup-working",
+                                gpui::Animation::new(std::time::Duration::from_millis(900))
+                                    .repeat(),
+                                |icon, delta| {
+                                    icon.transform(gpui::Transformation::rotate(gpui::percentage(
+                                        delta,
+                                    )))
+                                },
+                            ),
+                    )
                 } else if current {
                     m.border_2()
                         .border_color(Theme::accent())
@@ -331,6 +376,7 @@ impl Home {
             });
         let detail = if current && setup.running {
             self.build_detail(step)
+                .or_else(|| setup.activity.map(str::to_owned))
                 .map_or_else(|| text.to_owned(), |d| format!("{text} Now: {d}."))
         } else {
             text.to_owned()
@@ -433,12 +479,17 @@ impl Home {
             )
             .children(self.update_notice(cx))
             .child(steps)
-            .children(
-                setup
-                    .failed
-                    .clone()
-                    .map(|reason| ui::notice(Theme::danger(), "Preparing stopped", reason)),
-            )
+            .children(setup.failed.clone().map(|reason| {
+                let reason = if setup.step <= Step::Service {
+                    format!(
+                        "{reason}. The details are in {}.",
+                        install_log_path().display()
+                    )
+                } else {
+                    reason
+                };
+                ui::notice(Theme::danger(), "Preparing stopped", reason)
+            }))
             .children((!setup.warnings.is_empty()).then(|| {
                 ui::notice(
                     Theme::warning(),

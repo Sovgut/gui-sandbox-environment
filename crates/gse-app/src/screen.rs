@@ -307,7 +307,9 @@ impl Render for Screen {
             .bg(gpui::black())
             // The guest draws its own pointer into the frame, in the shape
             // its programs ask for; the host's would be a second one.
-            .when(self.image.is_some(), |view| view.cursor(gpui::CursorStyle::Hidden))
+            .when(self.image.is_some(), |view| {
+                view.cursor(gpui::CursorStyle::Hidden)
+            })
             .child(view)
             .on_mouse_move(cx.listener(|screen, event: &MouseMoveEvent, _, _| {
                 if screen.captured {

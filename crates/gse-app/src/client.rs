@@ -87,7 +87,11 @@ pub fn hello() -> Result<Match> {
     let mut version = None;
     let mut build = None;
     let outcome = call(&Request::Hello, |reply| {
-        if let Reply::Hello { version: v, build: b } = reply {
+        if let Reply::Hello {
+            version: v,
+            build: b,
+        } = reply
+        {
             version = Some(v);
             build = Some(b);
         }

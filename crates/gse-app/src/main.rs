@@ -287,6 +287,7 @@ impl Home {
             running: false,
             warnings: Vec::new(),
             failed: None,
+            activity: None,
         });
         // The tour follows preparing, which starts it when it ends.
         let tour = (!app_config.tour_done && setup.is_none()).then_some(onboarding::Tour::Welcome);
@@ -1049,59 +1050,53 @@ impl Home {
     fn service_notice(&self, cx: &mut Context<Self>) -> Option<Div> {
         match self.service {
             client::Match::Same => None,
-            client::Match::ServiceNewer => {
-                Some(ui::notice(
+            client::Match::ServiceNewer => Some(ui::notice(
+                Theme::warning(),
+                "This app is out of date",
+                "The gse service is newer than this app. Install the current version of the app.",
+            )),
+            client::Match::ServiceOlder if setup::carries_service() => Some(
+                ui::notice(
                     Theme::warning(),
-                    "This app is out of date",
-                    "The gse service is newer than this app. Install the current version of the app.",
-                ))
-            }
-            client::Match::ServiceOlder if setup::carries_service() => {
-                Some(
-                    ui::notice(
-                        Theme::warning(),
-                        "The service needs an update",
-                        "The gse service is older than this app. Updating installs the one this \
+                    "The service needs an update",
+                    "The gse service is older than this app. Updating installs the one this \
                          app carries and asks for your password; a running sandbox and an image \
                          build are stopped first.",
-                    )
-                    .child(button(
-                        "update-service",
-                        if self.restarting {
-                            "Updating..."
-                        } else {
-                            "Update service"
-                        },
-                        Kind::Primary,
-                        !self.restarting,
-                        cx.listener(|home, _, _, cx| home.update_service(cx)),
-                    )),
                 )
-            }
-            client::Match::ServiceOlder => {
-                Some(
-                    ui::notice(
-                        Theme::warning(),
-                        "The service needs a restart",
-                        "The gse service still runs an older version. Restarting it loads the \
+                .child(button(
+                    "update-service",
+                    if self.restarting {
+                        "Updating..."
+                    } else {
+                        "Update service"
+                    },
+                    Kind::Primary,
+                    !self.restarting,
+                    cx.listener(|home, _, _, cx| home.update_service(cx)),
+                )),
+            ),
+            client::Match::ServiceOlder => Some(
+                ui::notice(
+                    Theme::warning(),
+                    "The service needs a restart",
+                    "The gse service still runs an older version. Restarting it loads the \
                          current one; a running sandbox and an image build are stopped first.",
-                    )
-                    .child(button(
-                        "restart-service",
-                        if self.restarting {
-                            "Restarting..."
-                        } else {
-                            "Restart service"
-                        },
-                        Kind::Primary,
-                        !self.restarting,
-                        cx.listener(|home, _, _, cx| {
-                            home.restarting = true;
-                            home.request("service".into(), "", Request::Restart, cx);
-                        }),
-                    )),
                 )
-            }
+                .child(button(
+                    "restart-service",
+                    if self.restarting {
+                        "Restarting..."
+                    } else {
+                        "Restart service"
+                    },
+                    Kind::Primary,
+                    !self.restarting,
+                    cx.listener(|home, _, _, cx| {
+                        home.restarting = true;
+                        home.request("service".into(), "", Request::Restart, cx);
+                    }),
+                )),
+            ),
         }
     }
 

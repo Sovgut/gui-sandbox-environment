@@ -118,22 +118,26 @@ impl VmSpec {
             ),
             format!("file={},if=virtio,format=qcow2", self.disk.display()),
         ];
-        if let Some(home) = &self.home_disk {
-            drives.push(format!(
-                "file={},if=virtio,format=qcow2,serial=gse-home",
-                home.display()
-            ));
-        }
         for disk in &self.read_only_disks {
             drives.push(format!(
                 "file={},if=virtio,format=raw,readonly=on",
                 disk.display()
             ));
         }
-        drives
+        let mut args: Vec<String> = drives
             .into_iter()
             .flat_map(|drive| ["-drive".to_owned(), drive])
-            .collect()
+            .collect();
+        // The serial belongs to the device: `-drive` no longer takes one.
+        if let Some(home) = &self.home_disk {
+            args.extend([
+                "-drive".to_owned(),
+                format!("if=none,id=home,file={},format=qcow2", home.display()),
+                "-device".to_owned(),
+                "virtio-blk-pci,drive=home,serial=gse-home".to_owned(),
+            ]);
+        }
+        args
     }
 
     /// The command line, program first.

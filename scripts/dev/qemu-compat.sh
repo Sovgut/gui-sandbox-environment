@@ -62,6 +62,7 @@ grep -vE '^(passt|nft) ' /lines | while read -r kind line; do
     cp /usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2 "$dir/OVMF_VARS.qcow2"
     truncate -s 1M "$dir/seed.img"
     truncate -s 128M "$dir/screen"
+    printf 'layouts=us,ru\noptions=grp:win_space_toggle\n' > "$dir/keyboard"
     # passt drops to nobody, who must reach the socket's folder.
     $(echo "$passt_line" | sed "s|@PASST@|$dir/passt|") > "$dir/passt.out" 2>&1 &
     passt=$!

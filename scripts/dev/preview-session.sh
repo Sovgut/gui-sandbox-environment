@@ -99,7 +99,9 @@ if [ ! -x "$app" ]; then
 fi
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+# A FUSE mount a service left in the nested runtime folder would stop the
+# removal.
+trap 'fusermount3 -uz "$work/run/doc" 2>/dev/null || true; rm -rf "$work"' EXIT
 # A settings folder of its own: the welcome tour and the user's settings
 # must not show.
 mkdir -p "$work/config/gse"
@@ -128,11 +130,16 @@ EOF
 } > "$work/actions"
 
 # The nested bus starts its services with this environment: without the
-# desktop's display they cannot reach the desktop. KWin's output goes to a
-# file, never a pipe: services started on the nested bus keep a pipe open
+# desktop's display they cannot reach the desktop, and with a runtime folder
+# of their own they cannot take over the desktop's sockets and mounts (the
+# document portal mounts /run/user/<uid>/doc and unmounts it when it ends,
+# which leaves the desktop's Flatpak apps without it). KWin's output goes to
+# a file, never a pipe: services started on the nested bus keep a pipe open
 # after KWin exits.
 unset WAYLAND_DISPLAY DISPLAY
-GSE_SESSION_WORK=$work GSE_SESSION_STATE=$state GSE_PREVIEW_LOOK=$look \
+mkdir -m 0700 "$work/run"
+XDG_RUNTIME_DIR=$work/run \
+    GSE_SESSION_WORK=$work GSE_SESSION_STATE=$state GSE_PREVIEW_LOOK=$look \
     GSE_SESSION_WAIT=$wait GSE_SESSION_APP=$app \
     QT_FORCE_STDERR_LOGGING=1 QT_LOGGING_RULES='js.debug=true' \
     dbus-run-session -- kwin_wayland --virtual --no-lockscreen \

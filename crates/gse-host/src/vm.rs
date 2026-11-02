@@ -274,8 +274,10 @@ impl VmSpec {
                     "socket,id=input,path={},server=on,wait=off",
                     socket.display()
                 ),
-                "-object",
-                "monitor-qmp,id=input-monitor,chardev=input",
+                // `-mon`, not `-object monitor-qmp`: the object exists from
+                // QEMU 11 only, and Fedora 44 ships 10.2.
+                "-mon",
+                "chardev=input,mode=control",
             ]);
         }
         args
@@ -333,6 +335,15 @@ mod tests {
         assert!(objects.contains(
             &"input-linux,id=host-input1,evdev=/dev/input/event5,grab_all=on,repeat=off,grab-toggle=ctrl-ctrl"
         ));
+    }
+
+    #[test]
+    fn the_input_monitor_works_on_older_qemu() {
+        let mut spec = spec();
+        spec.input_socket = Some("/run/gse/proto.input".into());
+        let args = spec.command_line();
+        assert_eq!(after(&args, "-mon"), ["chardev=input,mode=control"]);
+        assert!(!args.iter().any(|a| a.contains("monitor-qmp")));
     }
 
     fn after<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {

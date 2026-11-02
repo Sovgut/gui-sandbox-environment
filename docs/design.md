@@ -364,6 +364,12 @@ voice activation does.
   and moves the result to `/var/lib/gse/images/<preset>.qcow2` only once the
   build passes; it reports each provisioning step to the app as it reaches
   the console, can stop a build, and builds only while no environment runs.
+  The service marks `/var/lib/gse/images`, `environments` and `builds`
+  no-copy-on-write where the file system has the mark (btrfs), so the
+  images and disks made there from then on do not fragment with every
+  write, and runs the disks of a VM past the host's page cache
+  (`cache=none`) when they carry the mark; direct I/O into a btrfs file with
+  checksums can store a block whose checksum no longer matches.
   It tells the app when the build in progress started, and keeps the last
   failed build of each image, the base image's included, with the step it
   reached and its console in `/var/log/gse/builds`, as
@@ -425,14 +431,24 @@ version. A preset installs it as an `appimage` entry.
   single GPU the app is gone while the environment owns the screen, so the
   service carries files itself. Sent in while the environment is stopped,
   files wait in its folder (`inbox-waiting/`) and go into the Inbox once it
-  is up. While a single-GPU environment runs, the service takes what is new
+  is up; the agent then shows them arriving on the guest's desktop (a
+  window with a bar, the file and the time left, from `/run/gse/incoming`
+  the agent writes) and a notification once they are in. A send copies at
+  the lowest best-effort I/O priority and nice 10, and waits for every
+  32 MiB it wrote to be on disk, so it never leaves gigabytes for the
+  kernel to flush at once; on btrfs such a flush stalls every program that
+  touches the disk. `CancelTransfer` stops a send at its next part: whole
+  files stay, the one under way goes. While a single-GPU environment runs, the service takes what is new
   in its Outbox every 20 s, past the same checks as a take, into a spool of
   the lines a take sends (`outbox-taken`); the app's Files panel lists and
   takes it after the run like a live Outbox.
 - **The host always initiates**; the agent only answers. The protocol is
   JSON lines (`gse_protocol::agent`): every call carries an id its answers
   repeat, lines are capped, a file travels in base64 chunks of 32 KiB with
-  its size and SHA-256, and listings and files have hard limits.
+  its size and SHA-256, and listings and files have hard limits. The
+  host speaks to agents from version 1 on; `Incoming`, which announces the
+  files kept for a start, goes only to version 2 and later, so
+  environments made from an older image keep working without the window.
 - The agent runs as **root** (`gse-agent.service`), since the port's device
   node belongs to root: a program of `guest` cannot open it and pose as the
   agent. It lists the processes of `guest` by the unit that started them
@@ -618,7 +634,9 @@ one. One window:
   holds every other sandbox too; "Build its apps" when nothing builds them.
   A sandbox never played has a plain cover with its set's title alone over
   its name. Play is greyed out while any image builds, another sandbox's
-  set included, and while the service updates or restarts.
+  set included, and while the service updates or restarts; while files are
+  sent into a sandbox its Play gives way to the send's progress and Cancel,
+  since with one GPU nothing would say whether they arrived.
   Under it the facts: internet as a switch that applies at once, graphics
   (leaving the host while it starts), screen, and the way into its
   settings. Under them the Activity, Programs and Files tabs. A tab's list
@@ -646,7 +664,11 @@ one. One window:
   with a way to its folder. The list marks the files whose name keeps them
   inside and N leaves them out; the checks of how a file starts show only
   in the take. "Choose files", "Choose a folder" or files dropped on the
-  panel go into the Inbox (see "Guest agent and file bridge").
+  panel go into the Inbox (see "Guest agent and file bridge"). A send or a
+  take under way shows how many bytes of how many went, the time left and a
+  bar (a send from the service's `Sending` reports every quarter second, a
+  take from the chunks it receives against the Outbox's listed sizes), with
+  Cancel: a take writes nothing, a send keeps the files that went in whole.
 - **The screen** of a running sandbox replaces the page: a bar with a way
   back to the sandbox's page ("Show screen" there returns), its name, how
   long it has run since its desktop came up, the mouse hint, the internet

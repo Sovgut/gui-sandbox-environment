@@ -337,6 +337,41 @@ pub const STATES: &[State] = &[
         home.busy
             .insert("demo/files".into(), crate::transfer::TAKING);
     }),
+    state("files-sending", "files being sent in", |home, cx| {
+        files(home, cx);
+        home.busy
+            .insert(format!("{}/files", data::DEMO), crate::transfer::SENDING);
+        home.flows.insert(
+            data::DEMO.into(),
+            crate::transfer::Flow::at(crate::transfer::SENDING, 412_000_000, 1_200_000_000, 120),
+        );
+    }),
+    state("files-taking", "files being taken out", |home, cx| {
+        files(home, cx);
+        home.busy
+            .insert(format!("{}/files", data::DEMO), crate::transfer::TAKING);
+        home.flows.insert(
+            data::DEMO.into(),
+            crate::transfer::Flow::at(crate::transfer::TAKING, 1_400_000_000, 3_200_000_000, 60),
+        );
+    }),
+    state(
+        "sending",
+        "a stopped sandbox waiting for files sent in",
+        |home, _| {
+            home.busy
+                .insert(format!("{}/files", data::DEMO), crate::transfer::SENDING);
+            home.flows.insert(
+                data::DEMO.into(),
+                crate::transfer::Flow::at(
+                    crate::transfer::SENDING,
+                    412_000_000,
+                    1_200_000_000,
+                    120,
+                ),
+            );
+        },
+    ),
     state("files-sent", "files just sent in", |home, cx| {
         files(home, cx);
         home.moved = Some(Moved::Sent(2));

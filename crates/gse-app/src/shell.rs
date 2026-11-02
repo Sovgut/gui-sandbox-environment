@@ -959,6 +959,15 @@ impl Home {
                     }),
                 ))
                 .into_any_element()
+        } else if let Some(sending) = self
+            .flows
+            .get(&name)
+            .filter(|flow| flow.doing == crate::transfer::SENDING)
+            .and(self.flow_view(&name, "cancel-send-cover", cx))
+        {
+            // Files on their way in hold the start: with one GPU the app is
+            // gone once it runs, and nothing would say they arrived.
+            div().w(px(400.)).child(sending).into_any_element()
         } else {
             // Nothing starts while an image builds or the service updates.
             let free =
@@ -1549,6 +1558,13 @@ impl Home {
     /// Plays `name`: asks first when it would stop another sandbox or take
     /// the monitor away.
     pub(crate) fn play(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self
+            .flows
+            .get(name)
+            .is_some_and(|flow| flow.doing == crate::transfer::SENDING)
+        {
+            return;
+        }
         if self.tour_points_at_play() {
             self.end_tour(cx);
         }

@@ -347,6 +347,9 @@ struct Home {
     moved: Option<transfer::Moved>,
     /// The archive each sandbox's Outbox last went into, by its name.
     last_taken: BTreeMap<String, std::path::PathBuf>,
+    /// The move of files under way for each sandbox: how far it got and
+    /// the flag that stops it.
+    flows: BTreeMap<String, transfer::Flow>,
     app_config: config::AppConfig,
     update: update::State,
     /// The update banner was put off with Later until the app starts again.
@@ -458,6 +461,7 @@ impl Home {
             files: None,
             moved: None,
             last_taken: BTreeMap::new(),
+            flows: BTreeMap::new(),
             app_config,
             update: update::State::Idle,
             update_later: false,

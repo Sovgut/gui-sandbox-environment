@@ -56,6 +56,22 @@ pub fn command(request: &Request) -> Result<()> {
     call(request, |reply| eprintln!("unexpected reply: {reply:?}"))
 }
 
+/// Sends files in with `request`, telling `progress` the bytes done and in
+/// all as the service reports them. A send that was stopped gives how many
+/// of its files went in whole, and how many it had.
+pub fn send_files(
+    request: &Request,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<Option<(usize, usize)>> {
+    let mut stopped = None;
+    call(request, |reply| match reply {
+        Reply::Sending { done, total } => progress(done, total),
+        Reply::Stopped { copied, files } => stopped = Some((copied, files)),
+        reply => eprintln!("unexpected reply: {reply:?}"),
+    })?;
+    Ok(stopped)
+}
+
 pub fn environments() -> Result<Vec<Environment>> {
     let mut found = None;
     call(&Request::List, |reply| {

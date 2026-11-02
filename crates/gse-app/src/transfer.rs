@@ -45,11 +45,92 @@ pub enum Moved {
     TakeFailed(String),
     /// Sending files in failed, for this reason.
     SendFailed(String),
+    /// Taking files out was stopped; nothing was written.
+    TakeStopped,
+    /// Sending files in was stopped: `copied` of `files` went in whole.
+    SendStopped { copied: usize, files: usize },
 }
+
+/// A move of files under way: how far it got, and the flag that stops it.
+pub(crate) struct Flow {
+    /// What it is, [`TAKING`] or [`SENDING`].
+    pub(crate) doing: &'static str,
+    pub(crate) done: u64,
+    pub(crate) total: u64,
+    since: std::time::Instant,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Flow {
+    fn new(doing: &'static str, total: u64) -> Self {
+        Self {
+            doing,
+            done: 0,
+            total,
+            since: std::time::Instant::now(),
+            stop: std::sync::Arc::default(),
+        }
+    }
+
+    /// A flow `elapsed` seconds old, for previews.
+    pub(crate) fn at(doing: &'static str, done: u64, total: u64, elapsed: u64) -> Self {
+        let mut flow = Self::new(doing, total);
+        flow.done = done;
+        flow.since = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(elapsed))
+            .unwrap_or(flow.since);
+        flow
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `412 MB of 1.2 GB · about 2 minutes left`; the time once there is
+    /// a pace to tell it by.
+    fn text(&self) -> String {
+        let mut text = format!(
+            "{}: {} of {}",
+            self.doing,
+            size_text(self.done.min(self.total)),
+            size_text(self.total)
+        );
+        let elapsed = self.since.elapsed().as_secs_f64();
+        if self.done > 0 && elapsed >= 3. && self.done < self.total {
+            #[allow(clippy::cast_precision_loss)] // a pace
+            let left = (self.total - self.done) as f64 / (self.done as f64 / elapsed);
+            text.push_str(" \u{b7} ");
+            text.push_str(&crate::setup::time_left(left));
+        }
+        text
+    }
+
+    /// How much of it is done, from 0 to 1.
+    fn share(&self) -> f32 {
+        if self.total == 0 {
+            return 0.;
+        }
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // a share
+        let share = (self.done as f64 / self.total as f64).clamp(0., 1.) as f32;
+        share
+    }
+}
+
+/// The stop of a take its Cancel asked for.
+#[derive(Debug)]
+struct TakeCancelled;
+
+impl std::fmt::Display for TakeCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the take was stopped")
+    }
+}
+
+impl std::error::Error for TakeCancelled {}
 
 /// What the busy entry of a sandbox's files says while a move runs.
 pub(crate) const TAKING: &str = "Taking files out";
-const SENDING: &str = "Sending files in";
+pub(crate) const SENDING: &str = "Sending files in";
 
 /// `count` of `one`, in its plural from 2 on: `1 file`, `2 files`.
 fn counted(count: usize, one: &str, many: &str) -> String {
@@ -72,7 +153,12 @@ fn plain(path: &str) -> bool {
 /// Takes the Outbox of `name` into a zip archive in `folder`. Files arrive
 /// one by one into a staging folder beside the archive, since one can still
 /// be refused after it began; the archive holds those that came whole.
-fn take_into(name: &str, folder: &Path) -> Result<Moved> {
+fn take_into(
+    name: &str,
+    folder: &Path,
+    progress: &mut dyn FnMut(u64),
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<Moved> {
     fs::create_dir_all(folder).with_context(|| format!("{}", folder.display()))?;
     let staging = folder.join(format!(".gse-taking-{name}-{}", std::process::id()));
     fs::remove_dir_all(&staging).ok();
@@ -81,6 +167,9 @@ fn take_into(name: &str, folder: &Path) -> Result<Moved> {
     let mut taken: Vec<String> = Vec::new();
     let mut refused = Vec::new();
     let outcome = client::take(name, |part| {
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(TakeCancelled.into());
+        }
         match part {
             Taking::Start { path } => {
                 if !plain(&path) {
@@ -91,11 +180,14 @@ fn take_into(name: &str, folder: &Path) -> Result<Moved> {
                 current = Some((path.clone(), File::create_new(&target)?));
                 taken.push(path);
             }
-            Taking::Chunk(bytes) => current
-                .as_mut()
-                .context("the service sent bytes of no file")?
-                .1
-                .write_all(&bytes)?,
+            Taking::Chunk(bytes) => {
+                current
+                    .as_mut()
+                    .context("the service sent bytes of no file")?
+                    .1
+                    .write_all(&bytes)?;
+                progress(bytes.len() as u64);
+            }
             Taking::Refused { path, reason } => {
                 if current.as_ref().is_some_and(|(p, _)| *p == path) {
                     current = None;
@@ -108,6 +200,13 @@ fn take_into(name: &str, folder: &Path) -> Result<Moved> {
         Ok(())
     });
     drop(current);
+    if outcome
+        .as_ref()
+        .is_err_and(|e| e.downcast_ref::<TakeCancelled>().is_some())
+    {
+        fs::remove_dir_all(&staging).ok();
+        return Ok(Moved::TakeStopped);
+    }
     let archive = outcome.and_then(|()| {
         if taken.is_empty() {
             return Ok(None);
@@ -166,6 +265,18 @@ fn section(title: &'static str, (before, strong, after): (&str, &str, &str)) -> 
 /// A line under a part of the files panel that says how a move went.
 fn outcome(color: Hsla, text: String) -> Div {
     div().text_xs().text_color(color).child(text)
+}
+
+/// A bar `share` full, from 0 to 1.
+fn bar(share: f32) -> Div {
+    div().h(px(6.)).rounded(px(3.)).bg(Theme::track()).child(
+        div()
+            .h_full()
+            .w(relative(share))
+            .rounded_l(px(3.))
+            .when(share >= 1., |fill| fill.rounded_r(px(3.)))
+            .bg(Theme::accent()),
+    )
 }
 
 /// An item of a list: a disc in the gutter, level with its first line.
@@ -358,7 +469,7 @@ impl Home {
                     );
                 }
             }
-            Moved::Sent(_) => {}
+            Moved::Sent(_) | Moved::TakeStopped | Moved::SendStopped { .. } => {}
             Moved::TakeFailed(why) => self
                 .tell(crate::Toast::error("Taking files out failed", sentence(&why)).about(name)),
             Moved::SendFailed(why) => self
@@ -367,15 +478,67 @@ impl Home {
     }
 
     fn take_files(&mut self, name: &str, cx: &mut Context<Self>) {
+        let total = match &self.files {
+            Some((shown, Ok(files))) if shown == name => files
+                .outbox
+                .iter()
+                .filter(|f| gse_protocol::kept_by_name(&f.path).is_none())
+                .map(|f| f.size)
+                .sum(),
+            _ => 0,
+        };
+        let flow = Flow::new(TAKING, total);
+        let stop = flow.stop.clone();
+        let report = self.follow_flow(name, flow, cx);
         let (owner, folder) = (name.to_owned(), self.app_config.received.clone());
         self.move_files(
             name,
             TAKING,
             move || {
-                take_into(&owner, &folder).unwrap_or_else(|e| Moved::TakeFailed(format!("{e:#}")))
+                let mut taken = 0;
+                let mut progress = |part| {
+                    taken += part;
+                    report.unbounded_send((taken, total)).ok();
+                };
+                take_into(&owner, &folder, &mut progress, &stop)
+                    .unwrap_or_else(|e| Moved::TakeFailed(format!("{e:#}")))
             },
             cx,
         );
+    }
+
+    /// Notes `flow` as the move under way for `name`; the sender it gives
+    /// takes the bytes moved and in all as they go. The flow ends when the
+    /// sender is dropped.
+    fn follow_flow(
+        &mut self,
+        name: &str,
+        flow: Flow,
+        cx: &mut Context<Self>,
+    ) -> futures::channel::mpsc::UnboundedSender<(u64, u64)> {
+        self.flows.insert(name.to_owned(), flow);
+        let (report, mut reports) = futures::channel::mpsc::unbounded::<(u64, u64)>();
+        let owner = name.to_owned();
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt as _;
+            while let Some((done, total)) = reports.next().await {
+                this.update(cx, |home, cx| {
+                    if let Some(flow) = home.flows.get_mut(&owner) {
+                        flow.done = done;
+                        flow.total = total;
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+            this.update(cx, |home, cx| {
+                home.flows.remove(&owner);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        report
     }
 
     /// Puts `paths` of this computer into the Inbox of `name`.
@@ -385,15 +548,100 @@ impl Home {
             name: name.to_owned(),
             paths,
         };
+        let report = self.follow_flow(name, Flow::new(SENDING, 0), cx);
         self.move_files(
             name,
             SENDING,
-            move || match client::command(&request) {
-                Ok(()) => Moved::Sent(count),
-                Err(e) => Moved::SendFailed(format!("{e:#}")),
+            move || {
+                let sent = client::send_files(&request, |done, total| {
+                    report.unbounded_send((done, total)).ok();
+                });
+                match sent {
+                    Ok(None) => Moved::Sent(count),
+                    Ok(Some((copied, files))) => Moved::SendStopped { copied, files },
+                    Err(e) => Moved::SendFailed(format!("{e:#}")),
+                }
             },
             cx,
         );
+    }
+
+    /// Stops the move of files under way for `name`. A take stops at its
+    /// next part and writes nothing; a send asks the service to stop, which
+    /// keeps the files that went in whole.
+    pub(crate) fn cancel_move(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some((stop, doing)) = self.flows.get(name).map(|f| (f.stop.clone(), f.doing)) else {
+            return;
+        };
+        if stop.load(std::sync::atomic::Ordering::SeqCst)
+            || self.preview_skips("stopping the move of files", cx)
+        {
+            return;
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if doing == SENDING {
+            let request = Request::CancelTransfer {
+                name: name.to_owned(),
+            };
+            cx.background_executor()
+                .spawn(async move {
+                    if let Err(e) = client::command(&request) {
+                        tracing::warn!("stopping a send: {e:#}");
+                    }
+                })
+                .detach();
+        }
+        cx.notify();
+    }
+
+    /// The move of files under way for `name` as a line, a bar and Cancel;
+    /// `id` keeps its button apart from another view of the same flow.
+    pub(crate) fn flow_view(
+        &self,
+        name: &str,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let flow = self.flows.get(name)?;
+        let text = if flow.stopped() {
+            "Stopping...".to_owned()
+        } else if flow.total == 0 {
+            format!("{}...", flow.doing)
+        } else {
+            flow.text()
+        };
+        let owner = name.to_owned();
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(Theme::accent())
+                                .child(text),
+                        )
+                        .child(
+                            button(
+                                id,
+                                "Cancel",
+                                Kind::Secondary,
+                                !flow.stopped(),
+                                cx.listener(move |home, _, _, cx| home.cancel_move(&owner, cx)),
+                            )
+                            .size(Size::Row),
+                        ),
+                )
+                .child(bar(flow.share())),
+        )
     }
 
     /// Asks for files, or for folders, and puts them into the Inbox.
@@ -445,9 +693,12 @@ impl Home {
     /// How the take of `name` going on or just done goes, or else the
     /// archive its Outbox last went into. Files a take kept inside are
     /// named here unless the list marks them already.
-    fn take_outcome(&self, name: &str, busy: Option<&str>) -> Vec<Div> {
+    fn take_outcome(&self, name: &str, busy: Option<&str>, cx: &mut Context<Self>) -> Vec<Div> {
         if busy == Some(TAKING) {
-            return vec![outcome(Theme::accent(), format!("{TAKING}..."))];
+            return vec![
+                self.flow_view(name, "cancel-take", cx)
+                    .unwrap_or_else(|| outcome(Theme::accent(), format!("{TAKING}..."))),
+            ];
         }
         let file_name = |archive: &Path| {
             archive
@@ -490,6 +741,10 @@ impl Home {
                 Theme::danger(),
                 format!("Taking files out failed: {e}"),
             )],
+            Some(Moved::TakeStopped) => vec![outcome(
+                Theme::warning(),
+                "Stopped: nothing was taken out.".to_owned(),
+            )],
             _ => self
                 .last_taken
                 .get(name)
@@ -502,9 +757,18 @@ impl Home {
     }
 
     /// How the sending going on or just done goes.
-    fn send_outcome(&self, up: bool, busy: Option<&str>) -> Option<Div> {
+    fn send_outcome(
+        &self,
+        name: &str,
+        up: bool,
+        busy: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
         if busy == Some(SENDING) {
-            return Some(outcome(Theme::accent(), format!("{SENDING}...")));
+            return Some(
+                self.flow_view(name, "cancel-send", cx)
+                    .unwrap_or_else(|| outcome(Theme::accent(), format!("{SENDING}..."))),
+            );
         }
         match &self.moved {
             Some(Moved::Sent(count)) => {
@@ -521,6 +785,13 @@ impl Home {
             Some(Moved::SendFailed(e)) => Some(outcome(
                 Theme::danger(),
                 format!("Sending files in failed: {e}"),
+            )),
+            Some(Moved::SendStopped { copied, files }) => Some(outcome(
+                Theme::warning(),
+                format!(
+                    "Stopped: {copied} of {} went in.",
+                    counted(*files, "item", "items")
+                ),
             )),
             _ => None,
         }
@@ -585,7 +856,7 @@ impl Home {
                 .h(px(42.))
                 .w_full(),
             )
-            .children(self.take_outcome(name, busy))
+            .children(self.take_outcome(name, busy, cx))
     }
 
     fn send_section(
@@ -684,7 +955,7 @@ impl Home {
                     .text_color(Theme::muted())
                     .child(now)
             }))
-            .children(self.send_outcome(up, busy))
+            .children(self.send_outcome(name, up, busy, cx))
     }
 
     /// Taking files out of `name` and sending files in: its Files tab, and

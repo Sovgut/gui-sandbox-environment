@@ -293,7 +293,7 @@ fn download_detail(
 }
 
 /// `seconds` still to go, as roughly as a person says it.
-fn time_left(seconds: f64) -> String {
+pub(crate) fn time_left(seconds: f64) -> String {
     let minutes = (seconds / 60.).round();
     if minutes < 1. {
         "less than a minute left".to_owned()

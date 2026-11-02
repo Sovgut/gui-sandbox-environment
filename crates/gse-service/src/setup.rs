@@ -226,14 +226,32 @@ fn install_packages(warning: &mut dyn FnMut(String), dry_run: bool) -> Result<()
     if Path::new(OSTREE_BOOTED).exists() {
         let mut args = vec!["install", "--idempotent", "--apply-live"];
         args.extend(&missing);
-        return command("rpm-ostree", &args, dry_run).context(
+        command("rpm-ostree", &args, dry_run).context(
             "the packages could not be added to the running system; restart the computer \
              and try again",
-        );
+        )?;
+        // rpm-ostree may layer the packages for the next boot only, and
+        // still succeed: then the programs are not there yet.
+        if !dry_run && tools_missing() {
+            bail!(
+                "QEMU and the rest are installed for the next start of the computer: restart \
+                 it, then press Try again"
+            );
+        }
+        return Ok(());
     }
     let mut args = vec!["install", "-y"];
     args.extend(&missing);
     command("dnf", &args, dry_run)
+}
+
+/// Whether a program in [`TOOLS`] is missing from where systemd finds it.
+fn tools_missing() -> bool {
+    TOOLS.iter().any(|tool| {
+        !SERVICE_PATH
+            .iter()
+            .any(|dir| is_program(&Path::new(dir).join(tool)))
+    })
 }
 
 /// Looks at what environments need from the machine. The service installs

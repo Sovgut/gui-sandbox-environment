@@ -51,6 +51,7 @@ step "desktop"
 dnf -y install \
     budgie-desktop budgie-desktop-defaults budgie-desktop-view budgie-backgrounds \
     python3-systemd papirus-icon-theme nemo gnome-text-editor xdg-desktop-portal-gtk \
+    fedora-workstation-repositories \
     labwc xdg-desktop-portal-wlr \
     xorg-x11-server-Xwayland xwayland-satellite xrandr greetd greetd-selinux wlr-randr \
     pipewire wireplumber pipewire-pulseaudio \
@@ -104,7 +105,7 @@ cat > /usr/share/glib-2.0/schemas/30_gse.gschema.override <<'EOF'
 layout='gse'
 
 [com.solus-project.icon-tasklist]
-pinned-launchers=['com.google.Chrome.desktop', 'nemo.desktop']
+pinned-launchers=['google-chrome.desktop', 'nemo.desktop']
 
 [org.gnome.desktop.interface:Budgie]
 color-scheme='prefer-dark'

@@ -356,6 +356,14 @@ mod tests {
     }
 
     #[test]
+    fn the_built_in_presets_pass_every_check() {
+        for preset in templates() {
+            validate(&preset).unwrap_or_else(|e| panic!("{}: {e:#}", preset.name));
+        }
+        assert_eq!(templates().len(), BUILT_IN.len());
+    }
+
+    #[test]
     fn every_built_in_preset_is_a_template() {
         let names: Vec<String> = templates().into_iter().map(|p| p.name).collect();
         assert_eq!(names, ["launchers", "desktop"]);

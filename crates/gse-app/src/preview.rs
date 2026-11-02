@@ -162,7 +162,7 @@ fn sets() -> Vec<Preset> {
                 app("Heroic", flatpak("com.heroicgameslauncher.hgl"), false),
                 app("Bottles", flatpak("com.usebottles.bottles"), false),
                 app("ProtonPlus", flatpak("com.vysp3r.ProtonPlus"), false),
-                app("Chrome", flatpak("com.google.Chrome"), false),
+                app("Chrome", dnf("google-chrome-stable"), false),
                 app("Discord", flatpak("com.discordapp.Discord"), true),
             ],
         },
@@ -181,7 +181,7 @@ fn sets() -> Vec<Preset> {
         },
         Preset {
             name: "desktop".into(),
-            apps: vec![app("Chrome", flatpak("com.google.Chrome"), false)],
+            apps: vec![app("Chrome", dnf("google-chrome-stable"), false)],
         },
     ]
 }

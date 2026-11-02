@@ -4,4 +4,7 @@ name = "desktop"
 
 [[app]]
 name = "Chrome"
-flatpak = "com.google.Chrome"
+dnf = ["google-chrome-stable"]
+repos = ["google-chrome"]
+desktop = "google-chrome.desktop"
+command = ["google-chrome-stable"]

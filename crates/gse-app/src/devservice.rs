@@ -37,6 +37,9 @@ fn run_helper() -> Result<()> {
 
 impl crate::Home {
     fn install_dev_service(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.preview_skips("installing the service build", cx) {
+            return;
+        }
         self.dev_install = Install::Running;
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -60,10 +63,15 @@ impl crate::Home {
     /// The development card of About and updates, on a machine with the
     /// helper only.
     pub(crate) fn dev_service_card(&self, cx: &mut gpui::Context<Self>) -> Option<gpui::Div> {
-        use crate::settings::{group, row};
-        use crate::ui::{Kind, button};
+        use crate::settings::Rows;
+        use crate::ui::{Kind, Size, Theme, button};
 
-        if !Path::new(HELPER).exists() {
+        let helper = if crate::preview::active() {
+            crate::preview::flag("dev")
+        } else {
+            Path::new(HELPER).exists()
+        };
+        if !helper {
             return None;
         }
         let hint = match &self.dev_install {
@@ -77,18 +85,25 @@ impl crate::Home {
             Install::Done => "Installed; the service restarted with it".to_owned(),
             Install::Failed(e) => format!("Not installed: {e}"),
         };
-        Some(group(
+        let tint = match self.dev_install {
+            Install::Done => Theme::good(),
+            Install::Failed(_) => Theme::danger(),
+            Install::Idle | Install::Running => Theme::muted(),
+        };
+        Some(Rows::Page.group(
             Some("Development"),
-            vec![row(
+            vec![Rows::Page.tinted_row(
                 "Service build",
                 Some(hint),
+                tint,
                 button(
                     "dev-install",
                     "Install service build",
                     Kind::Secondary,
                     !matches!(self.dev_install, Install::Running),
                     cx.listener(|home, _, _, cx| home.install_dev_service(cx)),
-                ),
+                )
+                .size(Size::Small),
             )],
         ))
     }

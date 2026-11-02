@@ -3,13 +3,12 @@
 //! settings edit what new sandboxes start with; a sandbox's settings panel
 //! edits that sandbox's own. A change is saved as soon as it is made.
 
-use gpui::{Context, Div, FontWeight, IntoElement, SharedString, div, prelude::*, px};
-use gpui_kit::component::{Disableable as _, Sizable as _};
+use gpui::{Context, Div, FontWeight, Hsla, IntoElement, SharedString, div, prelude::*, px};
 use gse_protocol::{Gpu, Request, ScreenMode, Settings, SwitchMode};
 
 use crate::client::{self, Unanswered};
 use crate::text_input::TextInput;
-use crate::ui::{self, Kind, Theme, button};
+use crate::ui::{self, Kind, Size, SwitchSize, Theme, Tone, button};
 use crate::{Home, Modal};
 
 const RESOLUTIONS: [(u32, u32); 4] = [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)];
@@ -40,52 +39,267 @@ pub fn explain(error: &anyhow::Error) -> SharedString {
     }
 }
 
-pub(crate) fn gpu_title(gpu: &Gpu) -> String {
-    gpu.device
-        .clone()
-        .unwrap_or_else(|| format!("GPU {:04x}:{:04x}", gpu.vendor_id, gpu.device_id))
-}
-
-/// A group of settings rows, with a small heading when given.
-pub(crate) fn group(heading: Option<&'static str>, rows: Vec<Div>) -> Div {
-    let mut group = div()
-        .flex()
-        .flex_col()
-        .rounded(px(12.))
-        .bg(Theme::group())
-        .children(heading.map(|h| {
-            div()
-                .px_3p5()
-                .pt_3()
-                .pb_1()
-                .text_xs()
-                .text_color(Theme::muted())
-                .child(h)
-        }));
-    for (i, row) in rows.into_iter().enumerate() {
-        group = group.child(row.when(i > 0, |r| r.border_t_1().border_color(Theme::border())));
+/// What `gpu` is called among `gpus`: its model, and its PCI slot when
+/// another card there has the same model.
+pub(crate) fn gpu_title(gpu: &Gpu, gpus: &[Gpu]) -> String {
+    let model = |gpu: &Gpu| {
+        gpu.device
+            .clone()
+            .unwrap_or_else(|| format!("GPU {:04x}:{:04x}", gpu.vendor_id, gpu.device_id))
+    };
+    let name = model(gpu);
+    if gpus
+        .iter()
+        .any(|other| other.address != gpu.address && model(other) == name)
+    {
+        let slot = gpu.address.strip_prefix("0000:").unwrap_or(&gpu.address);
+        format!("{name} ({slot})")
+    } else {
+        name
     }
-    group
 }
 
-/// One row of a [`group`]: what it is, a line under it, and its control.
-pub(crate) fn row(title: &'static str, hint: Option<String>, control: impl IntoElement) -> Div {
+/// One entry of a [`Home::menu`]: its label, a quieter note after it,
+/// whether it is the current one, and the value picking it hands on.
+pub(crate) struct Choice<T> {
+    label: String,
+    note: Option<&'static str>,
+    current: bool,
+    value: T,
+}
+
+impl<T> Choice<T> {
+    pub(crate) fn new(label: impl Into<String>, value: T) -> Self {
+        Self {
+            label: label.into(),
+            note: None,
+            current: false,
+            value,
+        }
+    }
+
+    /// Marks the entry as the one chosen now.
+    pub(crate) const fn current(mut self, current: bool) -> Self {
+        self.current = current;
+        self
+    }
+
+    pub(crate) const fn note(mut self, note: Option<&'static str>) -> Self {
+        self.note = note;
+        self
+    }
+}
+
+/// How a [`Home::menu`] looks while it is closed: the value it shows, its
+/// size, whether it fills the width it is given, and whether it opens.
+pub(crate) struct Picker {
+    id: SharedString,
+    current: String,
+    size: Size,
+    wide: bool,
+    enabled: bool,
+}
+
+impl Picker {
+    /// A menu 32 tall that shows `current`.
+    pub(crate) fn new(id: impl Into<SharedString>, current: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            current: current.into(),
+            size: Size::Medium,
+            wide: false,
+            enabled: true,
+        }
+    }
+
+    pub(crate) const fn size(mut self, size: Size) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// As wide as the space it is given, its value at the start and the
+    /// chevron at the end: a menu in a column of a table.
+    pub(crate) const fn wide(mut self) -> Self {
+        self.wide = true;
+        self
+    }
+
+    pub(crate) const fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+}
+
+/// How a group of settings rows looks, by where it stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rows {
+    /// In a sandbox's settings sheet: rows 12 by 14 on the group ground.
+    Sheet,
+    /// On a page of app settings that lists them: rows 14 by 16 on the
+    /// surface.
+    Page,
+    /// On a page of a few settings, each named in bold over a line that
+    /// says more: rows 16 by 18 on the panel ground.
+    Headlines,
+}
+
+impl Rows {
+    /// The padding of a row: across, then down.
+    const fn padding(self) -> (f32, f32) {
+        match self {
+            Self::Sheet => (14., 12.),
+            Self::Page => (16., 14.),
+            Self::Headlines => (18., 16.),
+        }
+    }
+
+    fn ground(self) -> Hsla {
+        match self {
+            Self::Sheet => Theme::group(),
+            Self::Page => Theme::surface(),
+            Self::Headlines => Theme::panel(),
+        }
+    }
+
+    fn divider(self) -> Hsla {
+        match self {
+            Self::Headlines => Theme::divider(),
+            Self::Sheet | Self::Page => Theme::border(),
+        }
+    }
+
+    /// A group of `rows` with lines between them, and a small heading over
+    /// them when given.
+    pub(crate) fn group(self, heading: Option<&'static str>, rows: Vec<Div>) -> Div {
+        let (across, _) = self.padding();
+        let mut group = div()
+            .flex()
+            .flex_col()
+            .rounded(px(if self == Self::Headlines { 14. } else { 12. }))
+            .bg(self.ground())
+            .children(heading.map(|h| {
+                div()
+                    .px(px(across))
+                    .py_3()
+                    .border_b_1()
+                    .border_color(self.divider())
+                    .text_xs()
+                    .text_color(Theme::muted())
+                    .child(h)
+            }));
+        for (i, row) in rows.into_iter().enumerate() {
+            group = group.child(row.when(i > 0, |r| r.border_t_1().border_color(self.divider())));
+        }
+        group
+    }
+
+    /// One row: what it is, a line under it, and its control.
+    pub(crate) fn row(
+        self,
+        title: &'static str,
+        hint: Option<String>,
+        control: impl IntoElement,
+    ) -> Div {
+        self.tinted_row(title, hint, Theme::muted(), control)
+    }
+
+    /// A [`Rows::row`] whose line under the title is in `color`, such as
+    /// [`Theme::danger`] for a failure.
+    pub(crate) fn tinted_row(
+        self,
+        title: &'static str,
+        hint: Option<String>,
+        color: Hsla,
+        control: impl IntoElement,
+    ) -> Div {
+        let (across, down) = self.padding();
+        let headline = self == Self::Headlines;
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(if headline { 20. } else { 16. }))
+            .px(px(across))
+            .py(px(down))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_sm()
+                            .when(headline, |t| t.font_weight(FontWeight::SEMIBOLD))
+                            .child(title),
+                    )
+                    .children(hint.map(|h| {
+                        div()
+                            .when(headline, |t| t.mt(px(2.)).text_size(px(13.)))
+                            .when(!headline, Styled::text_xs)
+                            .text_color(color)
+                            .child(h)
+                    })),
+            )
+            .child(div().flex_none().child(control))
+    }
+
+    /// A row with no title: a line of 13 px text in `color`, and its
+    /// control.
+    pub(crate) fn note_row(self, text: String, color: Hsla, control: impl IntoElement) -> Div {
+        let (across, down) = self.padding();
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .px(px(across))
+            .py(px(down))
+            .child(
+                div()
+                    .min_w_0()
+                    .text_size(px(13.))
+                    .text_color(color)
+                    .child(text),
+            )
+            .child(div().flex_none().child(control))
+    }
+}
+
+/// A group of rows of a sandbox's settings sheet, with a small heading
+/// when given.
+pub(crate) fn group(heading: Option<&'static str>, rows: Vec<Div>) -> Div {
+    Rows::Sheet.group(heading, rows)
+}
+
+/// The heading of a page of app settings: its title, 24 px bold, and what
+/// the page is for under it.
+pub(crate) fn page_title(title: &'static str, about: Option<&'static str>) -> Div {
     div()
         .flex()
-        .items_center()
-        .justify_between()
-        .gap_4()
-        .px_3p5()
-        .py_3()
+        .flex_col()
+        .min_w_0()
         .child(
             div()
-                .flex()
-                .flex_col()
-                .min_w_0()
-                .child(div().text_sm().child(title))
-                .children(hint.map(|h| div().text_xs().text_color(Theme::muted()).child(h))),
+                .text_size(px(24.))
+                .font_weight(FontWeight::BOLD)
+                .child(title),
         )
-        .child(div().flex_none().child(control))
+        .children(about.map(|about| {
+            div()
+                .mt_1()
+                .text_size(px(13.))
+                .text_color(Theme::muted())
+                .child(about)
+        }))
+}
+
+/// How the rows of `target` look: a page's for new sandboxes, the sheet's
+/// for a sandbox.
+const fn rows_of(target: Target) -> Rows {
+    match target {
+        Target::Defaults => Rows::Page,
+        Target::Sandbox => Rows::Sheet,
+    }
 }
 
 impl Home {
@@ -120,6 +334,15 @@ impl Home {
         self.draft_of(target)
             .and_then(|d| d.screen_mode.parse().ok())
             .unwrap_or(FALLBACK)
+    }
+
+    /// Whether the graphics of `target` can change now: not while a change
+    /// is saved, nor while the sandbox runs, since they apply at a start.
+    fn graphics_open(&self, target: Target) -> bool {
+        let running = target == Target::Sandbox
+            && matches!(&self.modal, Some(Modal::SandboxSettings { name, .. })
+                if self.environments.iter().any(|e| e.name == *name && e.running.is_some()));
+        !self.saving && !running
     }
 
     fn save_defaults(&mut self, cx: &mut Context<Self>) {
@@ -213,23 +436,28 @@ impl Home {
         .detach();
     }
 
-    /// A button showing `current` that opens a list of `options`; picking
-    /// one calls `pick` with its value. One menu is open at a time, by `id`.
+    /// A control showing what `picker` holds with a chevron after it, that
+    /// opens a list of `options`, the current one checked; picking one
+    /// calls `pick` with its value. One menu is open at a time, by its id.
     pub(crate) fn menu<T: Clone + 'static>(
         &self,
-        id: impl Into<SharedString>,
-        current: &str,
-        options: Vec<(String, T)>,
-        enabled: bool,
+        picker: Picker,
+        options: Vec<Choice<T>>,
         pick: impl Fn(&mut Self, T, &mut Context<Self>) + Clone + 'static,
         cx: &mut Context<Self>,
     ) -> Div {
-        let id: SharedString = id.into();
+        let Picker {
+            id,
+            current,
+            size,
+            wide,
+            enabled,
+        } = picker;
         let open = self.open_menu.as_ref() == Some(&id);
-        let mut picker = div().relative().child(
+        let mut picker = div().relative().when(wide, Styled::w_full).child(
             button(
                 id.clone(),
-                current.to_owned(),
+                current,
                 Kind::Secondary,
                 enabled,
                 cx.listener({
@@ -244,14 +472,23 @@ impl Home {
                     }
                 }),
             )
-            .small()
-            .icon(gpui_kit::component::IconName::ChevronDown),
+            .size(size)
+            .fill(Theme::selected())
+            .dropdown()
+            // The chevron sits near the end, as a browser's select has it.
+            .map(|b| {
+                if wide {
+                    b.w_full().px(px(4.))
+                } else {
+                    b.pr(px(4.))
+                }
+            }),
         );
         if open {
             let mut list = div()
                 .id(SharedString::from(format!("{id}-menu")))
                 .absolute()
-                .top(px(34.))
+                .top(px(size.height() + 4.))
                 .right_0()
                 .min_w(px(180.))
                 .max_h(px(260.))
@@ -263,28 +500,21 @@ impl Home {
                 .border_color(Theme::line())
                 .shadow_lg()
                 .occlude();
-            for (i, (label, value)) in options.into_iter().enumerate() {
+            for (i, choice) in options.into_iter().enumerate() {
                 let pick = pick.clone();
-                let chosen = label == current;
+                let value = choice.value;
                 list = list.child(
-                    div()
-                        .id(SharedString::from(format!("{id}-{i}")))
-                        .px_2p5()
-                        .py_1p5()
-                        .rounded(px(6.))
-                        .text_sm()
-                        .whitespace_nowrap()
-                        .cursor_pointer()
-                        .when(chosen, |o| {
-                            o.font_weight(FontWeight::SEMIBOLD).bg(Theme::selected())
-                        })
-                        .hover(|o| o.bg(Theme::raised()))
-                        .on_click(cx.listener(move |home, _, _, cx| {
-                            home.open_menu = None;
-                            pick(home, value.clone(), cx);
-                            cx.notify();
-                        }))
-                        .child(label),
+                    ui::menu_item(
+                        SharedString::from(format!("{id}-{i}")),
+                        choice.label,
+                        choice.note,
+                        choice.current,
+                    )
+                    .on_click(cx.listener(move |home, _, _, cx| {
+                        home.open_menu = None;
+                        pick(home, value.clone(), cx);
+                        cx.notify();
+                    })),
                 );
             }
             picker = picker.child(gpui::deferred(list).with_priority(1));
@@ -315,35 +545,60 @@ impl Home {
         cx.notify();
     }
 
-    /// The graphics rows of `target`: its GPU, screen size and frame rate.
+    /// The menu of the graphics card `target` gets, `chosen` checked and
+    /// the card that drives the monitor marked. A sandbox always has a
+    /// card, so there is nothing to pick for none.
+    fn gpu_menu(
+        &self,
+        target: Target,
+        gpus: &[Gpu],
+        chosen: Option<&Gpu>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let shown = match chosen {
+            Some(gpu) => gpu_title(gpu, gpus),
+            None if gpus.is_empty() => "No card found".to_owned(),
+            None => "Choose a card".to_owned(),
+        };
+        self.menu(
+            Picker::new(
+                match target {
+                    Target::Defaults => "defaults-gpu",
+                    Target::Sandbox => "sandbox-gpu",
+                },
+                shown,
+            )
+            .enabled(self.graphics_open(target) && !gpus.is_empty()),
+            gpus.iter()
+                .map(|g| {
+                    Choice::new(gpu_title(g, gpus), g.address.clone())
+                        .current(chosen.is_some_and(|c| c.address == g.address))
+                        .note(g.monitor.then_some("drives the monitor"))
+                })
+                .collect(),
+            move |home, address: String, cx| {
+                home.change(target, |d| d.gpu = address, cx);
+            },
+            cx,
+        )
+    }
+
+    /// The graphics rows of `target`: its GPU, screen size and frame rate,
+    /// under their heading.
     pub(crate) fn graphics_rows(
         &self,
         target: Target,
         gpus: &[Gpu],
         cx: &mut Context<Self>,
     ) -> Div {
-        let enabled = !self.saving;
+        let enabled = self.graphics_open(target);
         let draft = self.draft_of(target);
         let chosen = draft.and_then(|d| gpus.iter().find(|g| g.address == d.gpu));
         let gpu_hint = chosen.map(|g| match g.mode {
             SwitchMode::Single => "Takes the monitor while it runs".to_owned(),
             SwitchMode::Secondary => "Your desktop stays up while it runs".to_owned(),
         });
-        let gpu_menu = self.menu(
-            match target {
-                Target::Defaults => "defaults-gpu",
-                Target::Sandbox => "sandbox-gpu",
-            },
-            &chosen.map_or_else(|| "None".to_owned(), gpu_title),
-            gpus.iter()
-                .map(|g| (gpu_title(g), g.address.clone()))
-                .collect(),
-            enabled && !gpus.is_empty(),
-            move |home, address: String, cx| {
-                home.change(target, |d| d.gpu = address, cx);
-            },
-            cx,
-        );
+        let gpu_menu = self.gpu_menu(target, gpus, chosen, cx);
         let single = chosen.is_some_and(|g| g.mode == SwitchMode::Single);
         let mode = self.draft_mode(target);
         let mut sizes: Vec<(u32, u32)> = RESOLUTIONS.to_vec();
@@ -357,21 +612,26 @@ impl Home {
         }
         let screen: Div = if let (true, Some(gpu)) = (single, chosen) {
             div()
-                .text_sm()
+                .text_size(px(13.))
                 .text_color(Theme::muted())
                 .child(crate::shell::monitor_text(gpu))
         } else {
             self.menu(
-                match target {
-                    Target::Defaults => "defaults-size",
-                    Target::Sandbox => "sandbox-size",
-                },
-                &format!("{} x {}", mode.width, mode.height),
+                Picker::new(
+                    match target {
+                        Target::Defaults => "defaults-size",
+                        Target::Sandbox => "sandbox-size",
+                    },
+                    format!("{} x {}", mode.width, mode.height),
+                )
+                .enabled(enabled),
                 sizes
                     .into_iter()
-                    .map(|(w, h)| (format!("{w} x {h}"), (w, h)))
+                    .map(|(w, h)| {
+                        Choice::new(format!("{w} x {h}"), (w, h))
+                            .current((w, h) == (mode.width, mode.height))
+                    })
                     .collect(),
-                enabled,
                 move |home, (width, height): (u32, u32), cx| {
                     let mode = ScreenMode {
                         width,
@@ -385,18 +645,23 @@ impl Home {
         };
         let rate: Div = if single {
             div()
-                .text_sm()
+                .text_size(px(13.))
                 .text_color(Theme::muted())
                 .child("The monitor's own")
         } else {
             self.menu(
-                match target {
-                    Target::Defaults => "defaults-rate",
-                    Target::Sandbox => "sandbox-rate",
-                },
-                &format!("{} FPS", mode.rate),
-                rates.into_iter().map(|r| (format!("{r} FPS"), r)).collect(),
-                enabled,
+                Picker::new(
+                    match target {
+                        Target::Defaults => "defaults-rate",
+                        Target::Sandbox => "sandbox-rate",
+                    },
+                    format!("{} FPS", mode.rate),
+                )
+                .enabled(enabled),
+                rates
+                    .into_iter()
+                    .map(|r| Choice::new(format!("{r} FPS"), r).current(r == mode.rate))
+                    .collect(),
                 move |home, rate: u32, cx| {
                     let mode = ScreenMode {
                         rate,
@@ -407,12 +672,13 @@ impl Home {
                 cx,
             )
         };
-        group(
+        let rows = rows_of(target);
+        rows.group(
             Some("Graphics"),
             vec![
-                row("Graphics card", gpu_hint, gpu_menu),
-                row("Screen size", None, screen),
-                row("Frame rate", None, rate),
+                rows.row("Graphics card", gpu_hint, gpu_menu),
+                rows.row("Screen size", None, screen),
+                rows.row("Frame rate", None, rate),
             ],
         )
     }
@@ -425,14 +691,17 @@ impl Home {
         cx: &mut Context<Self>,
     ) -> Div {
         let on = self.draft_of(target).is_none_or(|d| d.internet);
-        row(
+        rows_of(target).row(
             "Internet",
             Some(hint.to_owned()),
-            gpui_kit::component::switch::Switch::new(match target {
-                Target::Defaults => "defaults-internet",
-                Target::Sandbox => "sandbox-internet",
-            })
-            .checked(on)
+            ui::switch(
+                match target {
+                    Target::Defaults => "defaults-internet",
+                    Target::Sandbox => "sandbox-internet",
+                },
+                on,
+                SwitchSize::Row,
+            )
             .disabled(self.saving)
             .on_change(cx.listener(move |home, on: &bool, _, cx| {
                 let on = *on;
@@ -443,17 +712,34 @@ impl Home {
 
     /// App settings: what new sandboxes start with.
     pub(crate) fn defaults_view(&self, cx: &mut Context<Self>) -> Div {
-        let view = div().flex().flex_col().gap_4().child(
-            div().text_sm().text_color(Theme::muted()).child(
-                "What a sandbox gets when it is made. Each one can change these later in its \
-                 own settings.",
-            ),
-        );
+        let header = div()
+            .flex()
+            .items_end()
+            .justify_between()
+            .gap_4()
+            .child(page_title(
+                "New sandboxes",
+                Some(
+                    "What a sandbox gets when it is made. Each one can change these later in \
+                     its own settings.",
+                ),
+            ))
+            // The rows wait while a change is saved; this says why.
+            .when(self.saving, |header| {
+                header.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(13.))
+                        .text_color(Theme::accent())
+                        .child("Saving..."),
+                )
+            });
+        let view = div().flex().flex_col().gap(px(18.)).child(header);
         let (_, gpus) = match &self.settings {
             Ok(loaded) => loaded,
             Err(reason) => {
                 return view.child(
-                    ui::notice(Theme::warning(), "Settings are unavailable", reason.clone()).child(
+                    ui::notice(Tone::Warning, "Settings are unavailable", reason.clone()).child(
                         button(
                             "settings-retry",
                             "Try again",
@@ -471,13 +757,21 @@ impl Home {
             .first_set
             .clone()
             .filter(|s| sets.contains(s))
-            .or_else(|| sets.first().cloned())
-            .unwrap_or_else(|| "None".to_owned());
+            .or_else(|| sets.first().cloned());
         let set_menu = self.menu(
-            "defaults-set",
-            &first,
-            sets.iter().map(|s| (s.clone(), s.clone())).collect(),
-            !sets.is_empty(),
+            Picker::new(
+                "defaults-set",
+                first
+                    .as_deref()
+                    .map_or_else(|| "No sets yet".to_owned(), crate::presets::set_title),
+            )
+            .enabled(!sets.is_empty()),
+            sets.iter()
+                .map(|s| {
+                    Choice::new(crate::presets::set_title(s), s.clone())
+                        .current(first.as_ref() == Some(s))
+                })
+                .collect(),
             |home, set: String, cx| {
                 home.app_config.first_set = Some(set);
                 if let Err(e) = home.app_config.save() {
@@ -487,16 +781,16 @@ impl Home {
             },
             cx,
         );
-        view.child(group(
+        view.child(Rows::Page.group(
             None,
-            vec![row(
+            vec![Rows::Page.row(
                 "Set of apps",
                 Some("Picked first in the new sandbox dialog".to_owned()),
                 set_menu,
             )],
         ))
         .child(self.graphics_rows(Target::Defaults, gpus, cx))
-        .child(group(
+        .child(Rows::Page.group(
             None,
             vec![self.internet_row(
                 Target::Defaults,

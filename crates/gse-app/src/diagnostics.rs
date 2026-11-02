@@ -212,15 +212,17 @@ fn host() -> String {
 impl crate::Home {
     /// Saves the archive in the background and says where it went.
     pub(crate) fn save_diagnostics(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.preview_skips("saving diagnostics", cx) {
+            return;
+        }
         self.say("Saving diagnostics...", false);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let saved = cx.background_executor().spawn(async { save() }).await;
             this.update(cx, |home, cx| {
                 match saved {
-                    Ok(path) => home.say(
-                        format!("Diagnostics saved to {}; send this file", path.display()),
-                        false,
+                    Ok(path) => home.tell(
+                        crate::Toast::result("Diagnostics saved; send this file").wrote(path),
                     ),
                     Err(e) => home.say(format!("Diagnostics were not saved: {e:#}"), true),
                 }

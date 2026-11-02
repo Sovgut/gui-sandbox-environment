@@ -1,6 +1,8 @@
 //! The window's own title bar: it moves the window, maximizes it on a
 //! double click, opens the window menu on a right click, and holds the
-//! window's buttons drawn and ordered the way KDE's Breeze has them.
+//! window's buttons drawn and ordered the way KDE's Breeze has them. In
+//! full screen, where KDE shows no title bar at all, it keeps only leaving
+//! full screen and close.
 
 use std::sync::OnceLock;
 
@@ -13,11 +15,13 @@ use crate::icons::Icon;
 use crate::shell::BAR_HEIGHT;
 use crate::ui::{self, Theme};
 
-/// A button of the window, as KWin's button layout letters name them.
+/// A button of the window, as KWin's button layout letters name them, and
+/// the one that leaves full screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Control {
     Minimize,
     Maximize,
+    LeaveFullScreen,
     Close,
 }
 
@@ -27,6 +31,9 @@ enum Control {
 fn controls() -> &'static [Control] {
     static CONTROLS: OnceLock<Vec<Control>> = OnceLock::new();
     CONTROLS.get_or_init(|| {
+        if crate::preview::active() {
+            return vec![Control::Minimize, Control::Maximize, Control::Close];
+        }
         let config = std::env::var_os("XDG_CONFIG_HOME")
             .map(std::path::PathBuf::from)
             .or_else(|| {
@@ -67,6 +74,25 @@ fn parse(letters: &str) -> Vec<Control> {
         .collect()
 }
 
+/// The buttons of a window in full screen, out of its usual `controls`:
+/// minimize and maximize mean nothing there, so leaving full screen takes
+/// maximize's place, or comes first in a layout without maximize, and
+/// close stays where it is.
+fn in_full_screen(controls: &[Control]) -> Vec<Control> {
+    let mut shown: Vec<Control> = controls
+        .iter()
+        .filter_map(|control| match control {
+            Control::Minimize | Control::LeaveFullScreen => None,
+            Control::Maximize => Some(Control::LeaveFullScreen),
+            Control::Close => Some(Control::Close),
+        })
+        .collect();
+    if !shown.contains(&Control::LeaveFullScreen) {
+        shown.insert(0, Control::LeaveFullScreen);
+    }
+    shown
+}
+
 /// A row for controls inside the title bar: pressing one of them does not
 /// start moving the window, so their clicks arrive.
 pub fn not_dragging() -> Div {
@@ -84,6 +110,7 @@ impl Home {
             Control::Minimize => ("window-minimize", Icon::WindowMinimize),
             Control::Maximize if window.is_maximized() => ("window-restore", Icon::WindowRestore),
             Control::Maximize => ("window-maximize", Icon::WindowMaximize),
+            Control::LeaveFullScreen => ("window-leave-full-screen", Icon::ExitFullscreen),
             Control::Close => ("window-close", Icon::WindowClose),
         };
         let close = control == Control::Close;
@@ -112,10 +139,14 @@ impl Home {
                     })
                     .child(ui::kit_icon(icon).size(px(16.))),
             )
+            .when(control == Control::LeaveFullScreen, |b| {
+                b.tooltip(ui::tooltip("Leave full screen".into()))
+            })
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |home, _, window, cx| match control {
                 Control::Minimize => window.minimize_window(),
                 Control::Maximize => window.zoom_window(),
+                Control::LeaveFullScreen => window.toggle_fullscreen(),
                 Control::Close => {
                     if home.should_close(cx) {
                         cx.quit();
@@ -130,9 +161,14 @@ impl Home {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let shown = if window.is_fullscreen() {
+            in_full_screen(controls())
+        } else {
+            controls().to_vec()
+        };
         let mut buttons = div().flex().flex_none().items_center().gap_1p5().pr_3();
-        for control in controls() {
-            buttons = buttons.child(Self::control(*control, window, cx));
+        for control in shown {
+            buttons = buttons.child(Self::control(control, window, cx));
         }
         div()
             .id("window-bar")
@@ -175,5 +211,22 @@ mod tests {
         );
         assert_eq!(parse("XA"), [Control::Close, Control::Maximize]);
         assert_eq!(parse(""), Vec::<Control>::new());
+    }
+
+    #[test]
+    fn full_screen_keeps_leaving_it_and_close() {
+        assert_eq!(
+            in_full_screen(&parse("IAX")),
+            [Control::LeaveFullScreen, Control::Close]
+        );
+        assert_eq!(
+            in_full_screen(&parse("XA")),
+            [Control::Close, Control::LeaveFullScreen]
+        );
+        assert_eq!(
+            in_full_screen(&parse("IX")),
+            [Control::LeaveFullScreen, Control::Close]
+        );
+        assert_eq!(in_full_screen(&[]), [Control::LeaveFullScreen]);
     }
 }

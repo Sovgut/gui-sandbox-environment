@@ -3,14 +3,15 @@
 
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::channel::mpsc::UnboundedSender;
 use gse_protocol::{
-    BaseImage, Build, Environment, Event, Gpu, GuestApp, GuestFiles, JournalEntry, Preset, Reply,
-    Request, SOCKET, Settings, Stage, receive, send,
+    BaseImage, Build, Environment, Event, FailedBuild, Gpu, GuestApp, GuestFiles, JournalEntry,
+    Preset, Reply, Request, SOCKET, Settings, Stage, receive, send,
 };
 
 /// The service closed the connection without answering. A service older
@@ -27,6 +28,9 @@ impl std::fmt::Display for Unanswered {
 impl std::error::Error for Unanswered {}
 
 fn connect() -> Result<(UnixStream, BufReader<UnixStream>)> {
+    if crate::preview::active() {
+        anyhow::bail!("a preview talks to no service");
+    }
     let stream = UnixStream::connect(SOCKET)
         .with_context(|| format!("the gse service is not running ({SOCKET})"))?;
     let reader = BufReader::new(stream.try_clone()?);
@@ -82,7 +86,27 @@ pub enum Match {
     ServiceNewer,
 }
 
-/// Asks the service for its protocol version.
+/// The release the service said it is when it last answered [`hello`].
+static SERVICE_BUILD: Mutex<Option<String>> = Mutex::new(None);
+
+/// The service's release as it last said it, such as `0.5.0`; none before
+/// it answered, or from a service that does not know the handshake.
+pub fn service_build() -> Option<String> {
+    SERVICE_BUILD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Keeps the release the service said it is, for [`service_build`].
+fn heard_build(build: Option<String>) {
+    *SERVICE_BUILD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = build;
+}
+
+/// Asks the service for its protocol version, and keeps the release it
+/// names for [`service_build`].
 pub fn hello() -> Result<Match> {
     let mut version = None;
     let mut build = None;
@@ -97,9 +121,13 @@ pub fn hello() -> Result<Match> {
         }
     });
     match outcome {
-        Err(e) if e.is::<Unanswered>() => return Ok(Match::ServiceOlder),
+        Err(e) if e.is::<Unanswered>() => {
+            heard_build(None);
+            return Ok(Match::ServiceOlder);
+        }
         other => other?,
     }
+    heard_build(build.clone());
     Ok(
         match version
             .context("no version in the reply")?
@@ -237,10 +265,12 @@ pub struct PresetsState {
     pub base: Option<BaseImage>,
     /// The presets whose images stand on an older base image.
     pub stale: Vec<String>,
+    /// The last failed build of each image, until it builds again.
+    pub failed: Vec<FailedBuild>,
 }
 
-/// The presets, the image build in progress, the base image and the
-/// images built on an older one.
+/// The presets, the image build in progress, the base image, the images
+/// built on an older one and the builds that failed.
 pub fn presets() -> Result<PresetsState> {
     let mut found = None;
     call(&Request::Presets, |reply| {
@@ -249,6 +279,7 @@ pub fn presets() -> Result<PresetsState> {
             build,
             base,
             stale,
+            failed,
         } = reply
         {
             found = Some(PresetsState {
@@ -256,6 +287,7 @@ pub fn presets() -> Result<PresetsState> {
                 build,
                 base,
                 stale,
+                failed,
             });
         }
     })?;

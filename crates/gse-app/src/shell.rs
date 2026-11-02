@@ -4,17 +4,16 @@
 //! Files tabs under them.
 
 use gpui::{
-    Background, Context, Div, FontWeight, Hsla, ScrollHandle, SharedString, Stateful, Window, div,
+    Context, Div, FontWeight, Hsla, ScrollHandle, SharedString, Stateful, Window, div,
     linear_color_stop, linear_gradient, prelude::*, px, rgb,
 };
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Disableable as _, IconName, Sizable as _};
+use gpui_kit::component::IconName;
 use gse_protocol::{Environment, Request, ScreenMode, Stage, SwitchMode};
 
 use crate::icons::Icon;
+use crate::presets;
 use crate::settings::gpu_title;
-use crate::ui::{self, Kind, Theme, button, icon_button};
+use crate::ui::{self, Kind, Size, SwitchSize, Theme, Tone, button, icon_button};
 use crate::{Home, Modal, Page, stage_text};
 
 pub const SIDEBAR_WIDTH: f32 = 272.;
@@ -25,6 +24,8 @@ const COMPACT_BELOW: f32 = 760.;
 const PANEL_MIN_HEIGHT: f32 = 300.;
 /// The height of the title bar, which the sidebar's header lines up with.
 pub const BAR_HEIGHT: f32 = 52.;
+/// What the list and the page say before there is any sandbox.
+const NO_SANDBOXES: &str = "No sandboxes yet";
 
 /// The tabs under a sandbox's cover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,26 +43,145 @@ const STEPS: [(Stage, &str); 4] = [
     (Stage::Ready, "Desktop"),
 ];
 
-/// A sandbox's cover: two colours picked from its name, so each keeps its
-/// own look in the list and on its page.
-pub fn cover(name: &str) -> Background {
-    const PAIRS: [(u32, u32); 6] = [
-        (0x2b_3a_5e, 0x4a_2f_55),
-        (0x3d_2e_22, 0x24_32_3a),
-        (0x23_3a_33, 0x2b_3a_5e),
-        (0x3a_2d_2a, 0x4a_2f_55),
-        (0x24_31_4f, 0x20_32_3c),
-        (0x2a_25_50, 0x1f_3a_44),
-    ];
+/// A cover's gradient over the diagonal: its first and last colour, and
+/// one in between at a point from 0 to 1 when it has one.
+#[derive(Clone, Copy)]
+struct Gradient {
+    from: u32,
+    between: Option<(u32, f32)>,
+    to: u32,
+}
+
+/// The colours a sandbox is drawn in while there is no picture of its own:
+/// its small cover in the list and the rail, and its cover on its page.
+struct Palette {
+    small: Gradient,
+    large: Gradient,
+}
+
+/// Both covers in one gradient from `from` to `to`.
+const fn pair(from: u32, to: u32) -> Palette {
+    let gradient = Gradient {
+        from,
+        between: None,
+        to,
+    };
+    Palette {
+        small: gradient,
+        large: gradient,
+    }
+}
+
+/// The palettes, picked by a hash of the name. The hash and the order put
+/// the design's sandboxes on the design's colours: `demo` blue and violet,
+/// `steam-games` and `games` brown and teal.
+const PALETTES: [Palette; 7] = [
+    pair(0x23_3a_33, 0x2b_3a_5e),
+    Palette {
+        small: Gradient {
+            from: 0x2b_3a_5e,
+            between: None,
+            to: 0x4a_2f_55,
+        },
+        large: Gradient {
+            from: 0x24_31_4f,
+            between: Some((0x3b_2a_4c, 0.55)),
+            to: 0x20_32_3c,
+        },
+    },
+    pair(0x3a_2d_2a, 0x4a_2f_55),
+    pair(0x3d_2e_22, 0x24_32_3a),
+    pair(0x24_31_4f, 0x20_32_3c),
+    pair(0x2a_25_50, 0x1f_3a_44),
+    pair(0x34_36_24, 0x22_2e_4a),
+];
+
+/// The palette of the sandbox `name`.
+fn palette(name: &str) -> &'static Palette {
     let hash = name.bytes().fold(0_usize, |h, b| {
-        h.wrapping_mul(31).wrapping_add(usize::from(b))
+        h.wrapping_mul(61).wrapping_add(usize::from(b))
     });
-    let (from, to) = PAIRS[hash % PAIRS.len()];
-    linear_gradient(
-        135.,
-        linear_color_stop(rgb(from), 0.),
-        linear_color_stop(rgb(to), 1.),
+    &PALETTES[hash % PALETTES.len()]
+}
+
+/// The large cover of the sandbox `name`, filling its parent, whose
+/// corners are `radius` round: its page's, its strip's, its screen's in a
+/// preview.
+pub fn cover(name: &str, radius: f32) -> impl IntoElement {
+    diagonal(palette(name).large, radius)
+}
+
+/// The small cover of the sandbox `name`, as the list and the rail show it.
+fn small_cover(name: &str, radius: f32) -> impl IntoElement {
+    diagonal(palette(name).small, radius)
+}
+
+/// `gradient` from the top left corner to the bottom right, as a browser
+/// draws `linear-gradient(135deg, ...)`, filling its parent with corners
+/// `radius` round. GPUI measures a gradient's angle on its box squared up
+/// and takes two stops, so this works out the angle and the stops that
+/// give the browser's lines on the box it gets, and lays the part past a
+/// colour in between over the rest as a fade from clear.
+fn diagonal(gradient: Gradient, radius: f32) -> impl IntoElement {
+    let stops: Vec<(u32, f32)> = std::iter::once((gradient.from, 0.))
+        .chain(gradient.between)
+        .chain(std::iter::once((gradient.to, 1.)))
+        .collect();
+    gpui::canvas(
+        |_, _, _| {},
+        move |bounds, (), window, _| {
+            let (width, height) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+            if width <= 0. || height <= 0. {
+                return;
+            }
+            // A hair off the diagonal, so that GPUI measures along the longer
+            // side, which `along` is worked out for.
+            let wide = width >= height;
+            let (sin, cos) = (135_f32 + if wide { -0.05 } else { 0.05 })
+                .to_radians()
+                .sin_cos();
+            let angle = if wide {
+                sin.atan2(cos * width / height)
+            } else {
+                (sin * height / width).atan2(cos)
+            }
+            .to_degrees();
+            // The browser's gradient runs over this length; GPUI's over the
+            // longer side.
+            let length = width * sin.abs() + height * cos.abs();
+            let along = |at: f32| 0.5 + (at - 0.5) * length / width.max(height);
+            let radius = gpui::Corners::all(px(radius));
+            let ((first, start), (second, end)) = (stops[0], stops[1]);
+            window.paint_quad(
+                gpui::fill(
+                    bounds,
+                    linear_gradient(
+                        angle,
+                        linear_color_stop(rgb(first), along(start)),
+                        linear_color_stop(rgb(second), along(end)),
+                    ),
+                )
+                .corner_radii(radius),
+            );
+            for pair in stops[1..].windows(2) {
+                let ((_, from), (color, to)) = (pair[0], pair[1]);
+                let color: Hsla = rgb(color).into();
+                window.paint_quad(
+                    gpui::fill(
+                        bounds,
+                        linear_gradient(
+                            angle,
+                            linear_color_stop(color.opacity(0.), along(from)),
+                            linear_color_stop(color, along(to)),
+                        ),
+                    )
+                    .corner_radii(radius),
+                );
+            }
+        },
     )
+    .absolute()
+    .inset_0()
 }
 
 /// When a sandbox last played, as the list says it at `now`.
@@ -96,6 +216,22 @@ fn cover_shade() -> Hsla {
     rgb(0x0e_10_15).into()
 }
 
+/// Words over a cover's picture, light whatever the palette.
+fn on_cover() -> Hsla {
+    rgb(0xe8_ea_f0).into()
+}
+
+/// How a cover heads itself with its set: over a picture, the set in a
+/// chip and its first apps beside it; on a plain cover, the set in a
+/// fainter chip; on the cover of a sandbox never played, the set's name
+/// alone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetLabel {
+    OnPicture,
+    OnPlain,
+    Bare,
+}
+
 /// The app's mark: a monitor on an accent square.
 pub(crate) fn mark(side: f32) -> Div {
     div()
@@ -107,14 +243,14 @@ pub(crate) fn mark(side: f32) -> Div {
         .rounded(px(side * 0.27))
         .bg(Theme::accent())
         .child(
-            ui::kit_icon(Icon::Monitor)
-                .size(px(side * 0.6))
+            ui::kit_icon(Icon::Mark)
+                .size(px(side * 16. / 26.))
                 .text_color(Theme::on_accent()),
         )
 }
 
 /// Leaves full screen, drawn like the app's [`mark`] it stands in for at the
-/// top of the sidebar while the window is full screen.
+/// top of the sidebar while the window is full screen with no title bar.
 fn leave_full_screen(id: &'static str, side: f32) -> gpui::Stateful<Div> {
     div()
         .id(id)
@@ -136,15 +272,17 @@ fn leave_full_screen(id: &'static str, side: f32) -> gpui::Stateful<Div> {
         )
 }
 
-/// How a [`pill`] looks: the accent, or see-through white over a cover.
+/// How a [`pill`] looks: the accent; see-through white over a cover; or
+/// see-through dark over the strip.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PillKind {
     Accent,
     Glass,
+    Dark,
 }
 
 /// A round button of the cover, `height` tall: Play's size on the full
-/// cover, smaller on the strip.
+/// cover, smaller on the strip and beside a start's name.
 fn pill(
     id: &'static str,
     label: impl Into<SharedString>,
@@ -156,22 +294,28 @@ fn pill(
 ) -> gpui::Stateful<Div> {
     let (bg, fg) = match kind {
         PillKind::Accent => (Theme::accent(), Theme::on_accent()),
-        PillKind::Glass => (gpui::white().opacity(0.12), Theme::text()),
+        PillKind::Glass => (gpui::white().opacity(0.12), on_cover()),
+        PillKind::Dark => (cover_shade().opacity(0.6), on_cover()),
     };
     let large = height >= 48.;
+    let accent = kind == PillKind::Accent;
     div()
         .id(id)
         .flex()
         .flex_none()
         .items_center()
-        .gap_2()
+        .gap(px(if large { 10. } else { 8. }))
         .h(px(height))
-        .px(px(if large { 24. } else { 16. }))
+        .px(px(match (large, accent) {
+            (true, _) => 28.,
+            (false, true) => 18.,
+            (false, false) => 16.,
+        }))
         .rounded(px(height / 2.))
         .bg(bg)
         .text_color(fg)
-        .text_size(px(if large { 16. } else { 14. }))
-        .font_weight(if large {
+        .text_size(px(if large { 17. } else { 14. }))
+        .font_weight(if large || accent {
             FontWeight::BOLD
         } else {
             FontWeight::SEMIBOLD
@@ -246,19 +390,35 @@ impl Home {
         self.sidebar_collapsed
     }
 
-    /// A sandbox's state under its name in the list.
+    /// The build `environment` waits for while one runs: its set's, or the
+    /// sandbox system's, which every set stands on.
+    fn awaited_build<'a>(&self, environment: &'a Environment) -> Option<&'a str> {
+        if self.building(&environment.image) {
+            Some(environment.image.as_str())
+        } else {
+            self.building(gse_protocol::BASE_IMAGE)
+                .then_some(gse_protocol::BASE_IMAGE)
+        }
+    }
+
+    /// A sandbox's state under its name in the list: what it does, the
+    /// stage of a start, the build it waits for, or when it last played.
     fn row_status(&self, environment: &Environment) -> (String, Hsla) {
+        let stopping = self
+            .busy
+            .contains_key(&format!("{}/stop", environment.name));
         if let Some(running) = &environment.running {
             return match running.stage {
+                _ if stopping => ("Stopping".into(), Theme::warning()),
                 Stage::Ready => ("Running".into(), Theme::good()),
                 stage => (stage_text(stage).into(), Theme::warning()),
             };
         }
         if let Some(doing) = self.busy.get(&environment.name) {
-            return ((*doing).into(), Theme::accent());
+            return ((*doing).into(), Theme::warning());
         }
-        if self.building(&environment.image) {
-            return match self.build_percent(&environment.image) {
+        if let Some(build) = self.awaited_build(environment) {
+            return match self.build_percent(build) {
                 Some(percent) => (format!("Preparing, {percent}%"), Theme::warning()),
                 None => ("Preparing".into(), Theme::warning()),
             };
@@ -267,9 +427,38 @@ impl Home {
             return ("Its apps are not built".into(), Theme::subtle());
         }
         (
-            played(environment.last_started, chrono::Local::now()),
+            played(environment.last_started, crate::clock::now()),
             Theme::muted(),
         )
+    }
+
+    /// The small cover of `environment` in the list and the rail, `width`
+    /// by `height`: its colours once it has played; a plain tile while its
+    /// apps are missing, with rays while it waits for a build; the accent's
+    /// tint before it first plays.
+    fn thumb(&self, environment: &Environment, width: f32, height: f32, radius: f32) -> Div {
+        let tile = div()
+            .relative()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .w(px(width))
+            .h(px(height))
+            .rounded(px(radius));
+        if self.awaited_build(environment).is_some() {
+            tile.bg(Theme::raised()).child(
+                ui::kit_icon(Icon::Preparing)
+                    .size(px(16.))
+                    .text_color(Theme::warning()),
+            )
+        } else if !environment.image_ready {
+            tile.bg(Theme::raised())
+        } else if environment.last_started.is_none() {
+            tile.bg(Tone::Accent.ground())
+        } else {
+            tile.child(small_cover(&environment.name, radius))
+        }
     }
 
     fn sidebar_row(&self, environment: &Environment, cx: &mut Context<Self>) -> impl IntoElement {
@@ -293,29 +482,7 @@ impl Home {
                 }
             })
             .on_click(cx.listener(move |home, _, window, cx| home.select(&name, window, cx)))
-            .child(if self.building(&environment.image) {
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .w(px(64.))
-                    .h(px(36.))
-                    .rounded(px(6.))
-                    .bg(Theme::raised())
-                    .child(
-                        gpui_kit::component::Icon::new(IconName::LoaderCircle)
-                            .size(px(16.))
-                            .text_color(Theme::warning()),
-                    )
-            } else {
-                div()
-                    .flex_none()
-                    .w(px(64.))
-                    .h(px(36.))
-                    .rounded(px(6.))
-                    .bg(cover(&environment.name))
-            })
+            .child(self.thumb(environment, 64., 36., 6.))
             .child(
                 div()
                     .flex()
@@ -336,7 +503,7 @@ impl Home {
             )
     }
 
-    fn sidebar_full(&self, full_screen: bool, cx: &mut Context<Self>) -> Div {
+    fn sidebar_full(&self, leaves_full_screen: bool, cx: &mut Context<Self>) -> Div {
         let sort = self.sort;
         let mut list = div()
             .id("sandboxes")
@@ -353,9 +520,9 @@ impl Home {
         if self.connected.is_none() {
             list = list.child(quiet("Loading..."));
         } else if self.environments.is_empty() && self.connected == Some(true) {
-            list = list.child(quiet("No sandboxes yet."));
+            list = list.child(quiet(NO_SANDBOXES));
         } else if listed.is_empty() && !self.environments.is_empty() {
-            list = list.child(quiet("No sandbox matches."));
+            list = list.child(quiet("No sandbox matches"));
         }
         for environment in listed {
             list = list.child(self.sidebar_row(environment, cx));
@@ -378,10 +545,9 @@ impl Home {
                     .items_center()
                     .gap_2p5()
                     .h(px(BAR_HEIGHT))
-                    .pl_4()
-                    .pr_2()
+                    .px_4()
                     .map(|bar| {
-                        if full_screen {
+                        if leaves_full_screen {
                             bar.child(leave_full_screen("sidebar-leave-full", 26.))
                         } else {
                             bar.child(mark(26.))
@@ -390,19 +556,24 @@ impl Home {
                     .child(
                         div()
                             .flex_1()
+                            .text_size(px(15.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("GSE"),
                     )
                     .child(
-                        Button::new("collapse-sidebar")
-                            .ghost()
-                            .small()
-                            .icon(IconName::PanelLeftClose)
-                            .tooltip("Collapse the sidebar")
-                            .on_click(cx.listener(|home, _, _, cx| {
+                        icon_button(
+                            "collapse-sidebar",
+                            Icon::SidebarClose,
+                            "Collapse the sidebar",
+                            Kind::Ghost,
+                            true,
+                            cx.listener(|home, _, _, cx| {
                                 home.sidebar_collapsed = true;
                                 cx.notify();
-                            })),
+                            }),
+                        )
+                        .size(Size::Small)
+                        .icon_size(16.),
                     ),
             )
             .child(
@@ -414,17 +585,22 @@ impl Home {
                     .pt_1()
                     .pb_2p5()
                     .child(div().flex_1().min_w_0().child(self.sandbox_search.clone()))
-                    .child(icon_button(
-                        "sort",
-                        sort.icon(),
-                        format!("Sorted {}; click for {}", sort.text(), sort.next().text()),
-                        Kind::Secondary,
-                        true,
-                        cx.listener(move |home, _, _, cx| {
-                            home.sort = sort.next();
-                            cx.notify();
-                        }),
-                    )),
+                    .child(
+                        icon_button(
+                            "sort",
+                            sort.icon(),
+                            format!("Sorted {}; click for {}", sort.text(), sort.next().text()),
+                            Kind::Quiet,
+                            true,
+                            cx.listener(move |home, _, _, cx| {
+                                home.sort = sort.next();
+                                cx.notify();
+                            }),
+                        )
+                        .size(Size::Toolbar)
+                        .fill(Theme::raised())
+                        .text_color(Theme::nav_text()),
+                    ),
             )
             .child(list)
             .child(self.sidebar_footer(cx))
@@ -447,27 +623,39 @@ impl Home {
                     self.connected == Some(true),
                     cx.listener(|home, _, _, cx| home.open_add(cx)),
                 )
+                .size(Size::Large)
                 .icon(IconName::Plus)
+                .h(px(38.))
+                .font_weight(FontWeight::SEMIBOLD)
                 .flex_1(),
             )
-            .child(icon_button(
-                "app-settings",
-                Icon::Settings,
-                "Settings",
-                if self.page == Page::AppSettings {
-                    Kind::Primary
-                } else {
-                    Kind::Secondary
-                },
-                true,
-                cx.listener(|home, _, window, cx| home.open_app_settings(window, cx)),
-            ))
+            .child(
+                icon_button(
+                    "app-settings",
+                    Icon::Settings,
+                    "Settings",
+                    if self.page == Page::AppSettings {
+                        Kind::Primary
+                    } else {
+                        Kind::Quiet
+                    },
+                    true,
+                    cx.listener(|home, _, window, cx| home.open_app_settings(window, cx)),
+                )
+                .size(Size::Large)
+                .w(px(38.))
+                .h(px(38.))
+                .icon_size(17.)
+                .when(self.page != Page::AppSettings, |b| {
+                    b.fill(Theme::raised()).text_color(Theme::nav_text())
+                }),
+            )
     }
 
-    /// The collapsed sidebar; in full screen its top leaves full screen in
-    /// place of the app's mark.
-    fn sidebar_rail(&self, full_screen: bool, cx: &mut Context<Self>) -> Div {
-        let top = if full_screen {
+    /// The collapsed sidebar; with `leaves_full_screen` its top leaves full
+    /// screen in place of the app's mark.
+    fn sidebar_rail(&self, leaves_full_screen: bool, cx: &mut Context<Self>) -> Div {
+        let top = if leaves_full_screen {
             div()
                 .mb_2()
                 .child(leave_full_screen("rail-leave-full", 44.))
@@ -489,14 +677,19 @@ impl Home {
             .border_r_1()
             .border_color(Theme::border())
             .child(top);
+        // The list reaches 2 px past its first cover, so the ring around a
+        // chosen one stays in sight.
         let mut covers = div()
             .id("rail")
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
+            .w_full()
             .items_center()
             .gap_2()
+            .mt(px(-2.))
+            .pt(px(2.))
             .overflow_y_scroll();
         for environment in self.listed(cx) {
             let name = environment.name.clone();
@@ -504,19 +697,25 @@ impl Home {
                 self.page == Page::Sandbox && self.selected.as_deref() == Some(name.as_str());
             let running = environment.running.is_some();
             covers = covers.child(
-                div()
+                self.thumb(environment, 44., 44., 10.)
                     .id(SharedString::from(format!("rail-{name}")))
-                    .relative()
-                    .flex_none()
-                    .size(px(44.))
-                    .rounded(px(10.))
-                    .bg(cover(&name))
                     .cursor_pointer()
-                    .when(selected, |c| c.border_2().border_color(Theme::accent()))
                     .tooltip(ui::tooltip(name.clone().into()))
                     .on_click(cx.listener(move |home, _, window, cx| {
                         home.select(&name, window, cx);
                     }))
+                    .when(selected, |c| {
+                        c.child(
+                            div()
+                                .absolute()
+                                .top(px(-2.))
+                                .left(px(-2.))
+                                .size(px(48.))
+                                .rounded(px(12.))
+                                .border_2()
+                                .border_color(Theme::accent()),
+                        )
+                    })
                     .when(running, |c| {
                         c.child(
                             div()
@@ -534,22 +733,28 @@ impl Home {
         }
         rail = rail.child(covers);
         rail.child(
-            Button::new("expand-sidebar")
-                .ghost()
-                .icon(IconName::PanelLeftOpen)
-                .tooltip("Expand the sidebar")
-                .on_click(cx.listener(|home, _, _, cx| {
+            icon_button(
+                "expand-sidebar",
+                Icon::SidebarOpen,
+                "Expand the sidebar",
+                Kind::Ghost,
+                true,
+                cx.listener(|home, _, _, cx| {
                     home.sidebar_collapsed = false;
                     cx.notify();
-                })),
+                }),
+            )
+            .size(Size::Large),
         )
     }
 
-    pub(crate) fn sidebar(&self, full_screen: bool, cx: &mut Context<Self>) -> Div {
+    /// The sidebar, full or as the rail; with `leaves_full_screen`, for a
+    /// window in full screen with no title bar, its top leaves full screen.
+    pub(crate) fn sidebar(&self, leaves_full_screen: bool, cx: &mut Context<Self>) -> Div {
         if self.rail() {
-            self.sidebar_rail(full_screen, cx)
+            self.sidebar_rail(leaves_full_screen, cx)
         } else {
-            self.sidebar_full(full_screen, cx)
+            self.sidebar_full(leaves_full_screen, cx)
         }
     }
 
@@ -602,7 +807,7 @@ impl Home {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let name = environment.name.clone();
-        div()
+        let play = div()
             .id("play")
             .flex()
             .flex_none()
@@ -611,10 +816,10 @@ impl Home {
             .h(px(52.))
             .px_7()
             .rounded_full()
-            .text_lg()
+            .text_size(px(17.))
             .font_weight(FontWeight::BOLD)
             .child(
-                gpui_kit::component::Icon::new(IconName::Play)
+                ui::kit_icon(Icon::Play)
                     .size(px(18.))
                     .text_color(if enabled {
                         Theme::on_accent()
@@ -623,13 +828,6 @@ impl Home {
                     }),
             )
             .child("Play")
-            .map(|b| {
-                if enabled && self.tour_points_at_play() {
-                    b.border_4().border_color(gpui::white().opacity(0.35))
-                } else {
-                    b
-                }
-            })
             .map(|b| {
                 if enabled {
                     b.bg(Theme::accent())
@@ -640,43 +838,55 @@ impl Home {
                 } else {
                     b.bg(Theme::selected()).text_color(Theme::subtle())
                 }
-            })
+            });
+        self.tour_spotlight(&environment.name, enabled, play, cx)
     }
 
-    /// The name of a sandbox with its set over it, `on_image` white over a
-    /// cover, in the page's colours over a plain one.
-    fn cover_title(&self, environment: &Environment, size: f32, on_image: bool) -> Div {
+    /// The name of a sandbox with its set over it, the set as `label` has
+    /// it; light over a picture, in the page's colours over a plain cover.
+    fn cover_title(&self, environment: &Environment, label: SetLabel) -> Div {
+        let picture = label == SetLabel::OnPicture;
+        let set = presets::set_title(&environment.image);
+        let heading = match label {
+            SetLabel::Bare => div().child(set),
+            SetLabel::OnPicture | SetLabel::OnPlain => div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .px_2()
+                        .py(px(3.))
+                        // On a plain cover the chip sits in the line like a
+                        // word, its ground reaching past the line's height.
+                        .when(!picture, |chip| chip.my(px(-3.)))
+                        .rounded(px(6.))
+                        .bg(if picture {
+                            gpui::white().opacity(0.12)
+                        } else {
+                            Theme::text().opacity(0.08)
+                        })
+                        .child(set),
+                )
+                .when(picture, |row| {
+                    row.children(self.apps_summary(&environment.image))
+                }),
+        };
         div()
-            .text_color(if on_image {
-                gpui::white()
-            } else {
-                Theme::text()
-            })
             .flex()
             .flex_col()
             .gap_1p5()
             .min_w_0()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(rgb(0xc4_ca_d6))
-                    .child(
-                        div()
-                            .px_2()
-                            .py_0p5()
-                            .rounded(px(6.))
-                            .bg(gpui::white().opacity(0.12))
-                            .child(environment.image.clone()),
-                    )
-                    .children(self.apps_summary(&environment.image)),
-            )
+            .text_color(if picture { on_cover() } else { Theme::text() })
+            .child(heading.text_xs().text_color(if picture {
+                rgb(0xc4_ca_d6).into()
+            } else {
+                Theme::soft_text()
+            }))
             .child(
                 div()
                     .truncate()
-                    .text_size(px(size))
+                    .text_size(px(34.))
                     .font_weight(FontWeight::BOLD)
                     .child(environment.name.clone()),
             )
@@ -719,6 +929,7 @@ impl Home {
             let show = name.clone();
             div()
                 .flex()
+                .items_center()
                 .gap_2()
                 .when(screen, |a| {
                     a.child(pill(
@@ -749,10 +960,15 @@ impl Home {
                 ))
                 .into_any_element()
         } else {
-            let free = !self.busy.contains_key(&name) && self.presets.build.is_none();
+            // Nothing starts while an image builds or the service updates.
+            let free =
+                !self.busy.contains_key(&name) && self.presets.build.is_none() && !self.restarting;
             self.play_button(environment, free, cx).into_any_element()
         };
-        frame.bg(cover(&name)).child(
+        // A sandbox never played has no picture yet: its cover is plain, its
+        // words need no shade.
+        let picture = environment.last_started.is_some();
+        Self::backdrop(frame, environment).child(
             div()
                 .absolute()
                 .left_0()
@@ -763,14 +979,33 @@ impl Home {
                 .justify_between()
                 .gap_4()
                 .p_7()
-                .bg(linear_gradient(
-                    180.,
-                    linear_color_stop(cover_shade().opacity(0.), 0.),
-                    linear_color_stop(cover_shade().opacity(0.9), 1.),
+                .when(picture, |row| {
+                    row.bg(linear_gradient(
+                        180.,
+                        linear_color_stop(cover_shade().opacity(0.), 0.),
+                        linear_color_stop(cover_shade().opacity(0.9), 1.),
+                    ))
+                })
+                .child(self.cover_title(
+                    environment,
+                    if picture {
+                        SetLabel::OnPicture
+                    } else {
+                        SetLabel::Bare
+                    },
                 ))
-                .child(self.cover_title(environment, 34., true))
                 .child(actions),
         )
+    }
+
+    /// `frame` with what a cover shows behind its words: the sandbox's
+    /// colours once it has played, the plain ground of one that never has.
+    fn backdrop(frame: Div, environment: &Environment) -> Div {
+        if environment.last_started.is_some() {
+            frame.child(cover(&environment.name, 16.))
+        } else {
+            frame.bg(Theme::picked())
+        }
     }
 
     /// The cover of a sandbox starting or stopping, at `stage`.
@@ -790,7 +1025,7 @@ impl Home {
         };
         let labels: Vec<&str> = STEPS.iter().map(|(_, l)| *l).collect();
         let stop = format!("{name}/stop");
-        frame.bg(cover(&name)).child(
+        Self::backdrop(frame, environment).child(
             div()
                 .absolute()
                 .inset_0()
@@ -800,7 +1035,7 @@ impl Home {
                 .px_10()
                 .py_9()
                 .bg(cover_shade().opacity(0.7))
-                .text_color(gpui::white())
+                .text_color(on_cover())
                 .child(
                     div()
                         .flex()
@@ -837,8 +1072,9 @@ impl Home {
                                 "Stopping".to_owned()
                             } else {
                                 match stage {
+                                    // The sidebar says the same of this stage.
                                     Some(Stage::SwitchingGpu) => {
-                                        "Handing over the graphics card".to_owned()
+                                        stage_text(Stage::SwitchingGpu).to_owned()
                                     }
                                     Some(Stage::Booting) => {
                                         "Booting the sandbox's system".to_owned()
@@ -853,12 +1089,12 @@ impl Home {
                                 &labels,
                                 Some(reached),
                                 false,
-                                Theme::accent(),
+                                Tone::Accent,
                             ))
                             .child(
-                                div().text_sm().text_color(Theme::muted()).child(
+                                div().text_size(px(13.)).text_color(rgb(0xa3_aa_b8)).child(
                                     "Usually under a minute. The screen opens here by \
-                                 itself when the desktop is up.",
+                                         itself when the desktop is up.",
                                 ),
                             )
                         }),
@@ -888,7 +1124,7 @@ impl Home {
                     .flex()
                     .items_start()
                     .justify_between()
-                    .child(self.cover_title(environment, 34., false))
+                    .child(self.cover_title(environment, SetLabel::OnPlain))
                     .child(self.play_button(environment, false, cx)),
             )
             .child(
@@ -910,13 +1146,39 @@ impl Home {
                         steps,
                         Some(reached),
                         false,
-                        Theme::warning(),
+                        Tone::Warning,
                     ))
-                    .child(div().text_sm().text_color(Theme::muted()).child(format!(
-                        "The set \"{}\" is being built; Play turns on when it is ready. \
-                         You can close the app, the build goes on.",
-                        environment.image
-                    ))),
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(Theme::secondary_text())
+                            .child(format!(
+                                "The set \"{}\" is being built; Play turns on when it is ready. \
+                                 You can close the app, the build goes on.",
+                                presets::set_title(&environment.image)
+                            )),
+                    ),
+            )
+    }
+
+    /// What a sandbox waiting for its set is told under its cover: the
+    /// build holds every other sandbox too.
+    fn waiting_note() -> Div {
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .py_3p5()
+            .rounded(px(12.))
+            .bg(Theme::surface())
+            .text_size(px(13.))
+            .text_color(Theme::secondary_text())
+            .child(ui::icon(Icon::Info, Theme::secondary_text()))
+            .child(
+                "Other sandboxes can't start during a build either: the build needs the \
+                 machine to itself for a few minutes.",
             )
     }
 
@@ -941,7 +1203,7 @@ impl Home {
                     .flex()
                     .items_start()
                     .justify_between()
-                    .child(self.cover_title(environment, 34., false))
+                    .child(self.cover_title(environment, SetLabel::OnPlain))
                     .child(self.play_button(environment, false, cx)),
             )
             .child(
@@ -961,10 +1223,16 @@ impl Home {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("Its apps are not built yet"),
                             )
-                            .child(div().text_sm().text_color(Theme::muted()).child(format!(
-                                "Build the set \"{preset}\" once; every sandbox \
-                                     made from it can play then."
-                            ))),
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(Theme::secondary_text())
+                                    .child(format!(
+                                        "Build the set \"{}\" once; every sandbox made from it \
+                                         can play then.",
+                                        presets::set_title(&preset)
+                                    )),
+                            ),
                     )
                     .child(button(
                         "sandbox-build",
@@ -984,54 +1252,60 @@ impl Home {
             .running
             .as_ref()
             .filter(|r| r.stage == Stage::Ready);
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap_3p5()
-            .h(px(76.))
-            .pl_6()
-            .pr_4()
-            .rounded(px(16.))
-            .bg(cover(&name))
-            .text_color(gpui::white())
-            .child(
-                div()
-                    .text_size(px(22.))
-                    .font_weight(FontWeight::BOLD)
-                    .child(name.clone()),
-            )
-            .child(ui::badge(status, color))
-            .child(div().flex_1())
-            .when_some(up, |strip, running| {
-                let stop = format!("{name}/stop");
-                let show = name.clone();
-                strip
-                    .when(running.screen.is_some(), |s| {
-                        s.child(pill(
-                            "strip-show",
-                            "Show screen",
-                            None,
-                            PillKind::Accent,
-                            40.,
-                            true,
-                            cx.listener(move |home, _, window, cx| {
-                                home.open_screen(&show, window, cx);
-                            }),
-                        ))
-                    })
-                    .child(pill(
-                        "strip-stop",
-                        "Stop",
+        let picture = environment.last_started.is_some();
+        let stop = format!("{name}/stop");
+        let stopping = self.busy.contains_key(&stop);
+        Self::backdrop(
+            div()
+                .relative()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_3p5()
+                .h(px(76.))
+                .pl_6()
+                .pr_4()
+                .rounded(px(16.))
+                .overflow_hidden(),
+            environment,
+        )
+        .text_color(if picture { on_cover() } else { Theme::text() })
+        .child(
+            div()
+                .text_size(px(22.))
+                .font_weight(FontWeight::BOLD)
+                .child(name.clone()),
+        )
+        .child(ui::badge(status, color).bg(cover_shade().opacity(0.6)))
+        .child(div().flex_1())
+        .when_some(up, |strip, running| {
+            let show = name.clone();
+            strip
+                .when(running.screen.is_some(), |s| {
+                    s.child(pill(
+                        "strip-show",
+                        "Show screen",
                         None,
-                        PillKind::Glass,
+                        PillKind::Accent,
                         40.,
                         true,
-                        cx.listener(move |home, _, _, cx| {
-                            home.request(stop.clone(), "Stopping", Request::Stop, cx);
+                        cx.listener(move |home, _, window, cx| {
+                            home.open_screen(&show, window, cx);
                         }),
                     ))
-            })
+                })
+                .child(pill(
+                    "strip-stop",
+                    if stopping { "Stopping..." } else { "Stop" },
+                    None,
+                    PillKind::Dark,
+                    40.,
+                    !stopping,
+                    cx.listener(move |home, _, _, cx| {
+                        home.request(stop.clone(), "Stopping", Request::Stop, cx);
+                    }),
+                ))
+        })
     }
 
     /// Internet, graphics, screen and the way into the sandbox's settings.
@@ -1064,11 +1338,26 @@ impl Home {
                 .rounded(px(12.))
                 .bg(Theme::surface())
         };
+        // A start takes the card off the host, and says so until it is up.
+        let starting = matches!(
+            self.cover_state(environment),
+            CoverState::Changing(stage) if stage != Some(Stage::Stopping)
+        );
         let gpu = match &self.settings {
             Ok((_, gpus)) => gpus
                 .iter()
                 .find(|g| g.address == environment.settings.gpu)
-                .map_or_else(|| "None".to_owned(), gpu_title),
+                .map_or_else(
+                    || "None".to_owned(),
+                    |g| {
+                        let model = gpu_title(g, gpus);
+                        if starting {
+                            format!("{model}, leaving the host")
+                        } else {
+                            model
+                        }
+                    },
+                ),
             Err(_) => "...".to_owned(),
         };
         let on = environment.settings.internet;
@@ -1085,8 +1374,7 @@ impl Home {
                         if on { "Allowed" } else { "Cut off" }.into(),
                     ))
                     .child(
-                        Switch::new("internet-switch")
-                            .checked(on)
+                        ui::switch("internet-switch", on, SwitchSize::Page)
                             .disabled(self.saving)
                             .on_change(cx.listener(move |home, on: &bool, _, cx| {
                                 home.set_internet(&name, *on, cx);
@@ -1128,11 +1416,10 @@ impl Home {
             _ => "Programs".to_owned(),
         };
         let tab = |id: &'static str, label: String, tab: PanelTab, cx: &mut Context<Self>| {
-            ui::segment(
+            ui::tab(
                 id,
                 label,
                 self.tab == tab,
-                true,
                 cx.listener(move |home, _, _, cx| {
                     // Files open as a panel at the right, over the page.
                     if tab == PanelTab::Files {
@@ -1198,8 +1485,16 @@ impl Home {
         }
     }
 
-    /// The page of the selected sandbox.
+    /// The page of the selected sandbox: banners 16 px apart and off what
+    /// follows, then its parts 20 px apart, or 16 around the strip.
     pub(crate) fn sandbox_page(&self, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
+        // The cover gives its room to a list scrolled away from its top, or
+        // to a window too short to show it whole, and takes it back once
+        // the list is at the top again.
+        let short = window.viewport_size().height < px(COMPACT_BELOW);
+        let compact =
+            short || self.tab_scroll().offset().y < px(0.) || crate::preview::flag("strip");
+        let gap = if compact { 16. } else { 20. };
         // A window too short for everything scrolls the page; the tabs keep
         // a usable height of their own.
         let page = div()
@@ -1209,10 +1504,10 @@ impl Home {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .gap_4()
+            .gap(px(gap))
             .px_8()
             .pb_6()
-            .children(self.notices(cx));
+            .children(self.notices(cx).map(|banners| banners.mb(px(16. - gap))));
         let Some(environment) = self.chosen() else {
             return page.child(
                 div()
@@ -1226,7 +1521,7 @@ impl Home {
                         if self.connected.is_none() {
                             "Loading..."
                         } else {
-                            "No sandbox yet"
+                            NO_SANDBOXES
                         },
                     ))
                     .when(self.connected == Some(true), |empty| {
@@ -1239,20 +1534,16 @@ impl Home {
                     }),
             );
         };
-        // The cover gives its room to a list scrolled away from its top, or
-        // to a window too short to show it whole, and takes it back once
-        // the list is at the top again.
-        let short = window.viewport_size().height < px(COMPACT_BELOW);
-        let compact = short || self.tab_scroll().offset().y < px(0.);
         if compact {
-            page.child(self.cover_strip(environment, cx))
-                .child(self.panel(environment, cx))
-        } else {
-            page.child(self.cover_view(environment, cx))
-                .children(self.tour_hint(cx))
-                .child(self.facts(environment, cx))
-                .child(self.panel(environment, cx))
+            return page
+                .child(self.cover_strip(environment, cx))
+                .child(self.panel(environment, cx));
         }
+        let waiting = matches!(self.cover_state(environment), CoverState::Waiting(..));
+        page.child(self.cover_view(environment, cx))
+            .when(waiting, |page| page.child(Self::waiting_note()))
+            .child(self.facts(environment, cx))
+            .child(self.panel(environment, cx))
     }
 
     /// Plays `name`: asks first when it would stop another sandbox or take
@@ -1282,6 +1573,7 @@ impl Home {
         if single && !self.app_config.single_gpu_explained {
             self.modal = Some(Modal::SingleGpu {
                 name: name.to_owned(),
+                explained: false,
             });
             cx.notify();
             return;
@@ -1324,5 +1616,22 @@ mod tests {
         assert_eq!(played(at(2), now), "Played 2 h ago");
         assert_eq!(played(at(24), now), "Played yesterday");
         assert_eq!(played(at(72), now), "Played 3 days ago");
+    }
+
+    #[test]
+    fn the_design_sandboxes_wear_the_design_colours() {
+        let demo = palette("demo");
+        assert_eq!((demo.small.from, demo.small.to), (0x2b_3a_5e, 0x4a_2f_55));
+        assert_eq!(
+            (demo.large.from, demo.large.between, demo.large.to),
+            (0x24_31_4f, Some((0x3b_2a_4c, 0.55)), 0x20_32_3c)
+        );
+        for brown in ["steam-games", "games"] {
+            let palette = palette(brown);
+            assert_eq!(
+                (palette.large.from, palette.large.to),
+                (0x3d_2e_22, 0x24_32_3a)
+            );
+        }
     }
 }

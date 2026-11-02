@@ -40,8 +40,12 @@ struct Span {
 
 pub struct Filter {
     pattern: Option<Regex>,
+    /// The words that are not `@` words, as typed: the expression.
+    pub text: String,
     /// Whether the words compiled as a regular expression, not as text.
     pub expression: bool,
+    /// The `@` words that name a time, as typed.
+    pub times: Vec<String>,
     spans: Vec<Span>,
     /// What the user should know about the filter as typed.
     pub problem: Option<String>,
@@ -57,7 +61,8 @@ pub enum Period {
 }
 
 impl Period {
-    pub const ALL: [Self; 4] = [Self::Everything, Self::Today, Self::LastHour, Self::Week];
+    /// The periods in the order their menu lists them.
+    pub const ALL: [Self; 4] = [Self::Today, Self::LastHour, Self::Week, Self::Everything];
 
     pub const fn text(self) -> &'static str {
         match self {
@@ -76,7 +81,7 @@ impl Period {
         else {
             return self == Self::Everything;
         };
-        let now = Local::now();
+        let now = crate::clock::now();
         match self {
             Self::Everything => true,
             Self::LastHour => now - when <= chrono::Duration::hours(1),
@@ -173,12 +178,16 @@ impl Span {
 impl Filter {
     pub fn new(text: &str) -> Self {
         let mut spans = Vec::new();
+        let mut times = Vec::new();
         let mut words = Vec::new();
         let mut problem = None;
         for word in text.split_whitespace() {
             match word.strip_prefix('@') {
                 Some(rest) => match span(rest) {
-                    Some(span) => spans.push(span),
+                    Some(span) => {
+                        spans.push(span);
+                        times.push(word.to_owned());
+                    }
                     None => {
                         problem = Some(format!(
                             "{word} is not a time: use @14:05, @2026-11-01 or @14:00..14:30"
@@ -203,10 +212,32 @@ impl Filter {
         };
         Self {
             pattern,
+            text: expression,
             expression: compiled,
+            times,
             spans,
             problem,
         }
+    }
+
+    /// Whether anything was typed that keeps lines out.
+    pub fn narrows(&self) -> bool {
+        self.pattern.is_some() || !self.spans.is_empty()
+    }
+
+    /// What the filter does, for the line under it: the `@` words that
+    /// limit the time, empty when there are none, and what they and the
+    /// rest of the filter are.
+    pub fn summary(&self) -> Option<(String, &'static str)> {
+        let does = match (self.times.len(), self.expression) {
+            (0, false) => return None,
+            (0, true) => "the filter is a regular expression",
+            (1, false) => "limits the time",
+            (_, false) => "limit the time",
+            (1, true) => "limits the time, the rest is a regular expression",
+            (_, true) => "limit the time, the rest is a regular expression",
+        };
+        Some((self.times.join(" "), does))
     }
 
     /// Whether the line written at `time` (seconds since the epoch) with
@@ -321,6 +352,31 @@ mod tests {
             Filter::new("@14:00").matches("anything"),
             Vec::<std::ops::Range<usize>>::new()
         );
+    }
+
+    #[test]
+    fn the_summary_says_what_the_filter_does() {
+        assert_eq!(Filter::new("").summary(), None);
+        assert!(!Filter::new("").narrows());
+        assert_eq!(
+            Filter::new("refus|block @18:00-19:30").summary(),
+            Some((
+                "@18:00-19:30".to_owned(),
+                "limits the time, the rest is a regular expression"
+            ))
+        );
+        assert_eq!(
+            Filter::new("@14:00 @2026-11-01").summary(),
+            Some(("@14:00 @2026-11-01".to_owned(), "limit the time"))
+        );
+        assert_eq!(
+            Filter::new("boot").summary(),
+            Some((String::new(), "the filter is a regular expression"))
+        );
+        let broken = Filter::new("refus(");
+        assert_eq!(broken.summary(), None);
+        assert_eq!(broken.text, "refus(");
+        assert!(broken.narrows());
     }
 
     #[test]

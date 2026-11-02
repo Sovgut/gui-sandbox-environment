@@ -31,6 +31,12 @@ use smallvec::SmallVec;
 use crate::ui::Theme;
 use gse_protocol::qmp::Input;
 
+/// The ground around a sandbox's screen, as dark in the light look as in
+/// the dark one, the way a screen's surround is.
+pub fn surround() -> gpui::Hsla {
+    gpui::rgb(0x08_09_0c).into()
+}
+
 /// Evdev codes the capture combination uses.
 const KEY_LEFT_CTRL: u32 = 29;
 const KEY_RIGHT_CTRL: u32 = 97;
@@ -310,7 +316,7 @@ impl Render for Screen {
             .id("environment-screen")
             .track_focus(&self.focus)
             .size_full()
-            .bg(gpui::black())
+            .bg(surround())
             // The guest draws its own pointer into the frame, in the shape
             // its programs ask for; the host's would be a second one.
             .when(self.image.is_some(), |view| {

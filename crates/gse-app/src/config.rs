@@ -58,6 +58,27 @@ fn home() -> PathBuf {
     std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
 }
 
+/// `path` as the app shows it: under the home folder as `~/...`. A
+/// preview's home is `/home/me`, as its made-up paths are.
+pub fn shown_path(path: &std::path::Path) -> String {
+    let home = if crate::preview::active() {
+        PathBuf::from("/home/me")
+    } else {
+        home()
+    };
+    home_relative(path, &home)
+}
+
+fn home_relative(path: &std::path::Path, home: &std::path::Path) -> String {
+    match path.strip_prefix(home) {
+        // Without a home, every path would be under "/".
+        _ if home.parent().is_none() => path.display().to_string(),
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 pub(crate) fn path() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map_or_else(|| home().join(".config"), PathBuf::from)
@@ -67,6 +88,9 @@ pub(crate) fn path() -> PathBuf {
 impl AppConfig {
     /// The settings saved, or the defaults: archives go to `~/GSE`.
     pub fn load() -> Self {
+        if crate::preview::active() {
+            return Self::preview();
+        }
         let table = fs::read_to_string(path())
             .ok()
             .and_then(|text| text.parse::<toml::Table>().ok())
@@ -100,7 +124,27 @@ impl AppConfig {
         }
     }
 
+    /// The settings of a preview, the same on every machine.
+    fn preview() -> Self {
+        Self {
+            received: PathBuf::from("/home/me/GSE"),
+            tour_done: true,
+            check_updates: true,
+            look: if crate::preview::light() {
+                Look::Light
+            } else {
+                Look::Dark
+            },
+            first_set: None,
+            single_gpu_explained: false,
+        }
+    }
+
+    /// Writes the settings; a preview writes nothing.
     pub fn save(&self) -> Result<()> {
+        if crate::preview::active() {
+            return Ok(());
+        }
         let path = path();
         fs::create_dir_all(path.parent().context("config path")?)?;
         let mut table = toml::Table::new();
@@ -152,4 +196,23 @@ pub fn remove_everything(received: Option<&std::path::Path>) -> Result<()> {
         fs::remove_dir_all(received).ok();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_under_home_read_from_a_tilde() {
+        let home = std::path::Path::new("/home/me");
+        let shown = |path: &str| home_relative(std::path::Path::new(path), home);
+        assert_eq!(shown("/home/me/GSE"), "~/GSE");
+        assert_eq!(shown("/home/me"), "~");
+        assert_eq!(shown("/home/meg/GSE"), "/home/meg/GSE");
+        assert_eq!(shown("/srv/GSE"), "/srv/GSE");
+        assert_eq!(
+            home_relative(std::path::Path::new("/srv/GSE"), std::path::Path::new("/")),
+            "/srv/GSE"
+        );
+    }
 }

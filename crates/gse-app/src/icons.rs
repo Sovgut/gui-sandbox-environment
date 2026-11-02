@@ -37,10 +37,19 @@ pub enum Icon {
     WindowMaximize,
     WindowRestore,
     WindowClose,
+    Warning,
+    Check,
+    Preparing,
+    Done,
+    Failed,
+    Info,
+    SidebarClose,
+    SidebarOpen,
+    Mark,
 }
 
 impl Icon {
-    const ALL: [Self; 27] = [
+    const ALL: [Self; 36] = [
         Self::Settings,
         Self::Sliders,
         Self::Play,
@@ -68,6 +77,15 @@ impl Icon {
         Self::WindowMaximize,
         Self::WindowRestore,
         Self::WindowClose,
+        Self::Warning,
+        Self::Check,
+        Self::Preparing,
+        Self::Done,
+        Self::Failed,
+        Self::Info,
+        Self::SidebarClose,
+        Self::SidebarOpen,
+        Self::Mark,
     ];
 
     fn name(self) -> &'static str {
@@ -99,6 +117,15 @@ impl Icon {
             Self::WindowMaximize => "window-maximize",
             Self::WindowRestore => "window-restore",
             Self::WindowClose => "window-close",
+            Self::Warning => "warning",
+            Self::Check => "check",
+            Self::Preparing => "preparing",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Info => "info",
+            Self::SidebarClose => "sidebar-close",
+            Self::SidebarOpen => "sidebar-open",
+            Self::Mark => "mark",
         }
     }
 
@@ -111,12 +138,12 @@ impl Icon {
     fn drawing(self) -> &'static str {
         match self {
             Self::Settings => {
-                r#"<circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="6.5"/><path d="M18.5 12H21.5M16.6 16.6L18.72 18.72M12 18.5V21.5M7.4 16.6L5.28 18.72M5.5 12H2.5M7.4 7.4L5.28 5.28M12 5.5V2.5M16.6 7.4L18.72 5.28"/>"#
+                r#"<circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="7"/><path d="M12 2.5V5M12 19V21.5M2.5 12H5M19 12H21.5"/>"#
             }
             Self::Sliders => {
                 r#"<path d="M4 6H11M15 6H20M4 12H6M10 12H20M4 18H14M18 18H20"/><circle cx="13" cy="6" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="16" cy="18" r="2"/>"#
             }
-            Self::Play => r#"<path d="M7 4.5V19.5L19.5 12Z" fill="black"/>"#,
+            Self::Play => r#"<path d="M7 4.5V19.5L19.5 12Z" fill="black" stroke="none"/>"#,
             Self::Stop => r#"<rect x="6" y="6" width="12" height="12" rx="1.5" fill="black"/>"#,
             Self::Reset => r#"<path d="M4 12A8 8 0 1 0 6.34 6.34L4 8.7"/><path d="M4 4V8.7H8.7"/>"#,
             Self::Trash => {
@@ -154,6 +181,26 @@ impl Icon {
             Self::WindowMaximize => r#"<path d="M6 14.5L12 8.5L18 14.5"/>"#,
             Self::WindowRestore => r#"<path d="M12 6L18 12L12 18L6 12Z"/>"#,
             Self::WindowClose => r#"<path d="M7 7L17 17M17 7L7 17"/>"#,
+            Self::Warning => r#"<path d="M12 3L21 19H3Z"/><path d="M12 10V14M12 17H12.01"/>"#,
+            // Heavier than the rest: it stands on a small filled disc.
+            Self::Check => r#"<path d="M5 12.5L9.5 17L19 7.5" stroke-width="3"/>"#,
+            // Four short rays: something on its way, such as a sandbox
+            // waiting for its apps.
+            Self::Preparing => r#"<path d="M12 3V7M12 17V21M3 12H7M17 12H21"/>"#,
+            Self::Done => r#"<path d="M5 12L10 17L19 7"/>"#,
+            Self::Failed => r#"<circle cx="12" cy="12" r="9"/><path d="M15 9L9 15M9 9L15 15"/>"#,
+            Self::Info => r#"<circle cx="12" cy="12" r="9"/><path d="M12 8V13M12 16H12.01"/>"#,
+            Self::SidebarClose => {
+                r#"<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4V20M16 10L14 12L16 14"/>"#
+            }
+            Self::SidebarOpen => {
+                r#"<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4V20M14 10L16 12L14 14"/>"#
+            }
+            // The monitor of the app's mark, heavier than the monitor icon so
+            // it holds up on the accent square.
+            Self::Mark => {
+                r#"<g stroke-width="2.4"><rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21H16M12 17V21"/></g>"#
+            }
             Self::Refresh => {
                 r#"<path d="M20 12A8 8 0 1 1 17.66 6.34L20 8.7"/><path d="M20 4V8.7H15.3"/>"#
             }

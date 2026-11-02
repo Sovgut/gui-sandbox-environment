@@ -7,13 +7,15 @@ use std::ops::Range;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill,
-    point, prelude::*, px, relative, size,
+    EntityInputHandler, FocusHandle, Focusable, FontWeight, GlobalElementId, Hsla, KeyBinding,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
+    fill, point, prelude::*, px, relative, size,
 };
+use gpui_kit::component::ActiveTheme as _;
 
-use crate::ui::Theme;
+use crate::icons::Icon;
+use crate::ui::{self, Theme};
 
 actions!(
     text_input,
@@ -34,6 +36,37 @@ actions!(
 );
 
 const CONTEXT: &str = "TextInput";
+
+/// How a [`TextInput`] looks, by where it sits. The heights are the whole
+/// field, border included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Look {
+    /// A search box: no border, 34 tall, 13 px text, sunk into the page.
+    Search,
+    /// A form field 36 tall: in panels, sheets and questions.
+    #[default]
+    Field,
+    /// A form field 42 tall: the name in a dialog that makes something.
+    DialogField,
+    /// A form field 44 tall, 15 px text, a shade off the page: the one
+    /// field of a page.
+    PageField,
+    /// The name of what an editor page edits: 40 tall like the page's
+    /// buttons beside it, 18 px semibold.
+    TitleField,
+}
+
+/// What a [`Look`] measures, in pixels: height, side padding, corner
+/// radius, text size and weight.
+const fn measures(look: Look) -> (f32, f32, f32, f32, FontWeight) {
+    match look {
+        Look::Search => (34., 10., 8., 13., FontWeight::NORMAL),
+        Look::Field => (36., 10., 8., 14., FontWeight::NORMAL),
+        Look::DialogField => (42., 12., 9., 14., FontWeight::NORMAL),
+        Look::PageField => (44., 14., 10., 15., FontWeight::NORMAL),
+        Look::TitleField => (40., 12., 9., 18., FontWeight::SEMIBOLD),
+    }
+}
 
 /// Binds the input's keys; called once when the app starts.
 pub fn bind_keys(cx: &mut App) {
@@ -66,6 +99,13 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    look: Look,
+    /// Drawn before the text, such as a search box's magnifier.
+    icon: Option<Icon>,
+    /// The ground in place of the look's own; read at each render, so it
+    /// follows the palette.
+    fill: Option<fn() -> Hsla>,
+    monospace: bool,
 }
 
 impl TextInput {
@@ -80,7 +120,35 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            look: Look::default(),
+            icon: None,
+            fill: None,
+            monospace: false,
         }
+    }
+
+    pub fn look(mut self, look: Look) -> Self {
+        self.look = look;
+        self
+    }
+
+    /// `icon` before the text, 15 px in the muted colour.
+    pub fn icon(mut self, icon: Icon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    /// The field's ground in `color`, a colour of [`Theme`]: a search box on
+    /// a raised sidebar, a field straight on the page.
+    pub fn fill(mut self, color: fn() -> Hsla) -> Self {
+        self.fill = Some(color);
+        self
+    }
+
+    /// Typed in the monospace font, for expressions and times.
+    pub fn monospace(mut self) -> Self {
+        self.monospace = true;
+        self
     }
 
     pub fn text(&self) -> &str {
@@ -93,6 +161,12 @@ impl TextInput {
         self.selected_range = self.content.len()..self.content.len();
         self.selection_reversed = false;
         self.marked_range = None;
+        cx.notify();
+    }
+
+    /// Replaces what the field shows while it is empty.
+    pub fn set_placeholder(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.placeholder = text.into();
         cx.notify();
     }
 
@@ -583,23 +657,44 @@ impl Element for TextElement {
 impl Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.is_focused(window);
+        let search = self.look == Look::Search;
+        let (height, padding, radius, text, weight) = measures(self.look);
+        // Sunk into what it sits on, but for a page's own field, which
+        // stands a shade off the page.
+        let ground = self.fill.map_or_else(
+            || match self.look {
+                Look::Search => Theme::background(),
+                Look::PageField => Theme::panel(),
+                Look::Field | Look::DialogField | Look::TitleField => Theme::well(),
+            },
+            |fill| fill(),
+        );
+        // A search box has no border until it has the keys; it keeps a
+        // clear one meanwhile, so its text does not move.
+        let border = match (focused, search) {
+            (true, true) => Theme::accent().opacity(0.4),
+            (true, false) => Theme::accent(),
+            (false, true) => gpui::transparent_black(),
+            (false, false) => Theme::line(),
+        };
         div()
             .flex()
             .items_center()
+            .gap_2()
             .w_full()
-            .h(px(32.))
-            .px_2()
-            .rounded_md()
+            .h(px(height))
+            .px(px(padding))
+            .rounded(px(radius))
             .border_1()
-            .border_color(if focused {
-                Theme::accent()
-            } else {
-                Theme::border()
-            })
-            .bg(Theme::background())
-            .text_sm()
-            .line_height(px(20.))
+            .border_color(border)
+            .bg(ground)
+            .text_size(px(text))
+            .font_weight(weight)
+            .line_height(px((text * 1.25).max(20.).round()))
             .text_color(Theme::text())
+            .when(self.monospace, |field| {
+                field.font_family(cx.theme().mono_font_family.clone())
+            })
             .overflow_hidden()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
@@ -620,7 +715,15 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .child(TextElement { input: cx.entity() })
+            .when_some(self.icon, |field, icon| {
+                field.child(ui::icon(icon, Theme::muted()).size(px(15.)))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(TextElement { input: cx.entity() }),
+            )
     }
 }
 

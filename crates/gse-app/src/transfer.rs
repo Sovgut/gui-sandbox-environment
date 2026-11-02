@@ -13,28 +13,51 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use chrono::Local;
-use gpui::{Context, Div, Entity, FontWeight, PathPromptOptions, div, prelude::*, px};
+use gpui::{
+    Context, Div, Entity, FontWeight, Hsla, PathPromptOptions, div, prelude::*, px, relative,
+};
 use gse_protocol::{GuestFile, GuestFiles, Request};
 use zip::write::SimpleFileOptions;
 
 use crate::client::{self, Taking};
-use crate::config::Look;
+use crate::config::{Look, shown_path};
 use crate::icons::Icon;
 use crate::programs::size_text;
-use crate::settings::{group, row};
+use crate::sandbox::{DialogSize, dialog, dialog_text, marked, sentence, still_field};
+use crate::settings::Rows;
 use crate::text_input::TextInput;
-use crate::ui::{self, Kind, Theme, button};
+use crate::ui::{self, Kind, Size, Theme, Tone, button};
 use crate::{Home, Modal};
 
-/// What the last move of files did, for the dialog to say.
+/// What the last move of files did, for the panel to say.
 pub enum Moved {
+    /// `count` files went into `archive`, none when nothing passed the
+    /// checks; `refused` are the files the take kept inside, with why.
     Taken {
         archive: Option<PathBuf>,
         count: usize,
         refused: Vec<(String, String)>,
     },
+    /// That many files and folders went into the Inbox, or wait for the
+    /// next start.
     Sent(usize),
-    Failed(String),
+    /// Taking files out failed, for this reason.
+    TakeFailed(String),
+    /// Sending files in failed, for this reason.
+    SendFailed(String),
+}
+
+/// What the busy entry of a sandbox's files says while a move runs.
+pub(crate) const TAKING: &str = "Taking files out";
+const SENDING: &str = "Sending files in";
+
+/// `count` of `one`, in its plural from 2 on: `1 file`, `2 files`.
+fn counted(count: usize, one: &str, many: &str) -> String {
+    if count == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{count} {many}")
+    }
 }
 
 /// Whether `path`, from the sandbox, stays below the folder it is joined
@@ -117,24 +140,78 @@ fn write_zip(staging: &Path, files: &[String], archive: &Path) -> Result<()> {
     Ok(())
 }
 
-fn section(title: &'static str, text: String) -> Div {
+/// The heading of a part of the files panel, and what it does under it:
+/// `before`, `strong` in the text's full colour, such as a folder, and
+/// `after`.
+fn section(title: &'static str, (before, strong, after): (&str, &str, &str)) -> Div {
     div()
         .flex()
         .flex_col()
-        .gap_1()
-        .child(div().font_weight(FontWeight::BOLD).child(title))
         .child(
             div()
-                .text_sm()
-                .line_height(px(19.))
+                .text_size(px(15.))
+                .font_weight(FontWeight::BOLD)
+                .child(title),
+        )
+        .child(
+            div()
+                .mt(px(3.))
+                .text_size(px(13.))
+                .line_height(relative(1.45))
                 .text_color(Theme::secondary_text())
-                .child(text),
+                .child(marked(before, strong, after, Theme::text(), false)),
         )
 }
 
-fn file_list(id: &'static str, files: &[GuestFile], empty: &'static str) -> impl IntoElement {
+/// A line under a part of the files panel that says how a move went.
+fn outcome(color: Hsla, text: String) -> Div {
+    div().text_xs().text_color(color).child(text)
+}
+
+/// An item of a list: a disc in the gutter, level with its first line.
+fn listed(text: String) -> Div {
+    div()
+        .flex()
+        .items_start()
+        .line_height(relative(1.8))
+        .text_color(Theme::soft_text())
+        .child(
+            div().flex_none().w(px(18.)).child(
+                div()
+                    .ml(px(2.))
+                    .mt(px(10.))
+                    .size(px(5.))
+                    .rounded_full()
+                    .bg(Theme::soft_text()),
+            ),
+        )
+        .child(text)
+}
+
+/// What the panel knows of the Inbox or the Outbox.
+#[derive(Clone, Copy)]
+enum Listed<'a> {
+    Loading,
+    /// The listing failed; the panel says why above.
+    Failed,
+    Files(&'a [GuestFile]),
+}
+
+/// How many files of the Outbox a take hands out as far as their names
+/// tell; the service refuses others by how they start, which only the take
+/// finds out.
+fn passing(outbox: &[GuestFile]) -> usize {
+    outbox
+        .iter()
+        .filter(|f| gse_protocol::kept_by_name(&f.path).is_none())
+        .count()
+}
+
+/// The Outbox as a list, files whose name keeps them inside marked; none
+/// when it could not be listed.
+fn outbox_list(listed: Listed, empty: &'static str) -> Option<gpui::Stateful<Div>> {
     let mut list = div()
-        .id(id)
+        .id("outbox-files")
         .flex()
         .flex_col()
         .max_h(px(180.))
@@ -143,28 +220,35 @@ fn file_list(id: &'static str, files: &[GuestFile], empty: &'static str) -> impl
         .bg(Theme::well())
         .border_1()
         .border_color(Theme::border())
-        .text_sm();
-    if files.is_empty() {
-        return list.child(div().px_3().py_2().text_color(Theme::subtle()).child(empty));
-    }
+        .text_size(px(13.));
+    let quiet = |text: &'static str| div().px_3().py_2().text_color(Theme::subtle()).child(text);
+    let files = match listed {
+        Listed::Failed => return None,
+        Listed::Loading => return Some(list.child(quiet("Loading..."))),
+        Listed::Files([]) => return Some(list.child(quiet(empty))),
+        Listed::Files(files) => files,
+    };
     for (i, file) in files.iter().enumerate() {
+        let kept = gse_protocol::kept_by_name(&file.path);
         list = list.child(
             div()
                 .flex()
                 .gap_3()
                 .px_3()
-                .py_2()
+                .py(px(9.))
                 .when(i > 0, |row| row.border_t_1().border_color(Theme::divider()))
+                .when(kept.is_some(), |row| row.text_color(Theme::warning()))
                 .child(div().flex_1().min_w_0().truncate().child(file.path.clone()))
-                .child(
-                    div()
+                .child(match kept {
+                    Some(what) => div().flex_none().child(format!("stays: {what}")),
+                    None => div()
                         .flex_none()
                         .text_color(Theme::muted())
                         .child(size_text(file.size)),
-                ),
+                }),
         );
     }
-    list
+    Some(list)
 }
 
 impl Home {
@@ -195,15 +279,29 @@ impl Home {
         .detach();
     }
 
-    /// Runs `work`, a move of files for `name`, then lists its folders again.
+    /// Lists the Inbox and Outbox of `name` again after a listing failed,
+    /// showing them as loading meanwhile.
+    fn list_files_again(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.preview_skips("listing the files again", cx) {
+            return;
+        }
+        self.files = None;
+        Self::load_files(name, cx);
+        cx.notify();
+    }
+
+    /// Runs `work`, a move of files for `name` that `doing` names, then
+    /// lists its folders again. The panel says how it went while it shows
+    /// that sandbox; an archive it wrote is the sandbox's last one.
     fn move_files(
         &mut self,
         name: &str,
+        doing: &'static str,
         work: impl FnOnce() -> Moved + Send + 'static,
         cx: &mut Context<Self>,
     ) {
         let key = format!("{name}/files");
-        self.busy.insert(key.clone(), "Moving files");
+        self.busy.insert(key.clone(), doing);
         self.moved = None;
         cx.notify();
         let name = name.to_owned();
@@ -211,7 +309,18 @@ impl Home {
             let moved = cx.background_executor().spawn(async move { work() }).await;
             this.update(cx, |home, cx| {
                 home.busy.remove(&key);
-                home.moved = Some(moved);
+                if let Moved::Taken {
+                    archive: Some(archive),
+                    ..
+                } = &moved
+                {
+                    home.last_taken.insert(name.clone(), archive.clone());
+                }
+                if matches!(&home.modal, Some(Modal::Transfer { name: shown }) if *shown == name) {
+                    home.moved = Some(moved);
+                } else {
+                    home.tell_moved(&name, moved);
+                }
                 Self::load_files(&name, cx);
             })
             .ok();
@@ -219,11 +328,52 @@ impl Home {
         .detach();
     }
 
+    /// Says how a move for `name` went in toasts, for when its panel is no
+    /// longer open: what was taken, what stayed inside and why, or the error.
+    fn tell_moved(&mut self, name: &str, moved: Moved) {
+        match moved {
+            Moved::Taken {
+                archive,
+                count,
+                refused,
+            } => {
+                if let Some(archive) = archive {
+                    self.tell(crate::Toast::taken(name, count, archive));
+                }
+                if !refused.is_empty() {
+                    let why = refused
+                        .iter()
+                        .map(|(file, reason)| format!("{file} is {reason}"))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    self.tell(
+                        crate::Toast::error(
+                            format!(
+                                "{} stayed in the sandbox",
+                                counted(refused.len(), "file", "files")
+                            ),
+                            format!("{why}. Programs can't leave a sandbox."),
+                        )
+                        .about(name),
+                    );
+                }
+            }
+            Moved::Sent(_) => {}
+            Moved::TakeFailed(why) => self
+                .tell(crate::Toast::error("Taking files out failed", sentence(&why)).about(name)),
+            Moved::SendFailed(why) => self
+                .tell(crate::Toast::error("Sending files in failed", sentence(&why)).about(name)),
+        }
+    }
+
     fn take_files(&mut self, name: &str, cx: &mut Context<Self>) {
         let (owner, folder) = (name.to_owned(), self.app_config.received.clone());
         self.move_files(
             name,
-            move || take_into(&owner, &folder).unwrap_or_else(|e| Moved::Failed(format!("{e:#}"))),
+            TAKING,
+            move || {
+                take_into(&owner, &folder).unwrap_or_else(|e| Moved::TakeFailed(format!("{e:#}")))
+            },
             cx,
         );
     }
@@ -237,9 +387,10 @@ impl Home {
         };
         self.move_files(
             name,
+            SENDING,
             move || match client::command(&request) {
                 Ok(()) => Moved::Sent(count),
-                Err(e) => Moved::Failed(format!("{e:#}")),
+                Err(e) => Moved::SendFailed(format!("{e:#}")),
             },
             cx,
         );
@@ -264,72 +415,130 @@ impl Home {
         .detach();
     }
 
-    fn moved_note(&self) -> Option<Div> {
-        let note = |color: gpui::Hsla, text: String| {
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p_2()
-                .rounded_md()
-                .bg(color.opacity(0.1))
-                .border_1()
-                .border_color(color.opacity(0.35))
-                .text_sm()
-                .child(div().text_color(color).child(text))
+    /// A line naming `archive` after `text`, with a link to the folder it
+    /// is in.
+    fn archive_line(text: String, archive: &Path) -> Div {
+        let folder = archive.parent().map(Path::to_path_buf).unwrap_or_default();
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .text_xs()
+            .text_color(Theme::good())
+            .child(text)
+            .child("\u{b7}")
+            .child(
+                ui::link("show-taken", "Show in folder")
+                    .text_xs()
+                    .on_click(move |_, _, _| {
+                        if crate::preview::active() {
+                            return;
+                        }
+                        std::process::Command::new("xdg-open")
+                            .arg(&folder)
+                            .spawn()
+                            .ok();
+                    }),
+            )
+    }
+
+    /// How the take of `name` going on or just done goes, or else the
+    /// archive its Outbox last went into. Files a take kept inside are
+    /// named here unless the list marks them already.
+    fn take_outcome(&self, name: &str, busy: Option<&str>) -> Vec<Div> {
+        if busy == Some(TAKING) {
+            return vec![outcome(Theme::accent(), format!("{TAKING}..."))];
+        }
+        let file_name = |archive: &Path| {
+            archive
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
         };
-        Some(match self.moved.as_ref()? {
-            Moved::Sent(count) => note(Theme::good(), format!("{count} item(s) are in the Inbox.")),
-            Moved::Failed(e) => note(Theme::danger(), e.clone()),
-            Moved::Taken {
+        match &self.moved {
+            Some(Moved::Taken {
                 archive,
                 count,
                 refused,
-            } => {
+            }) => {
                 let head = match archive {
-                    Some(archive) => format!("{count} file(s) saved to {}", archive.display()),
-                    None => "Nothing passed the checks; no archive was written.".to_owned(),
+                    Some(archive) => Self::archive_line(
+                        format!(
+                            "{} taken out: {}",
+                            counted(*count, "file", "files"),
+                            file_name(archive)
+                        ),
+                        archive,
+                    ),
+                    None => outcome(
+                        Theme::warning(),
+                        "Nothing passed the checks; no archive was written.".to_owned(),
+                    ),
                 };
-                let mut box_ = note(
-                    if refused.is_empty() {
-                        Theme::good()
-                    } else {
-                        Theme::warning()
-                    },
-                    head,
-                );
-                for (path, reason) in refused {
-                    box_ = box_.child(
-                        div()
-                            .text_xs()
-                            .text_color(Theme::muted())
-                            .child(format!("Refused {path}: {reason}")),
-                    );
-                }
-                box_
+                std::iter::once(head)
+                    .chain(
+                        refused
+                            .iter()
+                            .filter(|(path, _)| gse_protocol::kept_by_name(path).is_none())
+                            .map(|(path, reason)| {
+                                outcome(Theme::warning(), format!("{path} stayed inside: {reason}"))
+                            }),
+                    )
+                    .collect()
             }
-        })
+            Some(Moved::TakeFailed(e)) => vec![outcome(
+                Theme::danger(),
+                format!("Taking files out failed: {e}"),
+            )],
+            _ => self
+                .last_taken
+                .get(name)
+                .map(|archive| {
+                    Self::archive_line(format!("Last time: {}", file_name(archive)), archive)
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// How the sending going on or just done goes.
+    fn send_outcome(&self, up: bool, busy: Option<&str>) -> Option<Div> {
+        if busy == Some(SENDING) {
+            return Some(outcome(Theme::accent(), format!("{SENDING}...")));
+        }
+        match &self.moved {
+            Some(Moved::Sent(count)) => {
+                let items = counted(*count, "item", "items");
+                Some(outcome(
+                    Theme::good(),
+                    match (up, *count) {
+                        (true, _) => format!("{items} went into the Inbox."),
+                        (false, 1) => format!("{items} waits for the next start."),
+                        (false, _) => format!("{items} wait for the next start."),
+                    },
+                ))
+            }
+            Some(Moved::SendFailed(e)) => Some(outcome(
+                Theme::danger(),
+                format!("Sending files in failed: {e}"),
+            )),
+            _ => None,
+        }
     }
 
     fn take_section(
         &self,
         name: &str,
-        outbox: &[GuestFile],
-        (busy, up): (bool, bool),
+        outbox: Listed,
+        (busy, up): (Option<&'static str>, bool),
         cx: &mut Context<Self>,
     ) -> Div {
-        let take = name.to_owned();
-        let folder = self.app_config.received.display().to_string();
-        let open = self.app_config.received.clone();
-        let last = match &self.moved {
-            Some(Moved::Taken {
-                archive: Some(archive),
-                ..
-            }) => archive
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned()),
-            _ => None,
+        let taken = match outbox {
+            Listed::Files(files) => passing(files),
+            Listed::Loading | Listed::Failed => 0,
         };
+        let take = name.to_owned();
+        let folder = shown_path(&self.app_config.received);
         div()
             .flex()
             .flex_col()
@@ -337,20 +546,21 @@ impl Home {
             .child(section(
                 "Take out",
                 if up {
-                    format!(
-                        "What is in the sandbox's Outbox comes to {folder} as one zip. \
-                         Programs, scripts and archives stay inside."
+                    (
+                        "What is in the sandbox's Outbox comes to ",
+                        &folder,
+                        " as one zip. Programs, scripts and archives stay inside.",
                     )
                 } else {
-                    format!(
+                    (
                         "What its Outbox held while it ran on the whole screen was taken out \
-                         then, and comes to {folder} as one zip. Programs, scripts and archives \
-                         stayed inside."
+                         then, and comes to ",
+                        &folder,
+                        " as one zip. Programs, scripts and archives stayed inside.",
                     )
                 },
             ))
-            .child(file_list(
-                "outbox-files",
+            .children(outbox_list(
                 outbox,
                 if up {
                     "The Outbox is empty."
@@ -361,46 +571,28 @@ impl Home {
             .child(
                 button(
                     "take-files",
-                    match outbox.len() {
+                    match taken {
                         0 => "Take files out".to_owned(),
                         1 => "Take 1 file out".to_owned(),
                         n => format!("Take {n} files out"),
                     },
                     Kind::Primary,
-                    !busy && !outbox.is_empty(),
+                    busy.is_none() && taken > 0,
                     cx.listener(move |home, _, _, cx| home.take_files(&take, cx)),
                 )
-                .icon(ui::kit_icon(Icon::Download))
+                .size(Size::Dialog)
+                .icon(Icon::Download)
+                .h(px(42.))
                 .w_full(),
             )
-            .children(last.map(|archive| {
-                div()
-                    .flex()
-                    .gap_1()
-                    .text_xs()
-                    .text_color(Theme::good())
-                    .child(format!("Last time: {archive} \u{b7}"))
-                    .child(
-                        div()
-                            .id("show-taken")
-                            .text_color(Theme::accent())
-                            .cursor_pointer()
-                            .on_click(move |_, _, _| {
-                                fs::create_dir_all(&open).ok();
-                                std::process::Command::new("xdg-open")
-                                    .arg(&open)
-                                    .spawn()
-                                    .ok();
-                            })
-                            .child("Show in folder"),
-                    )
-            }))
+            .children(self.take_outcome(name, busy))
     }
 
     fn send_section(
+        &self,
         name: &str,
-        inbox: &[GuestFile],
-        (busy, up): (bool, bool),
+        inbox: Listed,
+        (busy, up): (Option<&'static str>, bool),
         cx: &mut Context<Self>,
     ) -> Div {
         let (send_files, send_folders) = (name.to_owned(), name.to_owned());
@@ -410,10 +602,16 @@ impl Home {
             "Waiting for the next start"
         };
         let now = match inbox {
-            [] if up => "The Inbox is empty.".to_owned(),
-            [] => "Nothing waits to go in.".to_owned(),
-            [one] => format!("{place}: {} \u{b7} {}", one.path, size_text(one.size)),
-            many => format!("{place}: {} items", many.len()),
+            Listed::Loading => Some("Loading...".to_owned()),
+            Listed::Failed => None,
+            Listed::Files([]) if up => Some("The Inbox is empty.".to_owned()),
+            Listed::Files([]) => Some("Nothing waits to go in.".to_owned()),
+            Listed::Files([one]) => Some(format!(
+                "{place}: {} \u{b7} {}",
+                one.path,
+                size_text(one.size)
+            )),
+            Listed::Files(many) => Some(format!("{place}: {} items", many.len())),
         };
         div()
             .flex()
@@ -421,14 +619,17 @@ impl Home {
             .gap_3()
             .child(section(
                 "Send in",
-                if up {
-                    "Files and folders land in the sandbox's Inbox, where its programs open and \
-                     run them."
-                } else {
-                    "Files and folders wait here and land in the sandbox's Inbox when it next \
-                     starts, where its programs open and run them."
-                }
-                .to_owned(),
+                (
+                    if up {
+                        "Files and folders land in the sandbox's Inbox, where its programs open \
+                         and run them."
+                    } else {
+                        "Files and folders wait here and land in the sandbox's Inbox when it \
+                         next starts, where its programs open and run them."
+                    },
+                    "",
+                    "",
+                ),
             ))
             .child(
                 div()
@@ -437,11 +638,12 @@ impl Home {
                     .items_center()
                     .justify_center()
                     .gap_2p5()
-                    .h(px(150.))
+                    // 150 inside its border, as the design draws it.
+                    .h(px(154.))
                     .rounded(px(12.))
                     .border_2()
                     .border_dashed()
-                    .border_color(Theme::line())
+                    .border_color(Theme::pending())
                     .text_sm()
                     .text_color(Theme::secondary_text())
                     .child(ui::icon(Icon::Upload, Theme::secondary_text()).size(px(26.)))
@@ -450,27 +652,39 @@ impl Home {
                         div()
                             .flex()
                             .gap_2()
-                            .child(button(
-                                "send-files",
-                                "Choose files",
-                                Kind::Secondary,
-                                !busy,
-                                cx.listener(move |_, _, _, cx| {
-                                    Self::choose_and_send(&send_files, false, cx);
-                                }),
-                            ))
-                            .child(button(
-                                "send-folders",
-                                "Choose a folder",
-                                Kind::Secondary,
-                                !busy,
-                                cx.listener(move |_, _, _, cx| {
-                                    Self::choose_and_send(&send_folders, true, cx);
-                                }),
-                            )),
+                            .child(
+                                button(
+                                    "send-files",
+                                    "Choose files",
+                                    Kind::Secondary,
+                                    busy.is_none(),
+                                    cx.listener(move |_, _, _, cx| {
+                                        Self::choose_and_send(&send_files, false, cx);
+                                    }),
+                                )
+                                .fill(Theme::selected()),
+                            )
+                            .child(
+                                button(
+                                    "send-folders",
+                                    "Choose a folder",
+                                    Kind::Secondary,
+                                    busy.is_none(),
+                                    cx.listener(move |_, _, _, cx| {
+                                        Self::choose_and_send(&send_folders, true, cx);
+                                    }),
+                                )
+                                .fill(Theme::selected()),
+                            ),
                     ),
             )
-            .child(div().text_sm().text_color(Theme::muted()).child(now))
+            .children(now.map(|now| {
+                div()
+                    .text_size(px(13.))
+                    .text_color(Theme::muted())
+                    .child(now)
+            }))
+            .children(self.send_outcome(up, busy))
     }
 
     /// Taking files out of `name` and sending files in: its Files tab, and
@@ -484,18 +698,23 @@ impl Home {
             .child(self.files_list(name, cx))
     }
 
+    /// The take and the send as parts ruled off from each other, under the
+    /// reason the folders could not be listed.
     fn files_list(&self, name: &str, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
-        let busy = self.busy.contains_key(&format!("{name}/files"));
+        let busy = self.busy.get(&format!("{name}/files")).copied();
         let files = self
             .files
             .as_ref()
             .filter(|(n, _)| n == name)
             .map(|(_, f)| f);
         let (inbox, outbox, problem) = match files {
-            Some(Ok(GuestFiles { inbox, outbox })) => (inbox.as_slice(), outbox.as_slice(), None),
-            Some(Err(e)) => (&[][..], &[][..], Some(e.clone())),
-            None => (&[][..], &[][..], None),
+            Some(Ok(GuestFiles { inbox, outbox })) => {
+                (Listed::Files(inbox), Listed::Files(outbox), None)
+            }
+            Some(Err(e)) => (Listed::Failed, Listed::Failed, Some(e.clone())),
+            None => (Listed::Loading, Listed::Loading, None),
         };
+        let again = name.to_owned();
         let drop_to = name.to_owned();
         let up = self.environments.iter().any(|e| {
             e.name == name
@@ -509,9 +728,6 @@ impl Home {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .gap_5()
-            .px_6()
-            .py_5()
             .overflow_y_scroll()
             .track_scroll(&self.files_scroll)
             .on_drop(
@@ -519,18 +735,27 @@ impl Home {
                     home.send_paths(&drop_to, paths.paths().to_vec(), cx);
                 }),
             )
-            .children(problem.map(|p| div().text_sm().text_color(Theme::warning()).child(p)))
-            .child(self.take_section(name, outbox, (busy, up), cx))
-            .child(Self::send_section(name, inbox, (busy, up), cx))
-            .when(busy, |body| {
-                body.child(
-                    div()
-                        .text_sm()
-                        .text_color(Theme::accent())
-                        .child("Moving files..."),
+            .children(problem.map(|reason| {
+                div().px_6().pt_5().child(
+                    ui::notice(Tone::Warning, "Files are unavailable", sentence(&reason)).child(
+                        button(
+                            "files-retry",
+                            "Try again",
+                            Kind::Secondary,
+                            true,
+                            cx.listener(move |home, _, _, cx| home.list_files_again(&again, cx)),
+                        ),
+                    ),
                 )
-            })
-            .children(self.moved_note())
+            }))
+            .child(
+                self.take_section(name, outbox, (busy, up), cx)
+                    .px_6()
+                    .py_5()
+                    .border_b_1()
+                    .border_color(Theme::border()),
+            )
+            .child(self.send_section(name, inbox, (busy, up), cx).px_6().py_5())
     }
 
     /// App settings, General: the look, where taken files go, the tour,
@@ -551,16 +776,16 @@ impl Home {
             .child(choice("look-system", "System", Look::System, cx))
             .child(choice("look-light", "Light", Look::Light, cx))
             .child(choice("look-dark", "Dark", Look::Dark, cx));
-        let folder = self.app_config.received.display().to_string();
-        let rows = group(
+        let folder = shown_path(&self.app_config.received);
+        let rows = Rows::Headlines.group(
             None,
             vec![
-                row(
+                Rows::Headlines.row(
                     "Look",
                     Some("Follows the system unless you pick one.".to_owned()),
                     looks,
                 ),
-                row(
+                Rows::Headlines.row(
                     "Files taken out go to",
                     Some(folder),
                     button(
@@ -569,9 +794,11 @@ impl Home {
                         Kind::Secondary,
                         true,
                         cx.listener(|_, _, _, cx| Self::choose_received(cx)),
-                    ),
+                    )
+                    .size(Size::Toolbar)
+                    .fill(Theme::selected()),
                 ),
-                row(
+                Rows::Headlines.row(
                     "Show the welcome tour again",
                     Some("From the first step, any time.".to_owned()),
                     button(
@@ -580,7 +807,9 @@ impl Home {
                         Kind::Secondary,
                         true,
                         cx.listener(|home, _, _, cx| home.start_tour(cx)),
-                    ),
+                    )
+                    .size(Size::Toolbar)
+                    .fill(Theme::selected()),
                 ),
             ],
         );
@@ -591,6 +820,7 @@ impl Home {
                 .gap_2p5()
                 .child(
                     div()
+                        .text_size(px(15.))
                         .font_weight(FontWeight::BOLD)
                         .text_color(Theme::danger_text())
                         .child("Remove GSE"),
@@ -599,9 +829,8 @@ impl Home {
                     div()
                         .flex()
                         .items_center()
-                        .justify_between()
                         .gap_5()
-                        .px_4()
+                        .px(px(18.))
                         .py_4()
                         .rounded(px(14.))
                         .border_1()
@@ -610,7 +839,8 @@ impl Home {
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .text_sm()
+                                .text_size(px(13.))
+                                .line_height(px(20.))
                                 .text_color(Theme::secondary_text())
                                 .child(
                                     "Stops every sandbox and removes the service, every \
@@ -622,11 +852,12 @@ impl Home {
                             button(
                                 "remove-ask",
                                 "Remove everything",
-                                Kind::Danger,
+                                Kind::DangerOutline,
                                 true,
                                 cx.listener(|home, _, _, cx| home.open_remove(cx)),
                             )
-                            .flex_none(),
+                            .size(Size::Toolbar)
+                            .h(px(36.)),
                         ),
                 ),
         )
@@ -642,16 +873,23 @@ impl Home {
         cx.refresh_windows();
     }
 
-    /// Opens the question before removing everything, and measures what
-    /// would go.
-    pub(crate) fn open_remove(&mut self, cx: &mut Context<Self>) {
-        let confirm = cx.new(|cx| TextInput::new("remove", cx));
+    /// The question before removing everything as it opens: the taken files
+    /// kept, nothing typed, nothing measured yet.
+    pub(crate) fn ask_remove(&mut self, cx: &mut Context<Self>) {
+        let confirm = cx.new(|cx| TextInput::new("", cx).fill(Theme::background));
         cx.observe(&confirm, |_, _, cx| cx.notify()).detach();
         self.modal = Some(Modal::RemoveAll {
             keep: true,
             confirm,
             sizes: None,
         });
+        cx.notify();
+    }
+
+    /// Opens the question before removing everything, and measures what
+    /// would go.
+    pub(crate) fn open_remove(&mut self, cx: &mut Context<Self>) {
+        self.ask_remove(cx);
         let received = self.app_config.received.clone();
         cx.spawn(async move |this, cx| {
             let sizes = cx
@@ -670,32 +908,40 @@ impl Home {
         cx.notify();
     }
 
-    /// The choice to keep the taken files when removing everything.
-    fn keep_box(keep: bool, detail: String, cx: &mut Context<Self>) -> Div {
+    /// The choice to keep the taken files when removing everything. It holds
+    /// still once removing began.
+    fn keep_box(keep: bool, detail: String, removing: bool, cx: &mut Context<Self>) -> Div {
         div()
-            .flex()
-            .items_start()
-            .gap_2p5()
             .px_3p5()
             .py_3()
             .rounded(px(10.))
             .bg(Theme::well())
             .child(
-                gpui_kit::component::checkbox::Checkbox::new("remove-keep")
-                    .checked(keep)
-                    .on_click(cx.listener(|home, on: &bool, _, cx| {
+                ui::checkbox(
+                    "remove-keep",
+                    keep,
+                    !removing,
+                    // The small line keeps the title's 14 px lines, as the
+                    // design sets it.
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_sm().child("Keep files taken from sandboxes"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .line_height(px(17.))
+                                .text_color(Theme::muted())
+                                .child(detail),
+                        ),
+                    cx.listener(|home, on: &bool, _, cx| {
                         if let Some(Modal::RemoveAll { keep, .. }) = home.modal.as_mut() {
                             *keep = *on;
                             cx.notify();
                         }
-                    })),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(div().text_sm().child("Keep files taken from sandboxes"))
-                    .child(div().text_xs().text_color(Theme::muted()).child(detail)),
+                    }),
+                )
+                .items_start(),
             )
     }
 
@@ -710,38 +956,32 @@ impl Home {
         let removing = self.busy.contains_key("remove-everything");
         let typed = confirm.read(cx).text().trim() == "remove";
         let (sandboxes, sets, received) = Sizes::lines(sizes);
-        let item = |text: String| {
-            div()
-                .flex()
-                .gap_2()
-                .text_sm()
-                .text_color(Theme::secondary_text())
-                .child("\u{2022}")
-                .child(text)
+        let folder = shown_path(&self.app_config.received);
+        let fate = if keep {
+            "stays where it is"
+        } else {
+            "is deleted too"
         };
-        let folder = self.app_config.received.display().to_string();
+        let kept = match received {
+            Some(size) => format!("{folder} \u{b7} {size} {fate}"),
+            None => format!("{folder} {fate}"),
+        };
         let body = div()
             .flex()
             .flex_col()
             .gap_4()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(Theme::secondary_text())
-                    .child("This stops every sandbox and deletes:"),
-            )
+            .child(dialog_text("This stops every sandbox and deletes:"))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .child(item(sandboxes))
-                    .child(item(sets))
-                    .child(item(
+                    .child(listed(sandboxes))
+                    .child(listed(sets))
+                    .child(listed(
                         "The background service and its system settings".to_owned(),
                     )),
             )
-            .child(Self::keep_box(keep, format!("{folder}{received}"), cx))
+            .child(Self::keep_box(keep, kept, removing, cx))
             .child(
                 div()
                     .flex()
@@ -749,30 +989,52 @@ impl Home {
                     .gap_1p5()
                     .child(
                         div()
-                            .text_sm()
+                            .text_size(px(13.))
                             .text_color(Theme::secondary_text())
-                            .child("Type remove to confirm"),
+                            .child(marked(
+                                "Type ",
+                                "remove",
+                                " to confirm",
+                                Theme::text(),
+                                true,
+                            )),
                     )
-                    .child(confirm.clone()),
+                    .child(if removing {
+                        still_field(confirm.read(cx).text().to_owned()).into_any_element()
+                    } else {
+                        confirm.clone().into_any_element()
+                    }),
             )
             .child(div().text_xs().text_color(Theme::muted()).child(
                 "Your system asks for the administrator password. The app quits when it is done.",
             ));
-        let buttons = div()
-            .flex()
-            .items_center()
-            .justify_end()
-            .gap_2p5()
-            .child(button(
-                "remove-cancel",
-                "Cancel",
-                Kind::Secondary,
-                !removing,
-                cx.listener(|home, _, _, cx| {
-                    home.modal = None;
-                    cx.notify();
-                }),
-            ))
+        dialog(
+            DialogSize::Medium,
+            "Remove GSE from this computer?",
+            body,
+            Self::remove_buttons(keep, typed, removing, cx),
+        )
+        .border_color(Theme::danger().opacity(0.3))
+    }
+
+    /// Cancel, and the button that removes everything once `typed`, the
+    /// taken files too unless `keep`.
+    fn remove_buttons(keep: bool, typed: bool, removing: bool, cx: &mut Context<Self>) -> Div {
+        div()
+            .child(
+                button(
+                    "remove-cancel",
+                    "Cancel",
+                    Kind::Quiet,
+                    !removing,
+                    cx.listener(|home, _, _, cx| {
+                        home.modal = None;
+                        cx.notify();
+                    }),
+                )
+                .size(Size::Dialog)
+                .px_4(),
+            )
             .child(
                 button(
                     "remove-go",
@@ -781,20 +1043,21 @@ impl Home {
                     } else {
                         "Remove everything"
                     },
-                    Kind::Danger,
+                    Kind::DangerFilled,
                     typed && !removing,
                     cx.listener(move |home, _, _, cx| home.remove_everything(!keep, cx)),
                 )
-                .bg(Theme::danger())
-                .text_color(Theme::on_danger()),
-            );
-        crate::sandbox::dialog("Remove GSE from this computer?", body, buttons)
+                .size(Size::Dialog),
+            )
     }
 
     /// Runs the service's uninstall through polkit, removes the app's own
     /// files, and the received files folder with `received`, and closes the
     /// app.
     fn remove_everything(&mut self, received: bool, cx: &mut Context<Self>) {
+        if self.preview_skips("removing everything", cx) {
+            return;
+        }
         self.busy.insert("remove-everything".into(), "Removing");
         cx.notify();
         let received = received.then(|| self.app_config.received.clone());
@@ -875,42 +1138,46 @@ fn disk_usage(path: &Path) -> u64 {
 }
 
 impl Sizes {
-    /// What goes and what stays, in words, measured or not yet.
-    fn lines(sizes: Option<&Self>) -> (String, String, String) {
-        let count = |n: usize, one: &str, many: &str| {
-            if n == 1 {
-                format!("1 {one}")
-            } else {
-                format!("{n} {many}")
-            }
-        };
+    /// What goes in words, measured or being measured, and how much the
+    /// received files folder holds once measured. The sets' size takes in
+    /// the sandbox system they are built on.
+    fn lines(sizes: Option<&Self>) -> (String, String, Option<String>) {
         sizes.map_or_else(
             || {
                 (
-                    "Sandboxes with everything inside them".to_owned(),
-                    "Sets of apps and the sandbox system".to_owned(),
-                    String::new(),
+                    "Sandboxes with everything inside them \u{b7} measuring...".to_owned(),
+                    "Sets of apps \u{b7} measuring...".to_owned(),
+                    None,
                 )
             },
             |s| {
                 (
                     format!(
                         "{} with everything inside them \u{b7} {}",
-                        count(s.sandboxes, "sandbox", "sandboxes"),
+                        counted(s.sandboxes, "sandbox", "sandboxes"),
                         size_text(s.sandbox_bytes)
                     ),
                     format!(
-                        "{} and the sandbox system \u{b7} {}",
-                        count(s.sets, "set of apps", "sets of apps"),
+                        "{} \u{b7} {}",
+                        counted(s.sets, "set of apps", "sets of apps"),
                         size_text(s.set_bytes)
                     ),
-                    format!(" \u{b7} {} stays where it is", size_text(s.received_bytes)),
+                    Some(size_text(s.received_bytes)),
                 )
             },
         )
     }
 
     fn measure(received: &Path) -> Self {
+        if crate::preview::active() {
+            return Self {
+                sandboxes: 4,
+                sandbox_bytes: 61_000_000_000,
+                sets: 3,
+                set_bytes: 18_000_000_000,
+                received_bytes: 2_300_000_000,
+            };
+        }
         let root = Path::new("/var/lib/gse");
         let count = |dir: &str, toml: bool| {
             fs::read_dir(root.join(dir))

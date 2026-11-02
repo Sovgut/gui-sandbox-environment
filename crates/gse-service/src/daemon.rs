@@ -7,6 +7,7 @@
 //! user behind that process owns any environment it starts: QEMU runs as
 //! them, and the screen memory, input socket and sound go to them.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, Write as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -17,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use gse_host::Root;
@@ -31,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::agent::Agent;
-use crate::{checks, fedora, gpu, image, mailbox, net, presets, vm};
+use crate::{checks, fedora, gpu, image, mailbox, net, nocow, presets, vm};
 
 /// The polkit action every client needs.
 pub const ACTION: &str = "io.github.sovgut.gse.manage";
@@ -755,6 +757,22 @@ struct Shared {
     watchers: Vec<Sender<Event>>,
     /// The connection to the running environment's agent, made on first use.
     agent: Arc<Mutex<Option<Agent>>>,
+    /// The sends in under way, by environment, each with the flag that
+    /// stops it.
+    sends: HashMap<String, Arc<AtomicBool>>,
+}
+
+/// A send in under way; it leaves the service's list when it ends.
+struct Send {
+    service: Service,
+    name: String,
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for Send {
+    fn drop(&mut self) {
+        self.service.lock().sends.remove(&self.name);
+    }
 }
 
 #[derive(Clone)]
@@ -771,6 +789,22 @@ impl Service {
         self.lock()
             .watchers
             .retain(|w| w.send(event.clone()).is_ok());
+    }
+
+    /// Notes a send in to `name`, which [`Request::CancelTransfer`] can
+    /// stop; one at a time per environment.
+    fn start_send(&self, name: &str) -> Result<Send> {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut shared = self.lock();
+        if shared.sends.contains_key(name) {
+            bail!("files are being sent into '{name}' already");
+        }
+        shared.sends.insert(name.to_owned(), flag.clone());
+        Ok(Send {
+            service: self.clone(),
+            name: name.to_owned(),
+            flag,
+        })
     }
 
     /// Adds `text` to the journal of `name` and tells the watchers.
@@ -1024,7 +1058,7 @@ impl Service {
                 return;
             }
             drop(shared);
-            thread::sleep(std::time::Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
         }
         warn!("the environment or image build did not stop in time");
     }
@@ -1348,6 +1382,82 @@ impl Service {
     }
 
     /// The requests about a running environment's programs and files.
+    /// Copies `paths` of the host into the Inbox of `name`, or keeps them
+    /// for its next start, telling the client how far it got; a
+    /// [`Request::CancelTransfer`] stops it.
+    fn send_files(
+        &self,
+        name: &str,
+        paths: &[PathBuf],
+        peer: Peer,
+        out: &mut UnixStream,
+    ) -> Result<()> {
+        let files = host_files(paths, peer.uid)?;
+        let count = files.len();
+        let stop = self.start_send(name)?;
+        mailbox::yield_to_others();
+        let up = self.is_up(name);
+        let sent = {
+            let mut copied = sending(out, total_size(&files));
+            if up {
+                self.with_agent(name, |agent| {
+                    for (done, (path, mut file, size)) in files.into_iter().enumerate() {
+                        // An AppImage runs whether or not its
+                        // download kept the flag.
+                        let executable = file.metadata()?.mode() & 0o100 != 0
+                            || path.to_ascii_lowercase().ends_with(".appimage");
+                        let mut counted =
+                            mailbox::Counted::new(&mut file, &mut copied).stopping(&stop.flag);
+                        if let Err(e) = agent.put(&path, &mut counted, size, executable) {
+                            if e.downcast_ref::<std::io::Error>()
+                                .is_some_and(mailbox::is_stopped)
+                            {
+                                return Err(mailbox::Stopped { copied: done }.into());
+                            }
+                            return Err(e);
+                        }
+                    }
+                    Ok(count)
+                })
+            } else {
+                let dir = self.environment_dir(name)?;
+                mailbox::queue(&dir, files, &mut copied, &stop.flag)
+            }
+        };
+        match sent {
+            Ok(count) if up => {
+                self.log(
+                    name,
+                    format!("{count} file(s) from the host put into the Inbox"),
+                );
+            }
+            Ok(count) => self.log(
+                name,
+                format!(
+                    "{count} file(s) from the host wait for the next start to go into the Inbox"
+                ),
+            ),
+            Err(e) => {
+                let Some(stopped) = e.downcast_ref::<mailbox::Stopped>() else {
+                    return Err(e);
+                };
+                let copied = stopped.copied;
+                self.log(
+                    name,
+                    format!("sending files in stopped: {copied} of {count} file(s) went in"),
+                );
+                send(
+                    out,
+                    &Reply::Stopped {
+                        copied,
+                        files: count,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn handle_guest(&self, request: Request, peer: Peer, out: &mut UnixStream) -> Result<()> {
         match request {
             Request::Processes { name } => {
@@ -1384,33 +1494,15 @@ impl Service {
                 let files = self.with_agent(&name, Agent::files)?;
                 send(out, &Reply::Files { files })?;
             }
-            Request::SendFiles { name, paths } if !self.is_up(&name) => {
-                let dir = self.environment_dir(&name)?;
-                let count = mailbox::queue(&dir, host_files(&paths, peer.uid)?)?;
-                self.log(
-                    &name,
-                    format!(
-                        "{count} file(s) from the host wait for the next start to go into the Inbox"
-                    ),
-                );
-            }
-            Request::SendFiles { name, paths } => {
-                let files = host_files(&paths, peer.uid)?;
-                let count = files.len();
-                self.with_agent(&name, |agent| {
-                    for (path, mut file, size) in files {
-                        // An AppImage runs whether or not its download kept
-                        // the flag.
-                        let executable = file.metadata()?.mode() & 0o100 != 0
-                            || path.to_ascii_lowercase().ends_with(".appimage");
-                        agent.put(&path, &mut file, size, executable)?;
-                    }
-                    Ok(())
-                })?;
-                self.log(
-                    &name,
-                    format!("{count} file(s) from the host put into the Inbox"),
-                );
+            Request::SendFiles { name, paths } => self.send_files(&name, &paths, peer, out)?,
+            Request::CancelTransfer { name } => {
+                let shared = self.lock();
+                let flag = shared
+                    .sends
+                    .get(&name)
+                    .context("no files are being sent in")?;
+                flag.store(true, Ordering::SeqCst);
+                info!("stopping the send of files into '{name}'");
             }
             Request::TakeFiles { name } if !self.is_up(&name) => {
                 let dir = self.environment_dir(&name)?;
@@ -1627,7 +1719,8 @@ impl Service {
             | Request::EndApp { .. }
             | Request::Files { .. }
             | Request::SendFiles { .. }
-            | Request::TakeFiles { .. }) => self.handle_guest(request, peer, out)?,
+            | Request::TakeFiles { .. }
+            | Request::CancelTransfer { .. }) => self.handle_guest(request, peer, out)?,
             Request::Journal { name } => {
                 let entries = self.lock().store.journal(&name)?;
                 send(out, &Reply::Journal { entries })?;
@@ -1798,6 +1891,29 @@ pub fn take_files(
 /// The files `paths` name for the Inbox, opened for `uid`: a file under its
 /// own name, a folder with every regular file below it under the folder's
 /// name. Links and anything else are left out.
+/// How often a send in says how far it got.
+const SENDING_EVERY: Duration = Duration::from_millis(250);
+
+/// The bytes `files` hold.
+fn total_size(files: &[(String, fs::File, u64)]) -> u64 {
+    files.iter().map(|(_, _, size)| size).sum()
+}
+
+/// What a send in of `total` bytes calls with each part it copies: it tells
+/// the client how far it got every [`SENDING_EVERY`] and once at the end. A
+/// client gone meanwhile misses the news, not the files.
+fn sending(out: &mut UnixStream, total: u64) -> impl FnMut(u64) + '_ {
+    let mut done = 0;
+    let mut last: Option<Instant> = None;
+    move |part| {
+        done += part;
+        if done >= total || last.is_none_or(|at| at.elapsed() >= SENDING_EVERY) {
+            last = Some(Instant::now());
+            send(out, &Reply::Sending { done, total }).ok();
+        }
+    }
+}
+
 fn host_files(paths: &[PathBuf], uid: u32) -> Result<Vec<(String, fs::File, u64)>> {
     let mut found = Vec::new();
     let mut pending: Vec<(PathBuf, String, usize)> = Vec::new();
@@ -1960,9 +2076,14 @@ pub fn serve(root: Root) -> Result<()> {
     let config = Config::load(Path::new(CONFIG))?;
     vm::recover(&root);
     let store = Store::new(DATA);
-    fs::create_dir_all(store.images_dir())?;
-    fs::create_dir_all(store.environments_dir())?;
-    fs::create_dir_all(store.builds_dir())?;
+    for dir in [
+        store.images_dir(),
+        store.environments_dir(),
+        store.builds_dir(),
+    ] {
+        fs::create_dir_all(&dir)?;
+        nocow::mark(&dir);
+    }
     // A build the service did not live to finish leaves its partial image,
     // and maybe a partial download.
     for leftover in fs::read_dir(store.builds_dir())?.flatten() {
@@ -1993,6 +2114,7 @@ pub fn serve(root: Root) -> Result<()> {
         build: None,
         watchers: Vec::new(),
         agent: Arc::default(),
+        sends: HashMap::new(),
     })));
     for stream in listener.incoming() {
         let stream = match stream {
@@ -2304,6 +2426,7 @@ mod tests {
             build: None,
             watchers: Vec::new(),
             agent: Arc::default(),
+            sends: HashMap::new(),
         })))
     }
 

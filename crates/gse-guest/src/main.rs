@@ -25,6 +25,7 @@
 mod agent;
 mod broker;
 mod display;
+mod incoming;
 mod launcher;
 mod screen;
 
@@ -78,6 +79,7 @@ enum Cli {
 fn main() -> Result<()> {
     match Cli::parse() {
         Cli::Desktop => {
+            std::thread::spawn(incoming::watch);
             broker::spawn(LAUNCHER_SOCKET.as_ref(), &run_socket()?)?;
             display::serve(DISPLAY_SOCKET.as_ref())
         }

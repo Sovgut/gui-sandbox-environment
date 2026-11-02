@@ -55,7 +55,7 @@ dnf -y install \
     labwc xdg-desktop-portal-wlr \
     xorg-x11-server-Xwayland xwayland-satellite xrandr greetd greetd-selinux wlr-randr \
     pipewire wireplumber pipewire-pulseaudio \
-    flatpak policycoreutils-python-utils google-noto-sans-fonts
+    flatpak policycoreutils-python-utils google-noto-sans-fonts zenity
 
 # One panel at the bottom: the menu and the open windows at the left, the
 # tray, sound and clock at the right. An applet's ID is the Name in its

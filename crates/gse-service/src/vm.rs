@@ -21,7 +21,7 @@ use gse_host::vm::{Network, OVMF_VARS_TEMPLATE, Screen, VmSpec};
 use gse_protocol::Stage;
 use tracing::{error, info, warn};
 
-use crate::{STATE_DIR, gpu, net, state_path};
+use crate::{STATE_DIR, gpu, net, nocow, state_path};
 
 /// Held for as long as a VM runs. Every VM, an environment or an image
 /// build, shares the one environment network ruleset and the host's memory,
@@ -223,10 +223,12 @@ pub fn launch_environment(
         }
         path
     });
+    let home = Some(dir.join("home.qcow2")).filter(|home| home.exists());
+    let direct_io = nocow::is_set(&launch.disk) && home.as_deref().is_none_or(nocow::is_set);
     let spec_for = |socket: PathBuf| VmSpec {
         name: launch.name.clone(),
         disk: launch.disk.clone(),
-        home_disk: Some(dir.join("home.qcow2")).filter(|home| home.exists()),
+        home_disk: home.clone(),
         read_only_disks: launch.read_only_disks.clone(),
         firmware_vars: dir.join("OVMF_VARS.qcow2"),
         memory_mib: launch.memory_mib,
@@ -248,6 +250,7 @@ pub fn launch_environment(
         serial_log: console.clone(),
         journal_log: Some(journal.clone()),
         run_as: Some(launch.owner.name.clone()),
+        direct_io,
         image_build: false,
     };
 

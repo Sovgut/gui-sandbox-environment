@@ -280,6 +280,7 @@ fn build_spec(
         qmp_object: false,
         keyboard: None,
         run_as: job.run_as.clone(),
+        direct_io: crate::nocow::is_set(overlay),
         image_build: true,
     }
 }

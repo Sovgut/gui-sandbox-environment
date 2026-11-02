@@ -33,7 +33,7 @@ pub const SOCKET: &str = "/run/gse/service.sock";
 /// The protocol's version: a client and a service speak to each other only
 /// when theirs match ([`Request::Hello`]). It changes with every change to
 /// the messages.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 /// The name a build of the base image goes by wherever a preset's name
 /// would stand: in [`Event::Build`], [`Event::BuildFinished`] and
@@ -142,6 +142,13 @@ pub enum Request {
     TakeFiles {
         name: String,
     },
+    /// Stop the [`Request::SendFiles`] running for `name`: the files copied
+    /// whole stay, the one under way is removed, and the send answers
+    /// [`Reply::Stopped`] before it is done. A take stops when its client
+    /// closes the connection.
+    CancelTransfer {
+        name: String,
+    },
     /// Stop any running environment or image build and restart the
     /// service, which comes back as whatever build is installed. Answered
     /// before the service exits.
@@ -215,6 +222,18 @@ pub enum Reply {
     FileStart {
         path: String,
         size: u64,
+    },
+    /// How far a [`Request::SendFiles`] got: `done` of its `total` bytes
+    /// copied, now and then while it runs and once at its end.
+    Sending {
+        done: u64,
+        total: u64,
+    },
+    /// A [`Request::SendFiles`] stopped by [`Request::CancelTransfer`]:
+    /// `copied` of its `files` went in whole.
+    Stopped {
+        copied: usize,
+        files: usize,
     },
     /// The next bytes of the file begun last, in base64.
     FileChunk {
@@ -453,7 +472,11 @@ pub mod agent {
     /// The port the guest streams its journal to, one way; the host only
     /// keeps what arrives, capped, and never parses it.
     pub const JOURNAL_PORT: &str = "io.github.sovgut.gse.journal";
-    pub const VERSION: u32 = 1;
+    /// The agent's version: 2 knows [`Call::Incoming`]. A host speaks to
+    /// any agent from [`MIN_VERSION`] on, so environments made from an older
+    /// image keep working.
+    pub const VERSION: u32 = 2;
+    pub const MIN_VERSION: u32 = 1;
     /// Raw bytes per chunk of a file; in base64 a chunk stays well under
     /// [`crate::MAX_LINE`].
     pub const CHUNK: usize = 32 * 1024;
@@ -498,6 +521,13 @@ pub mod agent {
         },
         PutEnd {
             sha256: String,
+        },
+        /// `files` of `bytes` in all follow as [`Call::Put`]s: the files
+        /// the host kept for this start. The guest shows them arriving on
+        /// its desktop. Version 2 on.
+        Incoming {
+            files: u32,
+            bytes: u64,
         },
         /// The Outbox file at `path`, answered with [`Answer::Chunk`]s and
         /// an [`Answer::GetEnd`].
@@ -1000,6 +1030,7 @@ mod tests {
                 paths: vec!["/home/me/save.dat".into()],
             },
             Request::TakeFiles { name: "x".into() },
+            Request::CancelTransfer { name: "x".into() },
             Request::Rename {
                 name: "x".into(),
                 to: "y".into(),

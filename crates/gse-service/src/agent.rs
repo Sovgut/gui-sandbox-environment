@@ -28,6 +28,8 @@ pub struct Agent {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
     next: u64,
+    /// The version the agent greeted with.
+    version: u32,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -50,12 +52,19 @@ impl Agent {
             reader: BufReader::new(stream.try_clone()?),
             stream,
             next: 1,
+            version: agent::MIN_VERSION,
         };
         match agent.ask(Call::Hello)? {
-            Answer::Hello { version } if version == agent::VERSION => Ok(agent),
+            Answer::Hello { version }
+                if (agent::MIN_VERSION..=agent::VERSION).contains(&version) =>
+            {
+                agent.version = version;
+                Ok(agent)
+            }
             Answer::Hello { version } => {
                 bail!(
-                    "the environment's agent speaks version {version}, not {}",
+                    "the environment's agent speaks version {version}, not {} to {}",
+                    agent::MIN_VERSION,
                     agent::VERSION
                 )
             }
@@ -90,6 +99,19 @@ impl Agent {
     fn ask(&mut self, body: Call) -> Result<Answer> {
         let id = self.call(body)?;
         self.answer(id)
+    }
+
+    /// Tells the agent that `files` of `bytes` in all follow, kept for this
+    /// start, so the guest shows them arriving. An agent before version 2
+    /// takes them without a word.
+    pub fn announce(&mut self, files: usize, bytes: u64) -> Result<()> {
+        if self.version < 2 {
+            return Ok(());
+        }
+        self.done(Call::Incoming {
+            files: u32::try_from(files).unwrap_or(u32::MAX),
+            bytes,
+        })
     }
 
     fn done(&mut self, body: Call) -> Result<()> {
@@ -152,7 +174,15 @@ impl Agent {
         let mut buffer = vec![0; agent::CHUNK];
         let mut sent = 0_u64;
         while sent < size {
-            let read = from.read(&mut buffer)?;
+            let read = match from.read(&mut buffer) {
+                Ok(read) => read,
+                Err(e) => {
+                    // Any other call makes the agent drop the upload and
+                    // the part of the file it wrote.
+                    self.ask(Call::Hello).ok();
+                    return Err(e.into());
+                }
+            };
             if read == 0 {
                 break;
             }

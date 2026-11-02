@@ -15,6 +15,7 @@ mod image;
 mod logs;
 mod mailbox;
 mod net;
+mod nocow;
 mod presets;
 mod setup;
 mod vm;

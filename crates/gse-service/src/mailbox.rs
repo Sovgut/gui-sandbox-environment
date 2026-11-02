@@ -14,6 +14,7 @@ use std::fs::{self, File};
 use std::io::{self, Write as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -46,11 +47,19 @@ fn plain(path: &str) -> bool {
 }
 
 /// Keeps `files` (Inbox path, open file, size) for the next start of the
-/// environment in `dir`; returns how many.
-pub fn queue(dir: &Path, files: Vec<(String, File, u64)>) -> Result<usize> {
+/// environment in `dir`; returns how many. `copied` hears of each part
+/// copied. When `stop` turns true the copy ends at the next part, the file
+/// under way is removed, and the error is [`Stopped`] with the files kept
+/// whole.
+pub fn queue(
+    dir: &Path,
+    files: Vec<(String, File, u64)>,
+    copied: &mut dyn FnMut(u64),
+    stop: &AtomicBool,
+) -> Result<usize> {
     let waiting = waiting_dir(dir);
     let count = files.len();
-    for (path, mut from, _) in files {
+    for (done, (path, mut from, _)) in files.into_iter().enumerate() {
         if !plain(&path) {
             bail!("{path} is no plain path");
         }
@@ -67,10 +76,139 @@ pub fn queue(dir: &Path, files: Vec<(String, File, u64)>) -> Result<usize> {
             .mode(if executable { 0o700 } else { 0o600 })
             .open(&to)
             .with_context(|| format!("{}", to.display()))?;
-        io::copy(&mut from, &mut out)?;
+        let mut reader = Counted::new(&mut from, &mut *copied).stopping(stop);
+        if let Err(e) = paced_copy(&mut reader, &mut out) {
+            drop(out);
+            fs::remove_file(&to).ok();
+            if is_stopped(&e) {
+                return Err(Stopped { copied: done }.into());
+            }
+            return Err(e).with_context(|| format!("copying {path}"));
+        }
     }
     fs::set_permissions(&waiting, fs::Permissions::from_mode(0o700)).ok();
     Ok(count)
+}
+
+/// A send that [`Request::CancelTransfer`](gse_protocol::Request) stopped,
+/// with how many of its files went in whole.
+#[derive(Debug)]
+pub struct Stopped {
+    pub copied: usize,
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stopped after {} file(s)", self.copied)
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+/// What a stopping [`Counted`] reads fail with.
+#[derive(Debug)]
+struct StopRead;
+
+impl std::fmt::Display for StopRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stopped")
+    }
+}
+
+impl std::error::Error for StopRead {}
+
+/// Whether `error` is a read that a stop ended.
+pub fn is_stopped(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<StopRead>().is_some())
+}
+
+/// How much a copy writes before it waits for that part to be on disk.
+const PACE: u64 = 32 << 20;
+
+/// Copies `from` into `to` without piling up unwritten data: every
+/// [`PACE`] it waits until what it wrote is on disk. A bulk copy into the
+/// page cache otherwise leaves gigabytes for the kernel to flush at once,
+/// and on btrfs every program that touches the disk waits for that flush.
+fn paced_copy(from: &mut impl io::Read, to: &mut File) -> io::Result<u64> {
+    let mut buffer = vec![0; 1 << 20];
+    let mut written = 0_u64;
+    let mut paced = 0_u64;
+    loop {
+        let read = match from.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        to.write_all(&buffer[..read])?;
+        written += read as u64;
+        if written - paced >= PACE {
+            to.sync_data()?;
+            paced = written;
+        }
+    }
+    Ok(written)
+}
+
+/// Lowers the calling thread's I/O and CPU priority, so a bulk copy waits
+/// for everything else on the machine: the best-effort I/O class at its
+/// lowest level (through `ionice`, since `ioprio_set` has no safe binding),
+/// and nice 10. The thread of a connection ends with it. Failing to only
+/// costs the courtesy.
+pub fn yield_to_others() {
+    let thread = rustix::thread::gettid();
+    rustix::process::setpriority_process(Some(thread), 10).ok();
+    std::process::Command::new("ionice")
+        .args([
+            "-c",
+            "2",
+            "-n",
+            "7",
+            "-p",
+            &thread.as_raw_nonzero().to_string(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok();
+}
+
+/// A reader that tells `copied` how many bytes each read gave, and fails
+/// with a stop once its `stop` flag is up.
+pub struct Counted<'a, R> {
+    inner: R,
+    copied: &'a mut dyn FnMut(u64),
+    stop: Option<&'a AtomicBool>,
+}
+
+impl<'a, R> Counted<'a, R> {
+    pub fn new(inner: R, copied: &'a mut dyn FnMut(u64)) -> Self {
+        Self {
+            inner,
+            copied,
+            stop: None,
+        }
+    }
+
+    /// Fails the next read once `stop` is up.
+    pub fn stopping(mut self, stop: &'a AtomicBool) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+}
+
+impl<R: io::Read> io::Read for Counted<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+            return Err(io::Error::other(StopRead));
+        }
+        let read = self.inner.read(buffer)?;
+        (self.copied)(read as u64);
+        Ok(read)
+    }
 }
 
 /// Every regular file below `root`, as a path relative to it.
@@ -107,6 +245,9 @@ pub fn waiting(dir: &Path) -> Vec<GuestFile> {
 /// Puts the waiting files into the Inbox through `agent`; returns how many.
 pub fn deliver(dir: &Path, agent: &mut Agent) -> Result<usize> {
     let files = files_below(&waiting_dir(dir));
+    if !files.is_empty() {
+        agent.announce(files.len(), files.iter().map(|(_, _, size)| size).sum())?;
+    }
     for (path, full, size) in &files {
         let mut file = File::open(full)?;
         let executable = file.metadata()?.mode() & 0o100 != 0;
@@ -191,7 +332,18 @@ mod tests {
         let source = dir.path().join("save.dat");
         fs::write(&source, "progress").unwrap();
         let files = vec![("Saves/save.dat".to_owned(), File::open(&source).unwrap(), 8)];
-        assert_eq!(queue(dir.path(), files).unwrap(), 1);
+        let mut copied = 0;
+        assert_eq!(
+            queue(
+                dir.path(),
+                files,
+                &mut |n| copied += n,
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(copied, 8);
         assert_eq!(
             waiting(dir.path()),
             [GuestFile {
@@ -200,7 +352,52 @@ mod tests {
             }]
         );
         let escaping = vec![("../x".to_owned(), File::open(&source).unwrap(), 8)];
-        assert!(queue(dir.path(), escaping).is_err());
+        assert!(queue(dir.path(), escaping, &mut |_| {}, &AtomicBool::new(false)).is_err());
+    }
+
+    #[test]
+    fn a_stopped_queue_keeps_whole_files_and_drops_the_one_under_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("big.bin");
+        fs::write(&source, vec![7_u8; 3 << 20]).unwrap();
+        let open = || File::open(&source).unwrap();
+        let files = vec![
+            ("one.bin".to_owned(), open(), 3 << 20),
+            ("two.bin".to_owned(), open(), 3 << 20),
+        ];
+        let stop = AtomicBool::new(false);
+        let mut seen = 0;
+        let error = queue(
+            dir.path(),
+            files,
+            &mut |n| {
+                seen += n;
+                if seen > 4 << 20 {
+                    stop.store(true, Ordering::SeqCst);
+                }
+            },
+            &stop,
+        )
+        .unwrap_err();
+        assert_eq!(error.downcast_ref::<Stopped>().unwrap().copied, 1);
+        let waiting = waiting(dir.path());
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].path, "one.bin");
+        assert_eq!(waiting[0].size, 3 << 20);
+    }
+
+    #[test]
+    fn a_paced_copy_copies_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let size = usize::try_from(PACE * 2).unwrap() + 12345;
+        let data: Vec<u8> = (0..size).map(|i| u8::try_from(i % 251).unwrap()).collect();
+        let to = dir.path().join("copy");
+        let mut out = File::create(&to).unwrap();
+        assert_eq!(
+            paced_copy(&mut data.as_slice(), &mut out).unwrap(),
+            data.len() as u64
+        );
+        assert_eq!(fs::read(&to).unwrap(), data);
     }
 
     #[test]

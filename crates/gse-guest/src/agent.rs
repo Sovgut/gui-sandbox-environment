@@ -100,6 +100,7 @@ pub fn serve() -> Result<()> {
         reader: BufReader::new(port.try_clone()?),
         writer: port,
         upload: None,
+        incoming: None,
     };
     loop {
         if let Err(e) = agent.serve_connection() {
@@ -127,6 +128,8 @@ struct Agent {
     reader: BufReader<File>,
     writer: File,
     upload: Option<Upload>,
+    /// The files the host kept for this start, while they arrive.
+    incoming: Option<crate::incoming::Batch>,
 }
 
 impl Agent {
@@ -214,6 +217,10 @@ impl Agent {
                 self.get(id, &path)?;
                 return Ok(None);
             }
+            Call::Incoming { files, bytes } => {
+                self.incoming = Some(crate::incoming::Batch::new(files, bytes));
+                Answer::Done
+            }
         }))
     }
 
@@ -256,6 +263,9 @@ impl Agent {
     fn start_upload(&mut self, id: u64, path: &str, size: u64, executable: bool) -> Result<()> {
         if size > agent::MAX_FILE {
             bail!("{path} is larger than {} bytes", agent::MAX_FILE);
+        }
+        if let Some(batch) = &mut self.incoming {
+            batch.file(path);
         }
         let parts = components(path)?;
         let (name, parents) = parts.split_last().context("empty path")?;
@@ -313,6 +323,9 @@ impl Agent {
             self.abandon_upload();
             return Err(e.into());
         }
+        if let Some(batch) = &mut self.incoming {
+            batch.bytes(len);
+        }
         Ok(())
     }
 
@@ -329,6 +342,13 @@ impl Agent {
             bail!("the file arrived damaged");
         }
         upload.file.sync_all()?;
+        if self
+            .incoming
+            .as_mut()
+            .is_some_and(crate::incoming::Batch::arrived)
+        {
+            self.incoming = None;
+        }
         Ok(())
     }
 

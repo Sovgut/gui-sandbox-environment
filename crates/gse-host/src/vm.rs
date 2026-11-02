@@ -69,6 +69,12 @@ pub struct VmSpec {
     pub journal_log: Option<PathBuf>,
     /// The account QEMU drops to once its devices are open.
     pub run_as: Option<String>,
+    /// Whether the disk and the home disk go past the host's page cache
+    /// (`cache=none`), so a guest writing gigabytes does not fill it. Only
+    /// for files that do not copy on write: direct I/O into a btrfs file
+    /// with checksums can store a block whose checksum no longer matches
+    /// when the guest changes the buffer while it is written.
+    pub direct_io: bool,
     /// An image build: the guest learns it through the `fw_cfg` item
     /// `opt/gse/build` and starts no desktop, which a VM without a GPU could
     /// only start and lose in a loop.
@@ -108,6 +114,11 @@ pub enum Network {
 }
 
 impl VmSpec {
+    /// The cache option of the writable disks.
+    fn cache(&self) -> &'static str {
+        if self.direct_io { ",cache=none" } else { "" }
+    }
+
     /// The firmware and the disks.
     fn disks(&self) -> Vec<String> {
         let mut drives = vec![
@@ -116,7 +127,11 @@ impl VmSpec {
                 "if=pflash,format=qcow2,file={}",
                 self.firmware_vars.display()
             ),
-            format!("file={},if=virtio,format=qcow2", self.disk.display()),
+            format!(
+                "file={},if=virtio,format=qcow2{}",
+                self.disk.display(),
+                self.cache()
+            ),
         ];
         for disk in &self.read_only_disks {
             drives.push(format!(
@@ -132,7 +147,11 @@ impl VmSpec {
         if let Some(home) = &self.home_disk {
             args.extend([
                 "-drive".to_owned(),
-                format!("if=none,id=home,file={},format=qcow2", home.display()),
+                format!(
+                    "if=none,id=home,file={},format=qcow2{}",
+                    home.display(),
+                    self.cache()
+                ),
                 "-device".to_owned(),
                 "virtio-blk-pci,drive=home,serial=gse-home".to_owned(),
             ]);
@@ -347,6 +366,7 @@ mod tests {
             qmp_object: false,
             keyboard: None,
             run_as: Some("sovhut".into()),
+            direct_io: false,
             image_build: false,
         }
     }
@@ -393,6 +413,24 @@ mod tests {
             .filter(|w| w[0] == flag)
             .map(|w| w[1].as_str())
             .collect()
+    }
+
+    #[test]
+    fn only_disks_without_copy_on_write_skip_the_page_cache() {
+        let mut spec = spec();
+        spec.home_disk = Some("/vm/home.qcow2".into());
+        let drives = |spec: &VmSpec| {
+            after(&spec.command_line(), "-drive")
+                .into_iter()
+                .filter(|d| d.contains("disk.qcow2") || d.contains("home.qcow2"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert!(drives(&spec).iter().all(|d| !d.contains("cache=")));
+        spec.direct_io = true;
+        let direct = drives(&spec);
+        assert_eq!(direct.len(), 2);
+        assert!(direct.iter().all(|d| d.ends_with(",cache=none")));
     }
 
     #[test]

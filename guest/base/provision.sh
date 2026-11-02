@@ -104,7 +104,7 @@ cat > /usr/share/glib-2.0/schemas/30_gse.gschema.override <<'EOF'
 layout='gse'
 
 [com.solus-project.icon-tasklist]
-pinned-launchers=['com.google.Chrome.desktop', 'org.mozilla.firefox.desktop', 'nemo.desktop']
+pinned-launchers=['com.google.Chrome.desktop', 'nemo.desktop']
 
 [org.gnome.desktop.interface:Budgie]
 color-scheme='prefer-dark'

@@ -181,7 +181,7 @@ fn sets() -> Vec<Preset> {
         },
         Preset {
             name: "desktop".into(),
-            apps: vec![app("Firefox", flatpak("org.mozilla.firefox"), false)],
+            apps: vec![app("Chrome", flatpak("com.google.Chrome"), false)],
         },
     ]
 }

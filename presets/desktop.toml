@@ -3,5 +3,5 @@
 name = "desktop"
 
 [[app]]
-name = "Firefox"
-flatpak = "org.mozilla.firefox"
+name = "Chrome"
+flatpak = "com.google.Chrome"

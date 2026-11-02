@@ -641,7 +641,7 @@ impl Home {
                     .child(line("Graphics card", gpu))
                     .child(line(
                         "Screen",
-                        crate::shell::mode_text(&settings.screen_mode),
+                        self.screen_text(&settings.gpu, &settings.screen_mode),
                     ))
                     .child(line(
                         "Internet",
@@ -1074,9 +1074,10 @@ impl Home {
             .flex_col()
             .gap_4()
             .child(div().text_sm().text_color(Theme::muted()).child(
-                "This computer has one graphics card, so the sandbox takes it whole: your \
-                 desktop disappears until you come back. Apps you left open keep running; \
-                 save your work in them first.",
+                "This computer has one graphics card, so the sandbox takes it whole, with your \
+                 keyboard and mouse. Your desktop session closes as if you logged out: save \
+                 your work and close your apps first. When the sandbox stops, the login screen \
+                 comes back.",
             ))
             .child(
                 div()
@@ -1097,7 +1098,10 @@ impl Home {
                                 div()
                                     .text_xs()
                                     .text_color(Theme::muted())
-                                    .child("Press both Ctrl keys together."),
+                                    .child(
+                                        "Shut the sandbox down from its menu, or press both \
+                                         Ctrl keys together to stop it at once.",
+                                    ),
                             ),
                     )
                     .child(keys),

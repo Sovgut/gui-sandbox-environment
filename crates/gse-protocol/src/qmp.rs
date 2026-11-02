@@ -1,11 +1,12 @@
 //! Sends keyboard and mouse input to an environment through QEMU's QMP
 //! socket, as events of the VM's virtual keyboard, tablet (absolute pointer)
 //! and mouse (relative motion). QEMU routes each event to the device of its
-//! kind.
+//! kind. The app's window sends through it, and on a single-GPU machine the
+//! service, which reads the host's keyboards and mice itself.
 //!
 //! Keys travel by their physical position, not by what the host's layout
-//! makes of them: the window hands over evdev codes, which go to QEMU as
-//! XT scancodes ("qnum"), so the environment's own layout applies inside it.
+//! makes of them: they arrive as evdev codes, which go to QEMU as XT
+//! scancodes ("qnum"), so the environment's own layout applies inside it.
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::Shutdown;

@@ -17,6 +17,8 @@
 //! goes. [`Request::BuildBase`] builds the base image those images are
 //! built on the same way, under the name [`BASE_IMAGE`].
 
+pub mod qmp;
+
 use std::fmt;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -554,6 +556,10 @@ pub struct Gpu {
     pub driver: Option<String>,
     /// Whether a monitor is connected to it.
     pub monitor: bool,
+    /// That monitor's preferred mode, as `1920x1080@60`, when its EDID
+    /// says: what a sandbox that takes this GPU shows.
+    #[serde(default)]
+    pub monitor_mode: Option<String>,
     /// How it changes hands when an environment gets it.
     pub mode: SwitchMode,
 }
@@ -761,6 +767,7 @@ mod tests {
                 device: None,
                 driver: Some("nouveau".into()),
                 monitor: false,
+                monitor_mode: Some("1920x1080@60".into()),
                 mode: SwitchMode::Secondary,
             }],
         };

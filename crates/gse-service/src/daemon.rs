@@ -84,6 +84,22 @@ pub struct Config {
     pub dev_ssh_port: Option<u16>,
 }
 
+/// The screen a sandbox on `gpu` gets, as its journal says it: `mode` in
+/// the app's window, or the monitor's preferred mode when that GPU drives
+/// the monitor.
+fn screen_words(root: &Root, gpu: &str, mode: &str) -> String {
+    let gpu = gpu
+        .parse()
+        .ok()
+        .and_then(|address| gse_host::pci::Gpu::read(root, address).ok());
+    match gpu {
+        Some(gpu) if gse_host::plan::Mode::for_gpu(&gpu) == gse_host::plan::Mode::Single => gpu
+            .monitor_mode()
+            .map_or_else(|| "the monitor's own".to_owned(), str::to_owned),
+        _ => mode.to_owned(),
+    }
+}
+
 fn pci_address<'de, D: serde::Deserializer<'de>>(from: D) -> Result<PciAddress, D::Error> {
     let text = String::deserialize(from)?;
     text.parse().map_err(serde::de::Error::custom)
@@ -756,7 +772,7 @@ impl Service {
                 "{STARTING} {} on GPU {}, screen {}, internet {}",
                 launch.owner.name,
                 launch.gpu,
-                launch.screen_mode,
+                screen_words(&root, &launch.gpu.to_string(), &launch.screen_mode),
                 on_off(launch.internet)
             ),
         );
@@ -1176,7 +1192,8 @@ impl Service {
                 name,
                 format!(
                     "Settings: GPU {}, screen {}; they apply from the next start",
-                    settings.gpu, settings.screen_mode
+                    settings.gpu,
+                    screen_words(&self.lock().root, &settings.gpu, &settings.screen_mode)
                 ),
             );
         }
@@ -1758,6 +1775,7 @@ mod tests {
             device: None,
             driver: Some("nouveau".into()),
             monitor: false,
+            monitor_mode: None,
             mode: gse_protocol::SwitchMode::Secondary,
         }];
         let settings = |gpu: &str, screen_mode: &str| Settings {

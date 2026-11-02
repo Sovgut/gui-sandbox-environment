@@ -355,11 +355,11 @@ impl Home {
             rates.push(mode.rate);
             rates.sort_unstable();
         }
-        let screen: Div = if single {
+        let screen: Div = if let (true, Some(gpu)) = (single, chosen) {
             div()
                 .text_sm()
                 .text_color(Theme::muted())
-                .child("The monitor's own")
+                .child(crate::shell::monitor_text(gpu))
         } else {
             self.menu(
                 match target {

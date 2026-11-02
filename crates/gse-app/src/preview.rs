@@ -94,6 +94,7 @@ fn gpus() -> Vec<Gpu> {
             device: Some("DG2 [Arc A380]".into()),
             driver: Some("i915".into()),
             monitor: true,
+            monitor_mode: Some("2560x1440@59.95".into()),
             mode: SwitchMode::Single,
         },
         Gpu {
@@ -104,6 +105,7 @@ fn gpus() -> Vec<Gpu> {
             device: Some("RTX 3070".into()),
             driver: Some("nouveau".into()),
             monitor: false,
+            monitor_mode: None,
             mode: SwitchMode::Secondary,
         },
     ]

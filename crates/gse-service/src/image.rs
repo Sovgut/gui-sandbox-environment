@@ -273,6 +273,7 @@ fn build(
         monitor_socket: state_path("build.monitor"),
         serial_log: console.clone(),
         journal_log: None,
+        host_input: Vec::new(),
         run_as: job.run_as.clone(),
         image_build: true,
     };
@@ -319,6 +320,7 @@ fn build(
     let mut watch = vm::Watch {
         owner: None,
         progress: &mut |_| {},
+        exit_keys: Vec::new(),
     };
     let outcome = vm::run_networked("build", true, None, job.stop, &mut watch, spec_for);
     done.store(true, Ordering::SeqCst);

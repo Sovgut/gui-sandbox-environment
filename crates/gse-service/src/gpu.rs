@@ -54,6 +54,7 @@ pub fn describe(root: &Root) -> Result<Vec<gse_protocol::Gpu>> {
                 device,
                 driver: display.driver.clone(),
                 monitor: gpu.drives_display(),
+                monitor_mode: gpu.monitor_mode().map(str::to_owned),
                 mode: match Mode::for_gpu(gpu) {
                     Mode::Single => gse_protocol::SwitchMode::Single,
                     Mode::Secondary => gse_protocol::SwitchMode::Secondary,

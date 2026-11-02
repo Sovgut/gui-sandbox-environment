@@ -37,6 +37,11 @@ pub struct VmSpec {
     /// PipeWire backend barely advances a stream it opened as root before
     /// dropping privileges, and the guest's sound then crawls.
     pub screen: Option<Screen>,
+    /// The host's own keyboards and mice, which QEMU grabs and gives to the
+    /// guest: on a single-GPU machine the environment owns the monitor and
+    /// nothing on the host is left to send input. Both Ctrl keys pressed
+    /// together hand them back, which the service takes as the way out.
+    pub host_input: Vec<HostInput>,
     /// A QMP socket through which the viewer of the environment screen sends input to
     /// the VM's virtual keyboard, its tablet (absolute pointer for the
     /// desktop) and its mouse (relative motion for games that lock the
@@ -58,6 +63,14 @@ pub struct VmSpec {
     /// `opt/gse/build` and starts no desktop, which a VM without a GPU could
     /// only start and lose in a loop.
     pub image_build: bool,
+}
+
+/// An evdev device of the host that the VM takes over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostInput {
+    pub device: PathBuf,
+    /// Keys repeat when held; a mouse has none to repeat.
+    pub keyboard: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,6 +250,17 @@ impl VmSpec {
                 ]);
             }
         }
+        // Grabbing any of them grabs all, and ctrl-ctrl lets all go.
+        for (index, input) in self.host_input.iter().enumerate() {
+            push(&[
+                "-object",
+                &format!(
+                    "input-linux,id=host-input{index},evdev={},grab_all=on,repeat={},grab-toggle=ctrl-ctrl",
+                    input.device.display(),
+                    if input.keyboard { "on" } else { "off" }
+                ),
+            ]);
+        }
         if let Some(socket) = &self.input_socket {
             push(&[
                 "-device",
@@ -282,9 +306,33 @@ mod tests {
             monitor_socket: "/run/gse/proto.monitor".into(),
             serial_log: "/vm/console.log".into(),
             journal_log: None,
+            host_input: Vec::new(),
             run_as: Some("sovhut".into()),
             image_build: false,
         }
+    }
+
+    #[test]
+    fn host_input_is_grabbed_together_and_only_keyboards_repeat() {
+        let mut spec = spec();
+        spec.host_input = vec![
+            HostInput {
+                device: "/dev/input/event2".into(),
+                keyboard: true,
+            },
+            HostInput {
+                device: "/dev/input/event5".into(),
+                keyboard: false,
+            },
+        ];
+        let args = spec.command_line();
+        let objects = after(&args, "-object");
+        assert!(objects.contains(
+            &"input-linux,id=host-input0,evdev=/dev/input/event2,grab_all=on,repeat=on,grab-toggle=ctrl-ctrl"
+        ));
+        assert!(objects.contains(
+            &"input-linux,id=host-input1,evdev=/dev/input/event5,grab_all=on,repeat=off,grab-toggle=ctrl-ctrl"
+        ));
     }
 
     fn after<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {

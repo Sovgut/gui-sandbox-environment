@@ -202,6 +202,25 @@ pub fn launch_environment(
     } else {
         crate::logs::start_environment_logs(dir, launch.owner.uid)?
     };
+    // With one GPU the environment drives the monitor itself and takes the
+    // host's keyboards and mice: the host session, and the app with it, is
+    // gone until the environment stops.
+    let single = gse_host::plan::Mode::for_gpu(&attached) == gse_host::plan::Mode::Single;
+    let host_input = if single {
+        crate::hostinput::discover()
+    } else {
+        Vec::new()
+    };
+    if single {
+        info!(
+            "single GPU: the environment drives the monitor and takes {}",
+            host_input
+                .iter()
+                .map(|i| i.device.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
     let spec_for = |socket: PathBuf| VmSpec {
         name: launch.name.clone(),
         disk: launch.disk.clone(),
@@ -212,11 +231,12 @@ pub fn launch_environment(
         passthrough: attached.functions.iter().map(|f| f.address).collect(),
         network: Network::Passt { socket },
         vnc_display: launch.dev_vnc,
-        screen: Some(Screen {
+        screen: (!single).then(|| Screen {
             memory: screen.clone(),
             mode: launch.screen_mode.clone(),
             sound_server: PathBuf::from(format!("/run/user/{}/pulse/native", launch.owner.uid)),
         }),
+        host_input: host_input.clone(),
         input_socket: Some(launch.input_socket()),
         agent_socket: Some(launch.agent_socket()),
         monitor_socket: state_path(&format!("{}.monitor", launch.name)),
@@ -233,8 +253,13 @@ pub fn launch_environment(
         Ok(())
     } else {
         let mut watch = Watch {
-            owner: Some(launch.owner.uid),
+            owner: (!single).then_some(launch.owner.uid),
             progress,
+            exit_keys: host_input
+                .iter()
+                .filter(|i| i.keyboard)
+                .map(|i| i.device.clone())
+                .collect(),
         };
         run_networked(
             &launch.name,
@@ -335,6 +360,9 @@ fn kill_qemu(name: &str, pid: i32) {
 pub struct Watch<'a> {
     pub owner: Option<u32>,
     pub progress: &'a mut dyn FnMut(Stage),
+    /// Host keyboards the VM grabbed; a key from one of them stops it (see
+    /// [`crate::hostinput`]).
+    pub exit_keys: Vec<PathBuf>,
 }
 
 /// The line the guest writes to its serial console once its desktop is up.
@@ -448,44 +476,22 @@ pub fn run_networked(
     outcome
 }
 
-fn run_qemu(spec: &VmSpec, stop: &AtomicBool, watch: &mut Watch<'_>) -> Result<()> {
-    fs::create_dir_all(STATE_DIR)?;
-    if !spec.firmware_vars.exists() {
-        fs::copy(OVMF_VARS_TEMPLATE, &spec.firmware_vars)
-            .with_context(|| format!("creating {}", spec.firmware_vars.display()))?;
-    }
-    fs::remove_file(&spec.monitor_socket).ok();
-    for socket in spec.input_socket.iter().chain(&spec.agent_socket) {
-        fs::remove_file(socket).ok();
-    }
-
-    let command_line = spec.command_line();
-    info!("starting {}", command_line.join(" "));
-    // VFIO pins all guest memory. QEMU runs in its own process group so a
-    // Ctrl+C in the terminal reaches only this service, which then kills QEMU
-    // and still gives the GPU back.
-    let mut child = Command::new("prlimit")
-        .arg("--memlock=unlimited:unlimited")
-        .arg("--")
-        .args(&command_line)
-        .stdin(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .context("starting QEMU")?;
-    // A service that dies leaves QEMU running in its own process group; the
-    // next service finds it through this file (see `recover`).
-    let pid_file = qemu_pid_file(&spec.name);
-    fs::write(&pid_file, child.id().to_string()).ok();
-    (watch.progress)(Stage::Booting);
-
+/// Waits for QEMU to exit, handing the input socket to its owner, reporting
+/// readiness, capping the guest's logs and killing QEMU once `stop` is set.
+fn wait_for_qemu(
+    spec: &VmSpec,
+    child: &mut std::process::Child,
+    stop: &AtomicBool,
+    watch: &mut Watch<'_>,
+) -> Result<ExitStatus> {
     let mut stopped = false;
     let mut ready = ReadyWatch::new(&spec.serial_log);
     let mut ready_reported = false;
     let mut input_handed_over = spec.input_socket.is_none() || watch.owner.is_none();
     let mut turns: u32 = 0;
-    let status: ExitStatus = loop {
+    loop {
         if let Some(status) = child.try_wait()? {
-            break status;
+            return Ok(status);
         }
         turns = turns.wrapping_add(1);
         if turns.is_multiple_of(25) {
@@ -517,7 +523,50 @@ fn run_qemu(spec: &VmSpec, stop: &AtomicBool, watch: &mut Watch<'_>) -> Result<(
         } else {
             20
         }));
-    };
+    }
+}
+
+fn run_qemu(spec: &VmSpec, stop: &AtomicBool, watch: &mut Watch<'_>) -> Result<()> {
+    fs::create_dir_all(STATE_DIR)?;
+    if !spec.firmware_vars.exists() {
+        fs::copy(OVMF_VARS_TEMPLATE, &spec.firmware_vars)
+            .with_context(|| format!("creating {}", spec.firmware_vars.display()))?;
+    }
+    fs::remove_file(&spec.monitor_socket).ok();
+    for socket in spec.input_socket.iter().chain(&spec.agent_socket) {
+        fs::remove_file(socket).ok();
+    }
+
+    let command_line = spec.command_line();
+    info!("starting {}", command_line.join(" "));
+    // VFIO pins all guest memory. QEMU runs in its own process group so a
+    // Ctrl+C in the terminal reaches only this service, which then kills QEMU
+    // and still gives the GPU back.
+    let mut child = Command::new("prlimit")
+        .arg("--memlock=unlimited:unlimited")
+        .arg("--")
+        .args(&command_line)
+        .stdin(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .context("starting QEMU")?;
+    // A service that dies leaves QEMU running in its own process group; the
+    // next service finds it through this file (see `recover`).
+    let pid_file = qemu_pid_file(&spec.name);
+    fs::write(&pid_file, child.id().to_string()).ok();
+    (watch.progress)(Stage::Booting);
+
+    let exit_keys = watch.exit_keys.clone();
+    let watching = AtomicBool::new(false);
+    let status = std::thread::scope(|scope| -> Result<ExitStatus> {
+        if !exit_keys.is_empty() {
+            scope.spawn(|| crate::hostinput::watch_for_exit(&exit_keys, stop, &watching));
+        }
+        let status = wait_for_qemu(spec, &mut child, stop, watch);
+        watching.store(true, Ordering::SeqCst);
+        status
+    })?;
+    let stopped = stop.load(Ordering::SeqCst);
     fs::remove_file(&pid_file).ok();
     fs::remove_file(&spec.monitor_socket).ok();
     for socket in spec.input_socket.iter().chain(&spec.agent_socket) {

@@ -10,6 +10,7 @@ mod checks;
 mod daemon;
 mod fedora;
 mod gpu;
+mod hostinput;
 mod image;
 mod logs;
 mod net;

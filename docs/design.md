@@ -98,9 +98,13 @@ kernel; with it the guest sees the 3070 at PCIe 4.0 x16 with Vulkan.
   Shutting the environment down reverses this and brings the desktop back. A switch
   takes roughly 20-40 seconds. With a second GPU the environment is shown in a window
   instead (see "Environment screen").
-- **Emergency exit hotkey** (for example `Ctrl+Alt+Pause`) is read by the host
-  service from evdev, so the guest can neither fake nor block it. It kills the
-  VM immediately.
+- **Emergency exit**: both Ctrl keys pressed together. On a single-GPU machine
+  QEMU grabs the host's keyboards and mice (`input-linux`, `grab_all`), so
+  nothing on the host sees them, and this pair makes it let them go. The
+  service reads the keyboards as well and gets nothing while they are
+  grabbed, so the first key it sees means the user asked to leave: it kills
+  the VM at once. The guest never sees the devices, so it can neither fake
+  the exit nor block it.
 - A suspended VM cannot be resumed after the GPU is reclaimed: consumer GeForce
   cards do not support saving VM state with a passed-through device.
 - The environment VM has no emulated display and no network of its own by
@@ -122,10 +126,13 @@ The app shows the running environment according to the switch mode:
   desktop. A "Full screen" button spreads it over the monitor; full screen
   hides the bar, and Ctrl+Alt+F leaves it. Keyboard and mouse go to the
   environment while its view has focus.
-- **single**: in place of "Full screen" the app has an "Enter" button. It
-  performs the switch: the host desktop goes away and the environment owns the
-  monitor. Shutting the environment down or the emergency hotkey brings the desktop
-  back.
+- **single**: the environment owns the monitor and the input. The guest gets
+  no screen mode, so labwc drives the GPU's connectors; QEMU gets the host's
+  keyboards and mice (see the emergency exit above) and no host sound card,
+  since the host session is gone: sound plays through the GPU's own HDMI
+  function. The app warns that the session closes as at a logout and goes
+  with it. Shutting the environment down from its menu, or the emergency
+  exit, brings the login screen back.
 
 In secondary mode the passed-through GPU usually has no monitor, as on a
 laptop whose discrete GPU has no outputs. The guest compositor still runs on

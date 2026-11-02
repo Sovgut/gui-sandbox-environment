@@ -28,7 +28,7 @@ use gse_protocol::ScreenAccess;
 use gse_screen::Reader;
 use smallvec::SmallVec;
 
-use crate::input::Input;
+use gse_protocol::qmp::Input;
 use crate::ui::Theme;
 
 /// Evdev codes the capture combination uses.

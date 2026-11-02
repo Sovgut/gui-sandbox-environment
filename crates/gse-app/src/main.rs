@@ -12,7 +12,6 @@ mod diagnostics;
 mod flathub;
 mod gpu;
 mod icons;
-mod input;
 mod journal;
 mod onboarding;
 mod presets;

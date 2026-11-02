@@ -118,6 +118,30 @@ impl PciFunction {
 pub struct Connector {
     pub name: String,
     pub connected: bool,
+    /// The connected monitor's preferred mode from its EDID, as
+    /// `1920x1080@60`: the mode a guest that takes the GPU shows on it.
+    pub preferred_mode: Option<String>,
+}
+
+/// The preferred mode in an EDID: its first detailed timing descriptor, its
+/// refresh rate exact to two decimals (`2560x1440@59.98`).
+#[must_use]
+pub fn edid_preferred_mode(edid: &[u8]) -> Option<String> {
+    let d = edid.get(54..72)?;
+    let clock = u64::from(u16::from_le_bytes([d[0], d[1]])) * 10_000;
+    let width = u64::from(d[2]) | (u64::from(d[4] & 0xf0) << 4);
+    let h_blank = u64::from(d[3]) | (u64::from(d[4] & 0x0f) << 8);
+    let height = u64::from(d[5]) | (u64::from(d[7] & 0xf0) << 4);
+    let v_blank = u64::from(d[6]) | (u64::from(d[7] & 0x0f) << 8);
+    let total = (width + h_blank) * (height + v_blank);
+    if clock == 0 || total == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let rate = clock as f64 / total as f64;
+    let rate = format!("{rate:.2}");
+    let rate = rate.trim_end_matches('0').trim_end_matches('.');
+    Some(format!("{width}x{height}@{rate}"))
 }
 
 /// A GPU and every function in its slot (usually its HDMI audio).
@@ -158,10 +182,16 @@ impl Gpu {
                 if !name.starts_with(&format!("{card}-")) {
                     continue;
                 }
-                let status = root.read_opt(drm.join(card).join(&name).join("status"));
+                let dir = drm.join(card).join(&name);
+                let connected = root.read_opt(dir.join("status")).as_deref() == Some("connected");
+                let preferred_mode = connected
+                    .then(|| std::fs::read(root.path(dir.join("edid"))).ok())
+                    .flatten()
+                    .and_then(|edid| edid_preferred_mode(&edid));
                 connectors.push(Connector {
-                    connected: status.as_deref() == Some("connected"),
                     name,
+                    connected,
+                    preferred_mode,
                 });
             }
         }
@@ -196,6 +226,15 @@ impl Gpu {
         self.display().iommu_group
     }
 
+    /// The preferred mode of the first monitor attached, if its EDID says.
+    #[must_use]
+    pub fn monitor_mode(&self) -> Option<&str> {
+        self.connectors
+            .iter()
+            .filter(|c| c.connected)
+            .find_map(|c| c.preferred_mode.as_deref())
+    }
+
     /// Whether a monitor is attached, which means the host desktop runs on it.
     #[must_use]
     pub fn drives_display(&self) -> bool {
@@ -205,6 +244,40 @@ impl Gpu {
     #[must_use]
     pub fn is_nvidia(&self) -> bool {
         self.display().vendor == 0x10de
+    }
+}
+
+#[cfg(test)]
+mod edid_tests {
+    use super::edid_preferred_mode;
+
+    /// An EDID whose first detailed timing is the given one.
+    fn edid(clock_10khz: u16, h: (u16, u16), v: (u16, u16)) -> Vec<u8> {
+        let mut edid = vec![0u8; 128];
+        let d = &mut edid[54..72];
+        d[0..2].copy_from_slice(&clock_10khz.to_le_bytes());
+        d[2] = (h.0 & 0xff) as u8;
+        d[3] = (h.1 & 0xff) as u8;
+        d[4] = (((h.0 >> 8) as u8) << 4) | (h.1 >> 8) as u8;
+        d[5] = (v.0 & 0xff) as u8;
+        d[6] = (v.1 & 0xff) as u8;
+        d[7] = (((v.0 >> 8) as u8) << 4) | (v.1 >> 8) as u8;
+        edid
+    }
+
+    #[test]
+    fn the_preferred_mode_keeps_its_exact_rate() {
+        // CVT reduced blanking 2560x1440: 241.50 MHz over 2720 x 1481.
+        assert_eq!(
+            edid_preferred_mode(&edid(24150, (2560, 160), (1440, 41))).as_deref(),
+            Some("2560x1440@59.95")
+        );
+        // CEA 1920x1080: 148.50 MHz over 2200 x 1125 is exactly 60.
+        assert_eq!(
+            edid_preferred_mode(&edid(14850, (1920, 280), (1080, 45))).as_deref(),
+            Some("1920x1080@60")
+        );
+        assert_eq!(edid_preferred_mode(&[0; 20]), None);
     }
 }
 

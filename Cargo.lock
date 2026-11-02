@@ -2983,6 +2983,7 @@ dependencies = [
 name = "gse-protocol"
 version = "0.3.0"
 dependencies = [
+ "anyhow",
  "serde",
  "serde_json",
 ]

@@ -193,8 +193,19 @@ fn pill(
         })
 }
 
+/// What a sandbox shows on a monitor it takes over: the monitor's preferred
+/// mode, when the service could read it.
+pub(crate) fn monitor_text(gpu: &gse_protocol::Gpu) -> String {
+    let mode = gpu.monitor_mode.as_deref().and_then(|mode| {
+        let (size, rate) = mode.split_once('@')?;
+        let (width, height) = size.split_once('x')?;
+        Some(format!("{width} x {height} @ {rate} FPS"))
+    });
+    mode.unwrap_or_else(|| "The monitor's own".to_owned())
+}
+
 /// The screen mode as the facts row says it.
-pub(crate) fn mode_text(mode: &str) -> String {
+fn mode_text(mode: &str) -> String {
     mode.parse::<ScreenMode>().map_or_else(
         |_| mode.to_owned(),
         |m| format!("{} x {} @ {} FPS", m.width, m.height, m.rate),
@@ -216,6 +227,20 @@ enum CoverState {
 }
 
 impl Home {
+    /// The screen a sandbox on `gpu` gets: the screen mode in the window, or
+    /// the monitor's own when that GPU drives the monitor and the sandbox
+    /// takes it over.
+    pub(crate) fn screen_text(&self, gpu: &str, mode: &str) -> String {
+        let single = self.settings.as_ref().ok().and_then(|(_, gpus)| {
+            gpus.iter()
+                .find(|g| g.address == gpu && g.mode == gse_protocol::SwitchMode::Single)
+        });
+        match single {
+            Some(gpu) => monitor_text(gpu),
+            None => mode_text(mode),
+        }
+    }
+
     /// The width the sidebar takes now.
     fn rail(&self) -> bool {
         self.sidebar_collapsed
@@ -1069,7 +1094,10 @@ impl Home {
                     ),
             )
             .child(tile().child(fact("Graphics", gpu)))
-            .child(tile().child(fact("Screen", mode_text(&environment.settings.screen_mode))))
+            .child(tile().child(fact(
+                "Screen",
+                self.screen_text(&environment.settings.gpu, &environment.settings.screen_mode),
+            )))
             .child(
                 tile()
                     .id("open-sandbox-settings")

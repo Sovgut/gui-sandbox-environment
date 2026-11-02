@@ -32,6 +32,7 @@ fn base(name: &str) -> VmSpec {
         screen: None,
         host_input: Vec::new(),
         qmp_object: false,
+        keyboard: None,
         input_socket: None,
         monitor_socket: "@DIR@/monitor".into(),
         agent_socket: None,
@@ -62,6 +63,7 @@ fn main() {
         device: "@DIR@/keyboard".into(),
         keyboard: true,
     }];
+    single.keyboard = Some("@DIR@/keyboard".into());
     single.input_socket = Some("@DIR@/input".into());
     single.agent_socket = Some("@DIR@/agent".into());
     single.journal_log = Some(PathBuf::from("@DIR@/guest.log"));

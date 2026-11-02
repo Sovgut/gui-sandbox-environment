@@ -723,7 +723,13 @@ impl Service {
 
     /// Starts `name` for `owner`; progress goes to `progress` and to every
     /// watcher, and a start that fails ends `progress` with the reason.
-    fn start(&self, name: &str, owner: u32, progress: Sender<Result<Stage, String>>) -> Result<()> {
+    fn start(
+        &self,
+        name: &str,
+        keyboard: Option<gse_protocol::Keyboard>,
+        owner: u32,
+        progress: Sender<Result<Stage, String>>,
+    ) -> Result<()> {
         let (launch, stop, root) = {
             let mut shared = self.lock();
             if let Some(current) = &shared.current {
@@ -750,6 +756,7 @@ impl Service {
                 owner: vm::Owner::from_uid(owner)?,
                 dev_ssh_port: shared.config.dev_ssh_port,
                 dev_vnc: None,
+                keyboard,
             };
             let stop = Arc::new(AtomicBool::new(false));
             shared.current = Some(Current {
@@ -831,9 +838,15 @@ impl Service {
 
     /// Starts `name` and reports its progress to `out` until the desktop is
     /// up; a start that fails ends with the reason.
-    fn start_and_report(&self, name: &str, peer: Peer, out: &mut UnixStream) -> Result<()> {
+    fn start_and_report(
+        &self,
+        name: &str,
+        keyboard: Option<gse_protocol::Keyboard>,
+        peer: Peer,
+        out: &mut UnixStream,
+    ) -> Result<()> {
         let (tx, rx) = mpsc::channel();
-        self.start(name, peer.uid, tx)?;
+        self.start(name, keyboard, peer.uid, tx)?;
         for update in rx {
             match update {
                 Ok(stage) => {
@@ -1032,7 +1045,8 @@ impl Service {
                 let out = store.builds_dir().join(format!("{BASE_IMAGE}.qcow2"));
                 fs::remove_file(&out).ok();
                 let fingerprint = image::base_fingerprint(&guest);
-                let built = image::build_base_image(&from, &out, guest, dev_key.as_deref(), &job, false);
+                let built =
+                    image::build_base_image(&from, &out, guest, dev_key.as_deref(), &job, false);
                 drop(job);
                 forwarder.join().ok();
                 built.and_then(|()| store.replace_base(&out, &fingerprint))
@@ -1346,7 +1360,9 @@ impl Service {
                 let entries = self.lock().store.journal(&name)?;
                 send(out, &Reply::Journal { entries })?;
             }
-            Request::Start { name } => self.start_and_report(&name, peer, out)?,
+            Request::Start { name, keyboard } => {
+                self.start_and_report(&name, keyboard, peer, out)?;
+            }
             Request::Stop => self.stop(peer)?,
             Request::Internet { on } => {
                 let name = self

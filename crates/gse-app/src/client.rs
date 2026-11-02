@@ -295,6 +295,7 @@ pub fn start(name: &str, mut progress: impl FnMut(Stage)) -> Result<()> {
     call(
         &Request::Start {
             name: name.to_owned(),
+            keyboard: crate::keyboard::host(),
         },
         |reply| {
             if let Reply::Progress { stage } = reply {

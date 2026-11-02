@@ -105,10 +105,7 @@ pub fn watch_for_exit(keyboards: &[PathBuf], stop: &AtomicBool, done: &AtomicBoo
         if rustix::event::poll(&mut fds, Some(&timeout)).is_err() {
             continue;
         }
-        let ready: Vec<bool> = fds
-            .iter()
-            .map(|fd| !fd.revents().is_empty())
-            .collect();
+        let ready: Vec<bool> = fds.iter().map(|fd| !fd.revents().is_empty()).collect();
         drop(fds);
         for (file, ready) in files.iter_mut().zip(ready) {
             if !ready {

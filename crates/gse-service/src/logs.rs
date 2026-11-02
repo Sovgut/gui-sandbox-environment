@@ -28,7 +28,9 @@ pub const RUNNING_LIMIT: u64 = 64 << 20;
 /// The file beside `path` that holds what it held before: `x.log` becomes
 /// `x.previous.log`.
 pub fn previous(path: &Path) -> PathBuf {
-    let stem = path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let stem = path
+        .file_stem()
+        .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
     path.with_file_name(format!("{stem}.previous.log"))
 }
 
@@ -84,10 +86,7 @@ pub fn keep_build_console(image: &str, console: &Path, ok: bool) {
         let to = Path::new(BUILDS).join(format!("{at}-{image}-{verdict}.log"));
         fs::copy(console, &to)?;
         fs::set_permissions(&to, fs::Permissions::from_mode(0o644))?;
-        let mut kept: Vec<PathBuf> = fs::read_dir(BUILDS)?
-            .flatten()
-            .map(|e| e.path())
-            .collect();
+        let mut kept: Vec<PathBuf> = fs::read_dir(BUILDS)?.flatten().map(|e| e.path()).collect();
         kept.sort();
         for old in kept.iter().rev().skip(KEEP_BUILDS) {
             fs::remove_file(old).ok();
@@ -130,7 +129,11 @@ pub fn cap(path: &Path, limit: u64) {
         && let Ok(mut file) = fs::OpenOptions::new().write(true).open(path)
     {
         file.set_len(0).ok();
-        writeln!(file, "--- gse: this log passed {limit} bytes and started over ---").ok();
+        writeln!(
+            file,
+            "--- gse: this log passed {limit} bytes and started over ---"
+        )
+        .ok();
     }
 }
 

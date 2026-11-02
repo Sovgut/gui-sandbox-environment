@@ -234,6 +234,41 @@ pub fn build_preset_image(
     build(base, out, &user_data, &files, job, dry_run)
 }
 
+/// The VM that builds an image: no GPU, no screen and no input, its guest
+/// console written to `console`.
+fn build_spec(
+    stem: &str,
+    work: &Path,
+    overlay: &Path,
+    seed_img: &Path,
+    console: &Path,
+    job: &Job<'_>,
+    socket: PathBuf,
+) -> VmSpec {
+    VmSpec {
+        name: format!("build-{stem}"),
+        disk: overlay.to_path_buf(),
+        read_only_disks: vec![seed_img.to_path_buf()],
+        firmware_vars: work.join("OVMF_VARS.qcow2"),
+        memory_mib: 6144,
+        cpus: 8,
+        passthrough: Vec::new(),
+        network: Network::Passt { socket },
+        vnc_display: None,
+        screen: None,
+        input_socket: None,
+        agent_socket: None,
+        monitor_socket: state_path("build.monitor"),
+        serial_log: console.to_path_buf(),
+        journal_log: None,
+        host_input: Vec::new(),
+        qmp_object: false,
+        keyboard: None,
+        run_as: job.run_as.clone(),
+        image_build: true,
+    }
+}
+
 /// Builds `out` from `from` by booting it once with a seed carrying
 /// `user_data` and `files`, then flattening the result.
 fn build(
@@ -257,27 +292,8 @@ fn build(
     let overlay = work.join("disk.qcow2");
     let seed_img = work.join("seed.img");
     let console = work.join("console.log");
-    let spec_for = |socket: PathBuf| VmSpec {
-        name: format!("build-{stem}"),
-        disk: overlay.clone(),
-        read_only_disks: vec![seed_img.clone()],
-        firmware_vars: work.join("OVMF_VARS.qcow2"),
-        memory_mib: 6144,
-        cpus: 8,
-        passthrough: Vec::new(),
-        network: Network::Passt { socket },
-        vnc_display: None,
-        screen: None,
-        input_socket: None,
-        agent_socket: None,
-        monitor_socket: state_path("build.monitor"),
-        serial_log: console.clone(),
-        journal_log: None,
-        host_input: Vec::new(),
-        qmp_object: false,
-        run_as: job.run_as.clone(),
-        image_build: true,
-    };
+    let spec_for =
+        |socket: PathBuf| build_spec(&stem, &work, &overlay, &seed_img, &console, job, socket);
     if dry_run {
         info!("dry run: build in {}", work.display());
         info!(

@@ -159,11 +159,44 @@ Type=oneshot
 ExecStartPre=-/usr/sbin/modprobe qemu_fw_cfg
 ExecStart=/bin/sh -c 'install -d /run/gse; f=/sys/firmware/qemu_fw_cfg/by_name/opt/gse/screen/raw; rm -f /run/gse/screen-mode; [ -r $f ] && install -m 0644 $f /run/gse/screen-mode; true'
 ExecStart=/bin/sh -c 'rm -f /run/gse/build; [ -r /sys/firmware/qemu_fw_cfg/by_name/opt/gse/build/raw ] && touch /run/gse/build; true'
+ExecStart=/usr/libexec/gse/keyboard
 
 [Install]
 WantedBy=multi-user.target
 EOF
 systemctl enable gse-screen-mode.service
+# The host hands over its user's keyboard layouts at each start (fw_cfg
+# opt/gse/keyboard: `layouts=us,ru`, `options=grp:win_space_toggle`). They
+# become the desktop's system-wide settings, locked, so the panel and
+# labwc (through Budgie's bridge) use them whatever was set inside.
+install -d /usr/libexec/gse /etc/dconf/profile /etc/dconf/db/local.d/locks
+printf 'user-db:user\nsystem-db:local\n' > /etc/dconf/profile/user
+cat > /usr/libexec/gse/keyboard <<'EOF'
+#!/bin/sh
+raw=/sys/firmware/qemu_fw_cfg/by_name/opt/gse/keyboard/raw
+db=/etc/dconf/db/local.d
+rm -f "$db/00-gse-keyboard" "$db/locks/gse-keyboard"
+field() { [ -r "$raw" ] && sed -n "s/^$1=//p" "$raw" | head -1; }
+layouts=$(field layouts)
+options=$(field options)
+# XKB names only; anything else is left out rather than written into dconf.
+case "$layouts$options" in *[!a-z0-9_:,\(\)+-]*) layouts= ;; esac
+if [ -n "$layouts" ]; then
+    sources=$(echo "$layouts" | tr ',' '\n' | sed 's/(\(.*\))/+\1/' \
+        | sed "s/.*/('xkb', '&')/" | paste -sd, - | sed 's/),(/), (/g')
+    xkb=$(echo "$options" | tr ',' '\n' | sed '/^$/d' | sed "s/.*/'&'/" \
+        | paste -sd, - | sed 's/,/, /g')
+    cat > "$db/00-gse-keyboard" <<KEYS
+[org/gnome/desktop/input-sources]
+sources=[$sources]
+xkb-options=[$xkb]
+KEYS
+    printf '%s\n' /org/gnome/desktop/input-sources/sources \
+        /org/gnome/desktop/input-sources/xkb-options > "$db/locks/gse-keyboard"
+fi
+dconf update
+EOF
+chmod 0755 /usr/libexec/gse/keyboard
 mkdir -p /etc/systemd/system/greetd.service.d
 cat > /etc/systemd/system/greetd.service.d/gse.conf <<'EOF'
 [Unit]

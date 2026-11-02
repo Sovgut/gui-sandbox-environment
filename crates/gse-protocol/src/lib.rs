@@ -60,9 +60,12 @@ pub enum Request {
         name: String,
         image: String,
     },
-    /// Start `name`; progress follows until it is ready.
+    /// Start `name`; progress follows until it is ready. `keyboard` is the
+    /// host user's, which the sandbox takes for this run.
     Start {
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keyboard: Option<Keyboard>,
     },
     /// Stop the running environment at once.
     Stop,
@@ -526,6 +529,29 @@ pub struct Build {
     pub steps: Vec<String>,
 }
 
+/// Keyboard layouts as XKB names them, the first one active, and the XKB
+/// options that go with them, such as the key that switches layouts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Keyboard {
+    /// Layouts with their variant, if any: `us`, `ru`, `us(intl)`.
+    pub layouts: Vec<String>,
+    /// Such as `grp:win_space_toggle`.
+    pub options: Vec<String>,
+}
+
+impl Keyboard {
+    /// The lines the guest reads from the `fw_cfg` item `opt/gse/keyboard`:
+    /// `layouts=us,ru` and `options=grp:win_space_toggle`.
+    #[must_use]
+    pub fn to_guest_text(&self) -> String {
+        format!(
+            "layouts={}\noptions={}\n",
+            self.layouts.join(","),
+            self.options.join(",")
+        )
+    }
+}
+
 /// What an environment gets when it starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
@@ -707,6 +733,7 @@ mod tests {
             &mut wire,
             &Request::Start {
                 name: "test".into(),
+                keyboard: None,
             },
         )
         .unwrap();
@@ -715,7 +742,8 @@ mod tests {
         assert_eq!(
             back,
             Request::Start {
-                name: "test".into()
+                name: "test".into(),
+                keyboard: None,
             }
         );
         assert!(receive::<Request>(&mut &b""[..]).unwrap().is_none());

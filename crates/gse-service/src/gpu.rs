@@ -178,7 +178,11 @@ pub fn attach(root: &Root, gpu: PciAddress, dry_run: bool) -> Result<(Gpu, Vec<P
     if let (false, Some(group)) = (dry_run, snapshot.gpu.iommu_group()) {
         info!("{gpu} is on {VFIO_PCI}: /dev/vfio/{group}");
     }
-    let moved = handoff.drivers.iter().map(|(address, _)| *address).collect();
+    let moved = handoff
+        .drivers
+        .iter()
+        .map(|(address, _)| *address)
+        .collect();
     Ok((snapshot.gpu, moved))
 }
 

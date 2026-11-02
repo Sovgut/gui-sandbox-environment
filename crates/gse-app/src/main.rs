@@ -13,6 +13,7 @@ mod flathub;
 mod gpu;
 mod icons;
 mod journal;
+mod keyboard;
 mod onboarding;
 mod presets;
 mod preview;

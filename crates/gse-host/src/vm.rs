@@ -42,6 +42,10 @@ pub struct VmSpec {
     /// nothing on the host is left to send input. Both Ctrl keys pressed
     /// together hand them back, which the service takes as the way out.
     pub host_input: Vec<HostInput>,
+    /// A file with the host user's keyboard layouts
+    /// (`gse_protocol::Keyboard::to_guest_text`), handed over as the `fw_cfg`
+    /// item `opt/gse/keyboard`.
+    pub keyboard: Option<PathBuf>,
     /// Whether this QEMU has the `monitor-qmp` object (QEMU 11 on), which
     /// takes the place of the deprecated `-mon`; older ones only know `-mon`.
     pub qmp_object: bool,
@@ -176,6 +180,12 @@ impl VmSpec {
         );
         if self.image_build {
             push(&["-fw_cfg", "name=opt/gse/build,string=1"]);
+        }
+        if let Some(keyboard) = &self.keyboard {
+            push(&[
+                "-fw_cfg",
+                &format!("name=opt/gse/keyboard,file={}", keyboard.display()),
+            ]);
         }
         // Appended to, so the service can start a log over that grew too
         // large while QEMU goes on writing.
@@ -315,6 +325,7 @@ mod tests {
             journal_log: None,
             host_input: Vec::new(),
             qmp_object: false,
+            keyboard: None,
             run_as: Some("sovhut".into()),
             image_build: false,
         }

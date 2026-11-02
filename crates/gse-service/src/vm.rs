@@ -90,6 +90,8 @@ pub struct Launch {
     pub dev_ssh_port: Option<u16>,
     /// Development only: an emulated display on VNC 127.0.0.1:5900+N.
     pub dev_vnc: Option<u16>,
+    /// The host user's keyboard layouts, which the guest takes.
+    pub keyboard: Option<gse_protocol::Keyboard>,
 }
 
 impl Launch {
@@ -168,6 +170,7 @@ pub fn run(root: &Root, args: &RunArgs, stop: &AtomicBool, dry_run: bool) -> Res
         owner: Owner::invoking().context("run this through sudo or pkexec")?,
         dev_ssh_port: args.dev_ssh_port,
         dev_vnc: args.dev_vnc,
+        keyboard: None,
     };
     launch_environment(root, &launch, stop, &mut |_| {}, dry_run)
 }
@@ -221,6 +224,15 @@ pub fn launch_environment(
                 .join(" ")
         );
     }
+    // The guest reads the layouts from fw_cfg; a file keeps QEMU's option
+    // parser away from their commas.
+    let keyboard = launch.keyboard.as_ref().map(|keyboard| {
+        let path = dir.join("keyboard");
+        if !dry_run {
+            fs::write(&path, keyboard.to_guest_text()).ok();
+        }
+        path
+    });
     let spec_for = |socket: PathBuf| VmSpec {
         name: launch.name.clone(),
         disk: launch.disk.clone(),
@@ -238,6 +250,7 @@ pub fn launch_environment(
         }),
         host_input: host_input.clone(),
         qmp_object: qemu_has_qmp_object(),
+        keyboard: keyboard.clone(),
         input_socket: Some(launch.input_socket()),
         agent_socket: Some(launch.agent_socket()),
         monitor_socket: state_path(&format!("{}.monitor", launch.name)),

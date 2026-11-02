@@ -5,10 +5,13 @@
 //! `guest` unless it is marked `trusted`, which makes it run as `sandbox`. Every
 //! `guest` application gets a menu entry on the desktop that starts it through
 //! `gse-guest run`, overriding any entry its package installs, so clicking
-//! it never starts it as `sandbox`; the same entries go onto the desktop.
+//! it never starts it as `sandbox`; the same entries go onto the desktop. The
+//! preset's `name` names its image; its `title`, if any, is what people call
+//! it.
 //!
 //! ```toml
 //! name = "launchers"
+//! title = "Game launchers"
 //!
 //! [[app]]
 //! name = "Steam"
@@ -46,6 +49,8 @@ const GUEST_RUN: &str = "/usr/libexec/gse/gse-guest run";
 #[serde(deny_unknown_fields)]
 pub struct Preset {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(default, rename = "app")]
     pub apps: Vec<App>,
 }
@@ -375,6 +380,7 @@ mod tests {
 
     const LAUNCHERS: &str = r#"
 name = "launchers"
+title = "Game launchers"
 
 [[app]]
 name = "Steam"
@@ -418,7 +424,9 @@ trusted = true
     #[test]
     fn writes_what_it_parses() {
         let preset = Preset::parse(LAUNCHERS).unwrap();
+        assert_eq!(preset.title.as_deref(), Some("Game launchers"));
         let text = preset.to_toml().unwrap();
+        assert!(text.starts_with("name = \"launchers\"\ntitle = \"Game launchers\"\n"));
         assert!(
             text.contains(
                 "[[app]]\nname = \"Heroic\"\nflatpak = \"com.heroicgameslauncher.hgl\"\n"
@@ -426,6 +434,14 @@ trusted = true
         );
         assert!(!text.contains("trusted = false"));
         assert_eq!(Preset::parse(&text).unwrap(), preset);
+        // A preset without a title is written without one.
+        let untitled = Preset {
+            title: None,
+            ..preset
+        };
+        let text = untitled.to_toml().unwrap();
+        assert!(!text.contains("title"));
+        assert_eq!(Preset::parse(&text).unwrap(), untitled);
     }
 
     #[test]

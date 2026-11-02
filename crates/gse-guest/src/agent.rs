@@ -1,7 +1,8 @@
 //! The environment's agent: answers the host over the virtio-serial port
-//! [`agent::PORT`], as root, and never speaks first. It lists and ends the
-//! processes of `guest` and moves files into `guest`'s `~/Inbox` and out of
-//! `~/Outbox`.
+//! [`agent::PORT`], as root, and never speaks first. It lists the processes
+//! of `guest` by the program each belongs to, with the program that
+//! started each program, ends them, and moves files into `guest`'s
+//! `~/Inbox` and out of `~/Outbox`.
 //!
 //! The port's device node belongs to root, so no program of `guest` can
 //! stand in for the agent. `guest` owns the two folders, though, and can
@@ -10,7 +11,7 @@
 //! new files and folders are given to `guest`, and a file only leaves when
 //! it is a regular file with a single link that `guest` owns.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read as _, Write as _};
@@ -53,6 +54,9 @@ const INFRASTRUCTURE: [&str; 13] = [
 const MAX_COMMAND: usize = 300;
 /// How deep a path below the Inbox or the Outbox may go.
 const MAX_DEPTH: usize = 16;
+/// How many parents up from a program's first process the program that
+/// started it is looked for.
+const MAX_ANCESTRY: usize = 64;
 
 /// The `guest` account.
 #[derive(Debug, Clone, Copy)]
@@ -572,14 +576,64 @@ fn process(pid: &str, status: &str) -> GuestProcess {
     }
 }
 
-/// The processes of `guest`, by the program each belongs to.
+/// Where a process of `guest` belongs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Belongs {
+    /// A program a user started, by its unit (see [`is_app_unit`]).
+    Program(String),
+    /// Outside every program.
+    Other,
+    /// The desktop's own services, `guest`'s systemd among them, which a
+    /// listing leaves out.
+    Desktop,
+}
+
+/// A process of `guest` as a listing found it.
+#[derive(Debug, Clone)]
+struct Found {
+    parent: u32,
+    belongs: Belongs,
+}
+
+/// The unit of the program that started the program `unit`, whose
+/// processes are `pids`: the nearest program up the line of parents of its
+/// first processes, past processes outside every program. The line ends at
+/// the desktop's services, `guest`'s systemd among them, which starts every
+/// menu entry, and at a process that is not `guest`'s.
+fn starter(found: &HashMap<u32, Found>, unit: &str, pids: &[u32]) -> Option<String> {
+    let own = |pid: u32| {
+        found
+            .get(&pid)
+            .is_some_and(|f| matches!(&f.belongs, Belongs::Program(u) if u == unit))
+    };
+    pids.iter()
+        .filter_map(|pid| found.get(pid))
+        // The first processes: those no other process of the program started.
+        .filter(|process| !own(process.parent))
+        .find_map(|process| {
+            let mut at = process.parent;
+            for _ in 0..MAX_ANCESTRY {
+                let parent = found.get(&at)?;
+                match &parent.belongs {
+                    Belongs::Program(other) if other != unit => return Some(other.clone()),
+                    Belongs::Desktop => return None,
+                    Belongs::Program(_) | Belongs::Other => at = parent.parent,
+                }
+            }
+            None
+        })
+}
+
+/// The processes of `guest`, by the program each belongs to, with the
+/// program that started each.
 fn processes(guest: Account) -> Vec<GuestApp> {
     let mut apps: BTreeMap<Option<String>, Vec<GuestProcess>> = BTreeMap::new();
+    let mut found = HashMap::new();
     for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
         let pid = entry.file_name().to_string_lossy().into_owned();
-        if !pid.bytes().all(|b| b.is_ascii_digit()) {
+        let Ok(number) = pid.parse::<u32>() else {
             continue;
-        }
+        };
         let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
             continue;
         };
@@ -588,20 +642,40 @@ fn processes(guest: Account) -> Vec<GuestApp> {
         if uid != Some(guest.uid) {
             continue;
         }
-        let unit = unit_of(&pid);
-        if unit.as_deref().is_some_and(is_infrastructure) {
-            continue;
-        }
-        let key = unit.filter(|u| is_app_unit(u));
+        let belongs = match unit_of(&pid) {
+            Some(unit) if is_infrastructure(&unit) => Belongs::Desktop,
+            Some(unit) if is_app_unit(&unit) => Belongs::Program(unit),
+            _ => Belongs::Other,
+        };
+        let parent = status_field(&status, "PPid")
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        found.insert(
+            number,
+            Found {
+                parent,
+                belongs: belongs.clone(),
+            },
+        );
+        let key = match belongs {
+            Belongs::Desktop => continue,
+            Belongs::Program(unit) => Some(unit),
+            Belongs::Other => None,
+        };
         apps.entry(key).or_default().push(process(&pid, &status));
     }
     apps.into_iter()
         .map(|(unit, mut processes)| {
             processes.sort_by_key(|p| p.pid);
+            let pids: Vec<u32> = processes.iter().map(|p| p.pid).collect();
             GuestApp {
                 title: unit
                     .as_deref()
                     .map_or_else(|| "Other programs".to_owned(), |u| title_of(guest, u)),
+                started_by: unit
+                    .as_deref()
+                    .and_then(|u| starter(&found, u, &pids))
+                    .map(|u| title_of(guest, &u)),
                 unit,
                 processes,
             }
@@ -675,6 +749,43 @@ mod tests {
         assert!(is_infrastructure("at-spi-dbus-bus.service"));
         assert!(!is_infrastructure("guest-app-1.service"));
         assert!(!is_infrastructure("dbus-broker.service.d"));
+    }
+
+    #[test]
+    fn a_program_names_the_program_that_started_it() {
+        const STEAM: &str = "guest-app-1.service";
+        const GAME: &str = "app-flatpak-com.example.Game-7.scope";
+        const HEROIC: &str = "app-flatpak-com.heroicgameslauncher.hgl-8.scope";
+        const OTHER: &str = "app-flatpak-com.example.Other-9.scope";
+        let program = |unit: &str| Belongs::Program(unit.to_owned());
+        let found: HashMap<u32, Found> = [
+            // `guest`'s systemd, started by root's.
+            (100, 1, Belongs::Desktop),
+            (200, 100, program(STEAM)),
+            (210, 200, program(STEAM)),
+            // A game Steam's helper started into a unit of its own.
+            (300, 210, program(GAME)),
+            (310, 300, program(GAME)),
+            // Heroic from the menu: systemd started it.
+            (400, 100, program(HEROIC)),
+            // Started through a shell Steam ran outside every program.
+            (500, 200, Belongs::Other),
+            (600, 500, program(OTHER)),
+            // Parents that loop, and one that is not `guest`'s.
+            (700, 701, Belongs::Other),
+            (701, 700, Belongs::Other),
+            (800, 700, program("guest-app-2.service")),
+            (900, 42, program("guest-app-3.service")),
+        ]
+        .into_iter()
+        .map(|(pid, parent, belongs)| (pid, Found { parent, belongs }))
+        .collect();
+        assert_eq!(starter(&found, GAME, &[300, 310]).as_deref(), Some(STEAM));
+        assert_eq!(starter(&found, STEAM, &[200, 210]), None);
+        assert_eq!(starter(&found, HEROIC, &[400]), None);
+        assert_eq!(starter(&found, OTHER, &[600]).as_deref(), Some(STEAM));
+        assert_eq!(starter(&found, "guest-app-2.service", &[800]), None);
+        assert_eq!(starter(&found, "guest-app-3.service", &[900]), None);
     }
 
     #[test]

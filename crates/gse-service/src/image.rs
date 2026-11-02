@@ -7,6 +7,7 @@
 //! back on the serial console; a passing build is flattened into one
 //! compressed qcow2 that no longer depends on the image it was built from.
 
+use std::cell::OnceCell;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -44,16 +45,29 @@ pub struct Job<'a> {
     /// Receives each provisioning step (an `=== <step>` line of the guest)
     /// as it reaches the console.
     pub steps: Option<Sender<String>>,
+    /// Where the build VM's console is kept once the build ended
+    /// ([`crate::logs::keep_build_console`]).
+    pub console: OnceCell<PathBuf>,
 }
 
 impl<'a> Job<'a> {
-    /// A build from the terminal, run for the user who ran sudo or pkexec.
-    fn invoked(stop: &'a AtomicBool) -> Self {
+    /// A build that reports its steps to `steps` and drops to `run_as`.
+    pub fn new(
+        stop: &'a AtomicBool,
+        run_as: Option<String>,
+        steps: Option<Sender<String>>,
+    ) -> Self {
         Self {
             stop,
-            run_as: vm::Owner::invoking().map(|o| o.name),
-            steps: None,
+            run_as,
+            steps,
+            console: OnceCell::new(),
         }
+    }
+
+    /// A build from the terminal, run for the user who ran sudo or pkexec.
+    fn invoked(stop: &'a AtomicBool) -> Self {
+        Self::new(stop, vm::Owner::invoking().map(|o| o.name), None)
     }
 }
 
@@ -344,7 +358,9 @@ fn build(
     done.store(true, Ordering::SeqCst);
     follower.join().ok();
     let ok = outcome.is_ok() && last_verdict(&console).is_ok_and(|v| v == "OK");
-    crate::logs::keep_build_console(&stem, &console, ok);
+    if let Some(kept) = crate::logs::keep_build_console(&stem, &console, ok) {
+        job.console.set(kept).ok();
+    }
     outcome?;
     if job.stop.load(Ordering::SeqCst) {
         bail!(

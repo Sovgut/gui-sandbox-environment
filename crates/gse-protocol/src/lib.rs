@@ -11,7 +11,8 @@
 //! [`Request::SetEnvironmentSettings`] changes one environment's own.
 //! [`Request::Journal`] answers what happened to an environment, which
 //! [`Event::Journal`] continues. [`Request::Presets`] lists
-//! the presets images are built from, [`Request::SavePreset`] and
+//! the presets images are built from, with the build in progress and the
+//! builds that failed; [`Request::SavePreset`] and
 //! [`Request::DeletePreset`] change them, and [`Request::BuildPreset`]
 //! builds a preset's image, sending [`Reply::BuildStep`] lines as the build
 //! goes. [`Request::BuildBase`] builds the base image those images are
@@ -32,7 +33,7 @@ pub const SOCKET: &str = "/run/gse/service.sock";
 /// The protocol's version: a client and a service speak to each other only
 /// when theirs match ([`Request::Hello`]). It changes with every change to
 /// the messages.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 /// The name a build of the base image goes by wherever a preset's name
 /// would stand: in [`Event::Build`], [`Event::BuildFinished`] and
@@ -42,6 +43,9 @@ pub const BASE_IMAGE: &str = "base";
 /// The longest line either side accepts; anything longer ends the
 /// connection.
 pub const MAX_LINE: usize = 64 * 1024;
+
+/// The longest title of a preset, in characters.
+pub const MAX_TITLE: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "kebab-case")]
@@ -171,9 +175,9 @@ pub enum Request {
     /// ends. The service fetches the Fedora Cloud image of the release its
     /// settings name (`fedora_release`, by default the one the base image's
     /// provisioning script is made for) and checks it against Fedora's
-    /// checksum, reporting `download` and then `download <percent>%` while
-    /// it downloads; a verified copy from an earlier build is used without
-    /// a download. The build goes by the name [`BASE_IMAGE`]. Images built
+    /// checksum, reporting `download` and then `download <percent>%` with
+    /// the bytes received and in all while it downloads; a verified copy
+    /// from an earlier build is used without a download. The build goes by the name [`BASE_IMAGE`]. Images built
     /// on the old base image keep working. Nothing may be running.
     BuildBase,
     /// Stop the image build in progress; the old image stays.
@@ -234,15 +238,22 @@ pub enum Reply {
         /// The presets whose images were built on an older base image.
         #[serde(default)]
         stale: Vec<String>,
+        /// The last build of each preset, and of the base image, that
+        /// failed; each stays until its image builds again.
+        #[serde(default)]
+        failed: Vec<FailedBuild>,
     },
     PresetTemplates {
         templates: Vec<Preset>,
     },
     /// The image build reached `step`: `prepare` as it begins, then the
     /// names its provisioning script reports, and `flatten` once the build
-    /// VM passed. A base image build reports its download before those.
+    /// VM passed. A base image build reports its download before those:
+    /// `download`, then `download <percent>%` with the bytes in `download`.
     BuildStep {
         step: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        download: Option<Downloaded>,
     },
     Event {
         event: Event,
@@ -333,6 +344,9 @@ pub enum Event {
     Build {
         preset: String,
         step: String,
+        /// How far the download is, while `step` is `download <percent>%`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        download: Option<Downloaded>,
     },
     /// The image build of `preset`, or of the base image when that is
     /// [`BASE_IMAGE`], ended; `error` says why when it did not produce an
@@ -366,6 +380,11 @@ pub struct GuestProcess {
 pub struct GuestApp {
     pub unit: Option<String>,
     pub title: String,
+    /// The title of the program whose process started this one, such as
+    /// the launcher of a game; none for a program started from a menu
+    /// entry, which `guest`'s systemd starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<String>,
     pub processes: Vec<GuestProcess>,
 }
 
@@ -380,6 +399,45 @@ pub struct GuestFile {
 pub struct GuestFiles {
     pub inbox: Vec<GuestFile>,
     pub outbox: Vec<GuestFile>,
+}
+
+/// File name endings an Outbox never hands out, with what such a file is:
+/// they run or start something when opened.
+const KEPT_BY_NAME: [(&str, &str); 22] = [
+    ("exe", "a program"),
+    ("dll", "a program"),
+    ("com", "a program"),
+    ("scr", "a program"),
+    ("jar", "a program"),
+    ("msi", "an installer"),
+    ("bat", "a script"),
+    ("cmd", "a script"),
+    ("ps1", "a script"),
+    ("vbs", "a script"),
+    ("vbe", "a script"),
+    ("js", "a script"),
+    ("jse", "a script"),
+    ("wsf", "a script"),
+    ("hta", "a script"),
+    ("sh", "a script"),
+    ("py", "a script"),
+    ("lnk", "a shortcut"),
+    ("desktop", "a shortcut"),
+    ("docm", "a document with macros"),
+    ("xlsm", "a document with macros"),
+    ("pptm", "a document with macros"),
+];
+
+/// What the Outbox file at `path` is when its name alone keeps it inside,
+/// such as "a program". The service also refuses files by how they start,
+/// which only a take finds out.
+#[must_use]
+pub fn kept_by_name(path: &str) -> Option<&'static str> {
+    let extension = path.rsplit_once('.')?.1.to_ascii_lowercase();
+    KEPT_BY_NAME
+        .iter()
+        .find(|(kept, _)| *kept == extension)
+        .map(|(_, what)| *what)
 }
 
 /// What the host and an environment's agent say to each other over the
@@ -473,8 +531,14 @@ pub struct JournalEntry {
 /// `gse_host::preset` for the file the service keeps it in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preset {
-    /// Also the name of the image built from it, so [`valid_name`] applies.
+    /// Also the name of its file, of the image built from it and of the
+    /// image its environments name, so [`valid_name`] applies; a new title
+    /// leaves it as it is.
     pub name: String,
+    /// What people call it, such as "Game launchers": up to
+    /// [`MAX_TITLE`] characters on one line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub apps: Vec<PresetApp>,
 }
 
@@ -527,6 +591,30 @@ pub struct Build {
     /// The steps reported so far, oldest first; how far a download has
     /// come (`download <percent>%`) is not kept.
     pub steps: Vec<String>,
+    /// When it started, in seconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<u64>,
+}
+
+/// How far a download has come, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Downloaded {
+    pub received: u64,
+    /// What it holds in all.
+    pub total: u64,
+}
+
+/// The last build of an image that failed, kept until the image builds
+/// again. A build that was stopped did not fail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedBuild {
+    /// The preset, or [`BASE_IMAGE`] for the base image.
+    pub preset: String,
+    /// The last step it reported (see [`Reply::BuildStep`]).
+    pub step: Option<String>,
+    /// The build VM's console as the service keeps it; none when the build
+    /// failed before its VM ran.
+    pub log: Option<PathBuf>,
 }
 
 /// Keyboard layouts as XKB names them, the first one active, and the XKB
@@ -825,6 +913,7 @@ mod tests {
                 current: false,
             }),
             stale: vec!["launchers".into()],
+            failed: Vec::new(),
         };
         let mut wire = Vec::new();
         send(&mut wire, &reply).unwrap();
@@ -835,6 +924,66 @@ mod tests {
             receive::<Reply>(&mut old.as_slice()).unwrap(),
             Some(Reply::Presets { base: None, .. })
         ));
+    }
+
+    #[test]
+    fn what_an_older_peer_leaves_out_reads_as_nothing() {
+        let presets = b"{\"reply\":\"presets\",\"presets\":[{\"name\":\"wow\",\"apps\":[]}],\
+                        \"build\":{\"preset\":\"wow\",\"steps\":[\"prepare\"]}}\n";
+        let Some(Reply::Presets {
+            presets,
+            build: Some(build),
+            failed,
+            ..
+        }) = receive::<Reply>(&mut presets.as_slice()).unwrap()
+        else {
+            panic!("not a presets reply");
+        };
+        assert_eq!(presets[0].title, None);
+        assert_eq!(build.started, None);
+        assert_eq!(failed, []);
+
+        let event = b"{\"reply\":\"event\",\"event\":{\"event\":\"build\",\"preset\":\"base\",\
+                      \"step\":\"download 43%\"}}\n";
+        assert!(matches!(
+            receive::<Reply>(&mut event.as_slice()).unwrap(),
+            Some(Reply::Event {
+                event: Event::Build { download: None, .. }
+            })
+        ));
+
+        let answer =
+            b"{\"id\":2,\"answer\":\"processes\",\"apps\":[{\"unit\":\"guest-app-1.service\",\
+                       \"title\":\"Steam\",\"processes\":[]}]}\n";
+        let Some(agent::Message {
+            body: agent::Answer::Processes { apps },
+            ..
+        }) = receive::<agent::Message<agent::Answer>>(&mut answer.as_slice()).unwrap()
+        else {
+            panic!("not a list of programs");
+        };
+        assert_eq!(apps[0].started_by, None);
+    }
+
+    #[test]
+    fn a_download_reports_its_bytes_beside_its_percentage() {
+        let event = Reply::Event {
+            event: Event::Build {
+                preset: BASE_IMAGE.into(),
+                step: "download 43%".into(),
+                download: Some(Downloaded {
+                    received: 1_200_000_000,
+                    total: 2_800_000_000,
+                }),
+            },
+        };
+        let mut wire = Vec::new();
+        send(&mut wire, &event).unwrap();
+        assert!(
+            String::from_utf8_lossy(&wire)
+                .contains("\"download\":{\"received\":1200000000,\"total\":2800000000}")
+        );
+        assert_eq!(receive::<Reply>(&mut wire.as_slice()).unwrap(), Some(event));
     }
 
     #[test]
@@ -888,6 +1037,7 @@ mod tests {
     fn presets_round_trip() {
         let preset = Preset {
             name: "launchers".into(),
+            title: Some("Game launchers".into()),
             apps: vec![
                 PresetApp {
                     name: "Steam".into(),
@@ -926,6 +1076,7 @@ mod tests {
         send(&mut wire, &request).unwrap();
         let text = String::from_utf8_lossy(&wire).into_owned();
         assert!(text.starts_with("{\"request\":\"save-preset\",\"preset\":{"));
+        assert!(text.contains("\"name\":\"launchers\",\"title\":\"Game launchers\","));
         assert!(
             text.contains("\"source\":{\"kind\":\"flatpak\",\"id\":\"com.discordapp.Discord\"}")
         );
@@ -941,9 +1092,15 @@ mod tests {
             build: Some(Build {
                 preset: "launchers".into(),
                 steps: vec!["packages".into()],
+                started: Some(1_793_545_989),
             }),
             base: None,
             stale: Vec::new(),
+            failed: vec![FailedBuild {
+                preset: BASE_IMAGE.into(),
+                step: Some("NVIDIA driver".into()),
+                log: Some("/var/log/gse/builds/1793545000-base-failed.log".into()),
+            }],
         };
         send(&mut wire, &reply).unwrap();
         assert!(wire.starts_with(b"{\"reply\":\"presets\","));
@@ -978,11 +1135,20 @@ mod tests {
         for reply in [
             Reply::BuildStep {
                 step: "flatpaks".into(),
+                download: None,
+            },
+            Reply::BuildStep {
+                step: "download 2%".into(),
+                download: Some(Downloaded {
+                    received: 12_000_000,
+                    total: 600_000_000,
+                }),
             },
             Reply::Event {
                 event: Event::Build {
                     preset: "launchers".into(),
                     step: "menu".into(),
+                    download: None,
                 },
             },
             Reply::Event {
@@ -1019,6 +1185,7 @@ mod tests {
             &mut wire,
             &Reply::BuildStep {
                 step: "menu".into(),
+                download: None,
             },
         )
         .unwrap();
@@ -1051,6 +1218,7 @@ mod tests {
                 apps: vec![GuestApp {
                     unit: Some("guest-app-1.service".into()),
                     title: "Steam".into(),
+                    started_by: None,
                     processes: vec![GuestProcess {
                         pid: 42,
                         name: "steam".into(),
@@ -1063,9 +1231,23 @@ mod tests {
         };
         let mut wire = Vec::new();
         send(&mut wire, &answer).unwrap();
+        assert!(!String::from_utf8_lossy(&wire).contains("started_by"));
         assert_eq!(
             receive::<Message<Answer>>(&mut wire.as_slice()).unwrap(),
             Some(answer)
+        );
+        let game = GuestApp {
+            unit: Some("app-flatpak-com.example.Game-7.scope".into()),
+            title: "com.example.Game".into(),
+            started_by: Some("Steam".into()),
+            processes: Vec::new(),
+        };
+        let mut wire = Vec::new();
+        send(&mut wire, &game).unwrap();
+        assert!(String::from_utf8_lossy(&wire).contains("\"started_by\":\"Steam\""));
+        assert_eq!(
+            receive::<GuestApp>(&mut wire.as_slice()).unwrap(),
+            Some(game)
         );
     }
 
@@ -1118,5 +1300,15 @@ mod tests {
         assert!(!valid_name("Test"));
         assert!(!valid_name("-x"));
         assert!(!valid_name(&"a".repeat(33)));
+    }
+
+    #[test]
+    fn outbox_files_that_run_stay_by_their_name() {
+        assert_eq!(kept_by_name("trainer.exe"), Some("a program"));
+        assert_eq!(kept_by_name("mods/Setup.MSI"), Some("an installer"));
+        assert_eq!(kept_by_name("run.sh"), Some("a script"));
+        assert_eq!(kept_by_name("saves/slot1.sav"), None);
+        assert_eq!(kept_by_name("README"), None);
+        assert_eq!(kept_by_name("archive.exe.png"), None);
     }
 }

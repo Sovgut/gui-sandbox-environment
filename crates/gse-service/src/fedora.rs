@@ -49,8 +49,18 @@ pub enum Download {
     /// The image is not in the cache, or no longer matches; it downloads
     /// now.
     Started,
-    /// This much of it has arrived, in percent.
-    Percent(u8),
+    /// `received` of its `total` bytes have arrived. A download whose size
+    /// is not known reports none.
+    Progress { received: u64, total: u64 },
+}
+
+impl Download {
+    /// How much has arrived, in whole percent.
+    pub fn percent(received: u64, total: u64) -> u8 {
+        u8::try_from(received.saturating_mul(100) / total.max(1))
+            .unwrap_or(100)
+            .min(100)
+    }
 }
 
 /// An image a CHECKSUM file names.
@@ -310,11 +320,9 @@ fn receive(
         file.write_all(&buffer[..read])
             .with_context(|| format!("writing {}", partial.display()))?;
         if let Some(total) = total {
-            let percent = u8::try_from(received.saturating_mul(100) / total)
-                .unwrap_or(100)
-                .min(100);
+            let percent = Download::percent(received, total);
             if percent > shown && shown_at.elapsed() >= REPORT_EVERY {
-                progress(Download::Percent(percent));
+                progress(Download::Progress { received, total });
                 (shown, shown_at) = (percent, Instant::now());
             }
         }
@@ -624,6 +632,16 @@ mod tests {
         let response = agent.head(&url).call().unwrap();
         assert_eq!(response.status(), 200);
         assert!(response.get_url().starts_with("https://"));
+    }
+
+    #[test]
+    fn a_download_counts_whole_percent() {
+        assert_eq!(Download::percent(0, 600), 0);
+        assert_eq!(Download::percent(599, 600), 99);
+        assert_eq!(Download::percent(1_200_000_000, 2_800_000_000), 42);
+        assert_eq!(Download::percent(700, 600), 100);
+        assert_eq!(Download::percent(u64::MAX, 1), 100);
+        assert_eq!(Download::percent(5, 0), 100);
     }
 
     #[test]

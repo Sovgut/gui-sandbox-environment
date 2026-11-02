@@ -1,6 +1,7 @@
 # Just the desktop, its file manager and a browser: for one program brought
 # in through the Inbox. Everything runs as `guest`.
 name = "desktop"
+title = "Empty desktop"
 
 [[app]]
 name = "Chrome"

@@ -37,18 +37,12 @@ const MAGIC: [(&[u8], &str); 12] = [
     (b"MSCF", "an archive"),
 ];
 
-/// Names of files that run or start something when opened.
-const EXTENSIONS: [&str; 22] = [
-    "exe", "dll", "com", "scr", "bat", "cmd", "ps1", "vbs", "vbe", "js", "jse", "wsf", "hta",
-    "msi", "lnk", "desktop", "sh", "jar", "py", "docm", "xlsm", "pptm",
-];
-
-/// Why a file named `name` may not leave, if its name already says so.
+/// Why a file named `name` may not leave, if its name already says so:
+/// [`gse_protocol::kept_by_name`], which the app marks its Outbox list by.
 pub fn by_name(name: &str) -> Option<String> {
+    gse_protocol::kept_by_name(name)?;
     let extension = name.rsplit_once('.')?.1.to_ascii_lowercase();
-    EXTENSIONS
-        .contains(&extension.as_str())
-        .then(|| format!("a .{extension} file can run or start a program"))
+    Some(format!("a .{extension} file can run or start a program"))
 }
 
 /// Why a file starting with `head` may not leave, if it may not.

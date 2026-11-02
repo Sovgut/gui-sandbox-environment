@@ -2,6 +2,7 @@
 # and links they open. Everything runs as `guest` except Discord, which runs
 # as `sandbox` so it stays out of reach of what the launchers start.
 name = "launchers"
+title = "Game launchers"
 
 [[app]]
 name = "Steam"

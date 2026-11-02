@@ -74,9 +74,10 @@ pub fn open_service_log() -> Result<SyncedLog> {
 }
 
 /// Keeps the guest console of a build of `image` that just ended, `ok` or
-/// not, and drops the oldest past [`KEEP_BUILDS`].
-pub fn keep_build_console(image: &str, console: &Path, ok: bool) {
-    let keep = || -> Result<()> {
+/// not, and drops the oldest past [`KEEP_BUILDS`]; returns where it is
+/// kept.
+pub fn keep_build_console(image: &str, console: &Path, ok: bool) -> Option<PathBuf> {
+    let keep = || -> Result<PathBuf> {
         fs::create_dir_all(BUILDS)?;
         fs::set_permissions(BUILDS, fs::Permissions::from_mode(0o755))?;
         let at = std::time::SystemTime::now()
@@ -91,11 +92,11 @@ pub fn keep_build_console(image: &str, console: &Path, ok: bool) {
         for old in kept.iter().rev().skip(KEEP_BUILDS) {
             fs::remove_file(old).ok();
         }
-        Ok(())
+        Ok(to)
     };
-    if let Err(e) = keep() {
-        tracing::warn!("keeping the build console of {image}: {e:#}");
-    }
+    keep()
+        .inspect_err(|e| tracing::warn!("keeping the build console of {image}: {e:#}"))
+        .ok()
 }
 
 /// Starts the logs of an environment run in `dir`: the last run's move

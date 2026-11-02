@@ -23,10 +23,11 @@ use gse_host::Root;
 use gse_host::pci::PciAddress;
 use gse_host::preset::Preset as HostPreset;
 use gse_protocol::{
-    BASE_IMAGE, BaseImage, Build, Environment, Event, JournalEntry, MAX_LINE, Reply, Request,
-    Running, SOCKET, ScreenAccess, ScreenMode, Settings, Stage, receive, send, valid_name,
+    BASE_IMAGE, BaseImage, Build, Downloaded, Environment, Event, FailedBuild, JournalEntry,
+    MAX_LINE, Reply, Request, Running, SOCKET, ScreenAccess, ScreenMode, Settings, Stage, receive,
+    send, valid_name,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::agent::Agent;
@@ -109,6 +110,13 @@ fn takes_monitor(root: &Root, gpu: PciAddress) -> bool {
 
 /// How large an environment's /home may grow.
 const HOME_SIZE: &str = "512G";
+
+/// Seconds since the Unix epoch.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 /// Runs `qemu-img` with `args`, then `path`, then `after`.
 fn qemu_img(args: &[&str], path: &Path, after: &[&str]) -> Result<()> {
@@ -246,7 +254,9 @@ fn validate(settings: &Settings, gpus: &[gse_protocol::Gpu]) -> Result<(PciAddre
 }
 
 /// Where images and environments live: `base.qcow2`, the base image presets
-/// build on; `images/<image>.qcow2`; `environments/<name>/` with the name
+/// build on; `images/<image>.qcow2`, with `<image>.base`, the base image it
+/// was built on, and `<image>.failed`, its last build when that failed
+/// (`base.failed` for the base image); `environments/<name>/` with the name
 /// of the environment's image, its `settings.toml` and `journal`, and once
 /// it has started, its disk, firmware variables and serial log;
 /// `presets/<preset>.toml`; `builds/`, where an image or the base image is
@@ -481,9 +491,7 @@ impl Store {
     /// journal grows past [`JOURNAL_MAX`] bytes.
     fn log(&self, name: &str, text: &str) -> Result<JournalEntry> {
         let entry = JournalEntry {
-            time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs()),
+            time: now(),
             text: text.to_owned(),
         };
         let path = self.dir(name).join("journal");
@@ -588,6 +596,45 @@ impl Store {
         self.images_dir().join(format!("{image}.base"))
     }
 
+    /// The record of the last build of the image `image`, or of the base
+    /// image, when it failed; it stays until the image builds again.
+    fn failure_path(&self, image: &str) -> PathBuf {
+        self.images_dir().join(format!("{image}.failed"))
+    }
+
+    /// Records that the build of `image` failed at `step`, its console kept
+    /// at `log`.
+    fn record_failure(
+        &self,
+        image: &str,
+        step: Option<String>,
+        log: Option<PathBuf>,
+    ) -> Result<()> {
+        let record = serde_json::to_string(&FailureRecord { step, log })?;
+        replace_file(&self.failure_path(image), &record)
+    }
+
+    /// Forgets the failed build of `image`, which builds again or is gone.
+    fn forget_failure(&self, image: &str) {
+        fs::remove_file(self.failure_path(image)).ok();
+    }
+
+    /// The last failed build of each of `images` that has one.
+    fn failures<'a>(&self, images: impl IntoIterator<Item = &'a str>) -> Vec<FailedBuild> {
+        images
+            .into_iter()
+            .filter_map(|image| {
+                let record = fs::read_to_string(self.failure_path(image)).ok()?;
+                let FailureRecord { step, log } = serde_json::from_str(&record).ok()?;
+                Some(FailedBuild {
+                    preset: image.to_owned(),
+                    step,
+                    log,
+                })
+            })
+            .collect()
+    }
+
     /// The images built on another base image than the one in place, by
     /// the fingerprints recorded at their builds; none while the base image
     /// has no fingerprint.
@@ -641,11 +688,24 @@ struct Building {
     preset: String,
     steps: Vec<String>,
     stop: Arc<AtomicBool>,
+    /// When it started, in seconds since the Unix epoch.
+    started: u64,
+}
+
+/// What [`Store::failure_path`] holds: the step a failed build reached and
+/// where its console is kept. The image is the file's name.
+#[derive(Serialize, Deserialize)]
+struct FailureRecord {
+    step: Option<String>,
+    log: Option<PathBuf>,
 }
 
 /// What a build tells the connection that asked for it.
 enum BuildUpdate {
-    Step(String),
+    Step {
+        step: String,
+        download: Option<Downloaded>,
+    },
     Finished(Result<(), String>),
 }
 
@@ -745,6 +805,7 @@ impl Service {
                 .with_context(|| format!("renaming the image of '{name}'"))?;
             fs::rename(store.on_base_path(name), store.on_base_path(to)).ok();
         }
+        fs::rename(store.failure_path(name), store.failure_path(to)).ok();
         let users: Vec<String> = store
             .environments()
             .into_iter()
@@ -937,22 +998,31 @@ impl Service {
         if let Some(build) = self.lock().build.as_mut() {
             build.steps.push(step.clone());
         }
-        self.build_progress(preset, step, report);
+        self.build_progress(preset, step, None, report);
     }
 
     /// Tells the watchers and `report` how far the build of `preset` is,
-    /// such as `download 40%`, without recording it as a step.
-    fn build_progress(&self, preset: &str, step: String, report: &Sender<BuildUpdate>) {
+    /// such as `download 40%` with the bytes of that `download`, without
+    /// recording it as a step.
+    fn build_progress(
+        &self,
+        preset: &str,
+        step: String,
+        download: Option<Downloaded>,
+        report: &Sender<BuildUpdate>,
+    ) {
         self.broadcast(&Event::Build {
             preset: preset.to_owned(),
             step: step.clone(),
+            download,
         });
-        report.send(BuildUpdate::Step(step)).ok();
+        report.send(BuildUpdate::Step { step, download }).ok();
     }
 
     /// Makes `name` the image build in progress and returns the flag that
     /// stops it. Images build only while no environment runs, one at a
-    /// time.
+    /// time. The image's last failed build is forgotten: this one replaces
+    /// it.
     fn claim_build(&self, name: &str) -> Result<Arc<AtomicBool>> {
         let stop = Arc::new(AtomicBool::new(false));
         let mut shared = self.lock();
@@ -962,10 +1032,12 @@ impl Service {
         if let Some(build) = &shared.build {
             bail!("the image '{}' is building", build.preset);
         }
+        shared.store.forget_failure(name);
         shared.build = Some(Building {
             preset: name.to_owned(),
             steps: Vec::new(),
             stop: Arc::clone(&stop),
+            started: now(),
         });
         Ok(stop)
     }
@@ -989,15 +1061,35 @@ impl Service {
     }
 
     /// Ends the build of `name` with `outcome`, which the watchers and
-    /// `report` learn; another build may start then.
-    fn finish_build(&self, name: &str, outcome: Result<()>, report: &Sender<BuildUpdate>) {
+    /// `report` learn; another build may start then. A build that failed,
+    /// rather than being stopped, is recorded with the step it reached and
+    /// its `console`, until the image builds again.
+    fn finish_build(
+        &self,
+        name: &str,
+        outcome: Result<()>,
+        console: Option<PathBuf>,
+        report: &Sender<BuildUpdate>,
+    ) {
         let error = outcome.err().map(|e| format!("{e:#}"));
         if let Some(e) = &error {
             error!("building the image '{name}': {e}");
         } else {
             info!("the image '{name}' is ready");
         }
-        self.lock().build = None;
+        {
+            let mut shared = self.lock();
+            let build = shared.build.take();
+            let stopped = build
+                .as_ref()
+                .is_some_and(|b| b.stop.load(Ordering::SeqCst));
+            if error.is_some() && !stopped {
+                let step = build.and_then(|b| b.steps.last().cloned());
+                if let Err(e) = shared.store.record_failure(name, step, console) {
+                    warn!("recording the failed build of '{name}': {e:#}");
+                }
+            }
+        }
         self.broadcast(&Event::Changed);
         self.broadcast(&Event::BuildFinished {
             preset: name.to_owned(),
@@ -1027,15 +1119,12 @@ impl Service {
         thread::spawn(move || {
             service.build_step(&name, "prepare".into(), &report);
             let (steps, forwarder) = service.forward_steps(&name, &report);
-            let job = image::Job {
-                stop: &stop,
-                run_as: Some(owner.name),
-                steps: Some(steps),
-            };
+            let job = image::Job::new(&stop, Some(owner.name), Some(steps));
             let out = store.builds_dir().join(format!("{name}.qcow2"));
             fs::remove_file(&out).ok();
             let outcome = image::build_preset_image(&preset, appimages, &base, &out, &job, false)
                 .and_then(|()| store.replace_image(&name, &out));
+            let console = job.console.get().cloned();
             drop(job);
             forwarder.join().ok();
             for reset in outcome.as_deref().unwrap_or_default() {
@@ -1044,7 +1133,7 @@ impl Service {
                     format!("The image {name} is new; the next start begins from it"),
                 );
             }
-            service.finish_build(&name, outcome.map(drop), &report);
+            service.finish_build(&name, outcome.map(drop), console, &report);
         });
         Ok(())
     }
@@ -1076,29 +1165,32 @@ impl Service {
                 fedora::Download::Started => {
                     service.build_step(BASE_IMAGE, "download".into(), &report);
                 }
-                fedora::Download::Percent(percent) => {
-                    let progress = format!("download {percent}%");
-                    service.build_progress(BASE_IMAGE, progress, &report);
+                fedora::Download::Progress { received, total } => {
+                    let percent = fedora::Download::percent(received, total);
+                    service.build_progress(
+                        BASE_IMAGE,
+                        format!("download {percent}%"),
+                        Some(Downloaded { received, total }),
+                        &report,
+                    );
                 }
             };
             let fetched = fedora::fetch(&store.cache_dir(), release, &stop, &mut on_download);
+            let mut console = None;
             let outcome = fetched.and_then(|from| {
                 let (steps, forwarder) = service.forward_steps(BASE_IMAGE, &report);
-                let job = image::Job {
-                    stop: &stop,
-                    run_as: Some(owner.name),
-                    steps: Some(steps),
-                };
+                let job = image::Job::new(&stop, Some(owner.name), Some(steps));
                 let out = store.builds_dir().join(format!("{BASE_IMAGE}.qcow2"));
                 fs::remove_file(&out).ok();
                 let fingerprint = image::base_fingerprint(&guest);
                 let built =
                     image::build_base_image(&from, &out, guest, dev_key.as_deref(), &job, false);
+                console = job.console.get().cloned();
                 drop(job);
                 forwarder.join().ok();
                 built.and_then(|()| store.replace_base(&out, &fingerprint))
             });
-            service.finish_build(BASE_IMAGE, outcome, &report);
+            service.finish_build(BASE_IMAGE, outcome, console, &report);
         });
         Ok(())
     }
@@ -1362,9 +1454,13 @@ impl Service {
                 let build = shared.build.as_ref().map(|b| Build {
                     preset: b.preset.clone(),
                     steps: b.steps.clone(),
+                    started: Some(b.started),
                 });
                 let base = shared.store.base_image(guest_fingerprint());
                 let stale = shared.store.stale_images();
+                let failed = shared
+                    .store
+                    .failures(presets.iter().map(|p| p.name.as_str()).chain([BASE_IMAGE]));
                 drop(shared);
                 send(
                     out,
@@ -1373,6 +1469,7 @@ impl Service {
                         build,
                         base,
                         stale,
+                        failed,
                     },
                 )?;
             }
@@ -1387,6 +1484,7 @@ impl Service {
                     bail!("'{name}' is building; stop the build first");
                 }
                 presets::delete(&shared.store.presets_dir(), &name)?;
+                shared.store.forget_failure(&name);
                 drop(shared);
                 self.broadcast(&Event::PresetsChanged);
             }
@@ -1737,7 +1835,9 @@ fn watch(events: &Receiver<Event>, out: &mut UnixStream) -> Result<()> {
 fn report_build(name: &str, updates: &Receiver<BuildUpdate>, out: &mut UnixStream) -> Result<()> {
     for update in updates {
         match update {
-            BuildUpdate::Step(step) => send(out, &Reply::BuildStep { step })?,
+            BuildUpdate::Step { step, download } => {
+                send(out, &Reply::BuildStep { step, download })?;
+            }
             BuildUpdate::Finished(Ok(())) => return Ok(()),
             BuildUpdate::Finished(Err(reason)) => bail!(reason),
         }
@@ -2123,6 +2223,69 @@ mod tests {
         assert_eq!(fs::read_to_string(store.base()).unwrap(), "new");
         assert!(store.base_image(Some("abc")).unwrap().current);
         assert!(!store.base_image(Some("other")).unwrap().current);
+    }
+
+    /// A service over a store in `dir` that runs nothing.
+    fn idle_service(dir: &Path) -> Service {
+        let store = Store::new(dir);
+        fs::create_dir_all(store.images_dir()).unwrap();
+        Service(Arc::new(Mutex::new(Shared {
+            root: Root::at(dir),
+            config: toml::from_str("gpu = \"0000:0e:00.0\"\n").unwrap(),
+            store,
+            current: None,
+            build: None,
+            watchers: Vec::new(),
+            agent: Arc::default(),
+        })))
+    }
+
+    #[test]
+    fn a_failed_build_is_kept_until_its_image_builds_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = idle_service(dir.path());
+        let store = service.lock().store.clone();
+        let (report, _updates) = mpsc::channel();
+
+        service.claim_build("wow").unwrap();
+        let started = service.lock().build.as_ref().map(|b| b.started).unwrap();
+        assert!(now().abs_diff(started) < 60);
+        service.build_step("wow", "prepare".into(), &report);
+        service.build_step("wow", "packages".into(), &report);
+        let log = PathBuf::from("/var/log/gse/builds/1793545000-wow-failed.log");
+        let failed = || Err(anyhow::anyhow!("the build failed (FAILED 12)"));
+        service.finish_build("wow", failed(), Some(log.clone()), &report);
+        service.claim_build(BASE_IMAGE).unwrap();
+        service.build_step(BASE_IMAGE, "download".into(), &report);
+        service.finish_build(BASE_IMAGE, failed(), None, &report);
+        assert_eq!(
+            store.failures(["launchers", "wow", BASE_IMAGE]),
+            [
+                FailedBuild {
+                    preset: "wow".into(),
+                    step: Some("packages".into()),
+                    log: Some(log),
+                },
+                FailedBuild {
+                    preset: BASE_IMAGE.into(),
+                    step: Some("download".into()),
+                    log: None,
+                },
+            ]
+        );
+        // The records are no images.
+        assert_eq!(store.images(), Vec::<String>::new());
+
+        // The next build clears it, and a stopped build is no failure.
+        let stop = service.claim_build("wow").unwrap();
+        assert_eq!(store.failures(["wow"]), []);
+        stop.store(true, Ordering::SeqCst);
+        service.finish_build("wow", failed(), None, &report);
+        assert_eq!(store.failures(["wow"]), []);
+        service.claim_build(BASE_IMAGE).unwrap();
+        service.finish_build(BASE_IMAGE, Ok(()), None, &report);
+        assert_eq!(store.failures([BASE_IMAGE]), []);
+        assert!(service.lock().build.is_none());
     }
 
     #[test]

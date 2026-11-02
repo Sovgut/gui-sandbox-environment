@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use gse_host::preset::{App, Preset as HostPreset, Source};
-use gse_protocol::{AppSource, BASE_IMAGE, Preset, PresetApp, valid_name};
+use gse_protocol::{AppSource, BASE_IMAGE, MAX_TITLE, Preset, PresetApp, valid_name};
 use tracing::warn;
 
 /// The presets a fresh service starts with.
@@ -98,18 +98,31 @@ pub fn load(dir: &Path, name: &str) -> Result<HostPreset> {
     Ok(preset)
 }
 
-/// Every preset that reads back; a broken file is logged and left out.
+/// Every preset that reads back; a broken file is logged and left out. A
+/// file of a built-in preset's name without a title goes by the built-in
+/// preset's title, since the files an older service seeded carry none.
 pub fn list(dir: &Path) -> Vec<Preset> {
     names(dir)
         .into_iter()
         .filter_map(|name| match load(dir, &name) {
-            Ok(preset) => Some(to_protocol(&preset)),
+            Ok(preset) => {
+                let mut preset = to_protocol(&preset);
+                if preset.title.is_none() {
+                    preset.title = built_in_title(&preset.name);
+                }
+                Some(preset)
+            }
             Err(e) => {
                 warn!("{e:#}");
                 None
             }
         })
         .collect()
+}
+
+/// The title of the built-in preset `name`, if there is one.
+fn built_in_title(name: &str) -> Option<String> {
+    templates().into_iter().find(|t| t.name == name)?.title
 }
 
 /// Checks `preset` and writes it, replacing any preset of the same name.
@@ -182,6 +195,7 @@ fn write_atomically(path: &Path, data: &[u8]) -> Result<()> {
 fn to_protocol(preset: &HostPreset) -> Preset {
     Preset {
         name: preset.name.clone(),
+        title: preset.title.clone(),
         apps: preset
             .apps
             .iter()
@@ -209,6 +223,7 @@ fn to_protocol(preset: &HostPreset) -> Preset {
 fn from_protocol(preset: &Preset) -> HostPreset {
     HostPreset {
         name: preset.name.clone(),
+        title: preset.title.clone(),
         apps: preset
             .apps
             .iter()
@@ -261,6 +276,11 @@ fn validate(preset: &Preset) -> Result<()> {
     }
     if preset.name == BASE_IMAGE {
         bail!("'{BASE_IMAGE}' is the base image's name; give the preset another");
+    }
+    if let Some(title) = &preset.title
+        && (title.trim().is_empty() || title.chars().count() > MAX_TITLE || !one_line(title))
+    {
+        bail!("preset titles are 1-{MAX_TITLE} characters on one line");
     }
     if preset.apps.len() > MAX_APPS {
         bail!("a preset holds at most {MAX_APPS} apps");
@@ -342,12 +362,15 @@ mod tests {
         let presets = list(dir.path());
         let names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["desktop", "launchers"]);
+        let titles: Vec<Option<&str>> = presets.iter().map(|p| p.title.as_deref()).collect();
+        assert_eq!(titles, [Some("Empty desktop"), Some("Game launchers")]);
         assert!(presets[1].apps.iter().any(|a| a.trusted));
 
         delete(dir.path(), "launchers").unwrap();
         delete(dir.path(), "desktop").unwrap();
         let mine = Preset {
             name: "mine".into(),
+            title: None,
             apps: vec![flatpak("Heroic", "com.heroicgameslauncher.hgl")],
         };
         save(dir.path(), &mine).unwrap();
@@ -370,10 +393,29 @@ mod tests {
     }
 
     #[test]
+    fn untitled_files_of_built_in_presets_go_by_their_titles() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(path(dir.path(), "launchers"), "name = \"launchers\"\n").unwrap();
+        fs::write(path(dir.path(), "wow"), "name = \"wow\"\n").unwrap();
+        let titles: Vec<(String, Option<String>)> = list(dir.path())
+            .into_iter()
+            .map(|p| (p.name, p.title))
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                ("launchers".to_owned(), Some("Game launchers".to_owned())),
+                ("wow".to_owned(), None),
+            ]
+        );
+    }
+
+    #[test]
     fn a_renamed_preset_keeps_its_apps_under_the_new_name() {
         let dir = tempfile::tempdir().unwrap();
         let mine = Preset {
             name: "mine".into(),
+            title: Some("Mine".into()),
             apps: vec![flatpak("Heroic", "com.heroicgameslauncher.hgl")],
         };
         save(dir.path(), &mine).unwrap();
@@ -406,6 +448,7 @@ mod tests {
         discord.trusted = true;
         let preset = Preset {
             name: "games".into(),
+            title: Some("Games \"for now\"".into()),
             apps: vec![
                 steam,
                 discord,
@@ -434,6 +477,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = Preset {
             name: BASE_IMAGE.into(),
+            title: None,
             apps: vec![flatpak("Heroic", "com.heroicgameslauncher.hgl")],
         };
         assert!(save(dir.path(), &base).is_err());
@@ -455,6 +499,7 @@ mod tests {
                 dir.path(),
                 &Preset {
                     name: "x".into(),
+                    title: None,
                     apps,
                 },
             )
@@ -465,11 +510,27 @@ mod tests {
                 dir.path(),
                 &Preset {
                     name: "../x".into(),
+                    title: None,
                     apps: Vec::new()
                 }
             )
             .is_err()
         );
+        let titled = |title: &str| {
+            save(
+                dir.path(),
+                &Preset {
+                    name: "x".into(),
+                    title: Some(title.into()),
+                    apps: vec![flatpak("A", "com.example.App")],
+                },
+            )
+            .is_err()
+        };
+        assert!(titled("   "));
+        assert!(titled("Line\nbreak"));
+        assert!(titled(&"x".repeat(MAX_TITLE + 1)));
+        assert!(!titled(&"\u{e9}".repeat(MAX_TITLE)));
         let dnf = |packages: &[&str], command: &[&str]| {
             let mut a = app(
                 "A",

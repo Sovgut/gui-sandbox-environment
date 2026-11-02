@@ -128,6 +128,10 @@ pub enum Step {
     /// the session gone already, once the display manager stopped; the
     /// executor only warns then, and [`Step::ReleaseGpu`] decides.
     TerminateSession(String),
+    /// Stops the user's whole systemd instance (`user@<uid>.service`), and
+    /// with it every unit that would start KWin again: ending the session
+    /// alone leaves it running, and it restarts a killed KWin at once.
+    StopUserManager(String),
     /// Detaches the text consoles from the framebuffer of the host driver,
     /// which otherwise keeps `nvidia_drm` (with `fbdev`) in use.
     UnbindConsoles,
@@ -175,6 +179,7 @@ impl fmt::Display for Step {
             Self::StartUnit(u) => write!(f, "start {u}"),
             Self::StopUserUnit { user, unit } => write!(f, "stop {unit} of {user}"),
             Self::TerminateSession(s) => write!(f, "terminate session {s}"),
+            Self::StopUserManager(user) => write!(f, "stop the systemd instance of {user}"),
             Self::UnbindConsoles => f.write_str("unbind the framebuffer consoles"),
             Self::BindConsoles => f.write_str("bind the framebuffer consoles"),
             Self::AwaitSessionsEnd(wait) => write!(
@@ -272,6 +277,13 @@ pub fn attach(snapshot: &Snapshot) -> (Plan, Handoff) {
                 });
                 steps.push(Step::TerminateSession(session.id.clone()));
             }
+            let mut users: Vec<&str> = snapshot
+                .graphical_sessions
+                .iter()
+                .map(|s| s.user.as_str())
+                .collect();
+            users.dedup();
+            steps.extend(users.into_iter().map(|u| Step::StopUserManager(u.to_owned())));
             steps.extend(snapshot.gpu_services.iter().cloned().map(Step::StopUnit));
             steps.push(Step::ReleaseGpu {
                 wait: Duration::from_secs(10),
@@ -498,7 +510,12 @@ mod tests {
         assert!(
             position("stop graphical-session.target of dreamer") < position("terminate session 2")
         );
-        assert!(position("terminate session 2") < position("stop nvidia-powerd.service"));
+        assert!(
+            position("terminate session 2") < position("stop the systemd instance of dreamer")
+        );
+        assert!(
+            position("stop the systemd instance of dreamer") < position("stop nvidia-powerd.service")
+        );
         assert!(
             position("unbind the framebuffer consoles")
                 < position("unload nvidia_drm nvidia_modeset nvidia_uvm nvidia")

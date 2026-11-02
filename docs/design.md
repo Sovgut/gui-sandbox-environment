@@ -35,7 +35,10 @@ The service therefore has two GPU switch modes, chosen from the hardware:
   then ends the session with `loginctl terminate-session`; nothing has to be
   signalled after that. Both may find the session already ending once the
   display manager stopped, and refuse: the switch goes on, and whether the
-  GPU is free decides. The text consoles are unbound from the framebuffer
+  GPU is free decides. On Bazzite the user's systemd refused to stop the
+  target and outlived the ended session, starting every killed KWin again,
+  so the switch then stops the user's whole instance (`user@<uid>.service`)
+  as well. The text consoles are unbound from the framebuffer
   first, since with `nvidia-drm.fbdev` they keep `nvidia_drm` in use, and
   bound again on the way back. Returning the GPU waits for the old sessions
   to end before the display manager starts, so a new login does not meet a
@@ -684,7 +687,7 @@ the service or the app, so a failure of either still leaves a record:
 | :--- | :--- |
 | The app: start, requests and their outcomes, events, first-start steps, updates, the screen, and a crash with its backtrace | `~/.cache/gse/app.log`, the previous start's in `app.previous.log` |
 | The service install: what it ran and what dnf or rpm-ostree printed | `~/.cache/gse/install.log` |
-| The service | `/var/log/gse/service.log` and `service.previous.log`, besides the systemd journal |
+| The service, each line synced to disk so a switch that freezes the machine still leaves its last steps | `/var/log/gse/service.log` and `service.previous.log`, besides the systemd journal |
 | Each image build: the guest's console, ok or failed | `/var/log/gse/builds/<time>-<image>-<ok or failed>.log`, the last 12 |
 | Each sandbox: its activity, its guest console, and the guest's journal streamed out as it is written (`gse-journal.service` on the `io.github.sovgut.gse.journal` port) | `/var/lib/gse/environments/<name>/`: `journal`, `console.log`, `guest.log`, and the previous run's `*.previous.log`; the guest logs belong to the sandbox's owner alone |
 

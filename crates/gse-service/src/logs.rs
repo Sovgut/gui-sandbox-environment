@@ -40,9 +40,26 @@ pub fn rotate(path: &Path, limit: u64) {
     }
 }
 
+/// A log file that reaches the disk with every line: a GPU switch that goes
+/// wrong can freeze the machine, and what it wrote last must survive the
+/// power button.
+pub struct SyncedLog(pub fs::File);
+
+impl std::io::Write for SyncedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.0.write(buf)?;
+        self.0.sync_data()?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.sync_data()
+    }
+}
+
 /// Opens the service's log for appending, readable by everyone, after
 /// moving a large one aside.
-pub fn open_service_log() -> Result<fs::File> {
+pub fn open_service_log() -> Result<SyncedLog> {
     fs::create_dir_all(DIR)?;
     fs::set_permissions(DIR, fs::Permissions::from_mode(0o755))?;
     rotate(Path::new(SERVICE), ROTATE_AT);
@@ -51,7 +68,7 @@ pub fn open_service_log() -> Result<fs::File> {
         .append(true)
         .mode(0o644)
         .open(SERVICE)?;
-    Ok(file)
+    Ok(SyncedLog(file))
 }
 
 /// Keeps the guest console of a build of `image` that just ended, `ok` or

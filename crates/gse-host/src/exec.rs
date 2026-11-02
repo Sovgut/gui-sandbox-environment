@@ -111,6 +111,19 @@ impl Executor<'_> {
                 }
                 Ok(())
             }
+            Step::StopUserManager(user) => {
+                let stopped = self
+                    .system
+                    .run("id", &["-u", user])
+                    .and_then(|uid| {
+                        let unit = format!("user@{}.service", uid.trim());
+                        self.system.run("systemctl", &["stop", &unit])
+                    });
+                if let Err(e) = stopped {
+                    warn!("{e}");
+                }
+                Ok(())
+            }
             Step::UnbindConsoles => {
                 self.bind_consoles(false);
                 Ok(())
@@ -121,8 +134,17 @@ impl Executor<'_> {
             }
             Step::AwaitSessionsEnd(wait) => {
                 let left = wait_until_empty(*wait, || self.graphical_sessions());
+                for id in &left {
+                    warn!("graphical session {id} is still open: terminating it");
+                    if let Err(e) = self.system.run("loginctl", &["terminate-session", id]) {
+                        warn!("{e}");
+                    }
+                }
                 if !left.is_empty() {
-                    warn!("graphical sessions still open: {}", left.join(" "));
+                    let left = wait_until_empty(Duration::from_secs(5), || self.graphical_sessions());
+                    if !left.is_empty() {
+                        warn!("graphical sessions still open: {}", left.join(" "));
+                    }
                 }
                 Ok(())
             }

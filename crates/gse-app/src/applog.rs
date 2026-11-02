@@ -33,7 +33,11 @@ pub fn init() {
         if fs::metadata(&path).is_ok_and(|m| m.len() > ROTATE_AT) {
             fs::rename(&path, path.with_file_name("app.previous.log")).ok();
         }
-        fs::OpenOptions::new().create(true).append(true).open(&path).ok()
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()
     })();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,naga=warn,wgpu=warn"));

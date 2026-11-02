@@ -20,6 +20,7 @@ fn base(name: &str) -> VmSpec {
     VmSpec {
         name: name.into(),
         disk: "@DIR@/disk.qcow2".into(),
+        home_disk: Some("@DIR@/home.qcow2".into()),
         read_only_disks: Vec::new(),
         firmware_vars: "@DIR@/OVMF_VARS.qcow2".into(),
         memory_mib: 2048,
@@ -47,6 +48,7 @@ fn main() {
     let mut build = base("build-base");
     build.read_only_disks = vec!["@DIR@/seed.img".into()];
     build.image_build = true;
+    build.home_disk = None;
 
     let mut window = base("window");
     window.screen = Some(Screen {
@@ -87,6 +89,8 @@ fn main() {
     }
     println!(
         "nft {}",
-        ruleset(NET_UID, true).replace('\\', "\\\\").replace('\n', "\\n")
+        ruleset(NET_UID, true)
+            .replace('\\', "\\\\")
+            .replace('\n', "\\n")
     );
 }

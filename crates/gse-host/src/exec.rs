@@ -114,13 +114,10 @@ impl Executor<'_> {
                 Ok(())
             }
             Step::StopUserManager(user) => {
-                let stopped = self
-                    .system
-                    .run("id", &["-u", user])
-                    .and_then(|uid| {
-                        let unit = format!("user@{}.service", uid.trim());
-                        self.system.run("systemctl", &["stop", &unit])
-                    });
+                let stopped = self.system.run("id", &["-u", user]).and_then(|uid| {
+                    let unit = format!("user@{}.service", uid.trim());
+                    self.system.run("systemctl", &["stop", &unit])
+                });
                 if let Err(e) = stopped {
                     warn!("{e}");
                 }
@@ -143,7 +140,8 @@ impl Executor<'_> {
                     }
                 }
                 if !left.is_empty() {
-                    let left = wait_until_empty(Duration::from_secs(5), || self.graphical_sessions());
+                    let left =
+                        wait_until_empty(Duration::from_secs(5), || self.graphical_sessions());
                     if !left.is_empty() {
                         warn!("graphical sessions still open: {}", left.join(" "));
                     }
@@ -287,7 +285,9 @@ impl Executor<'_> {
                 .read_opt(dir.join("name"))
                 .is_some_and(|name| name.contains("frame buffer"));
             if on_framebuffer
-                && let Err(e) = self.root.write(dir.join("bind"), if bind { "1" } else { "0" })
+                && let Err(e) = self
+                    .root
+                    .write(dir.join("bind"), if bind { "1" } else { "0" })
             {
                 warn!("{console}: {e}");
             }
@@ -296,14 +296,20 @@ impl Executor<'_> {
 
     /// The ids of the graphical sessions open now.
     fn graphical_sessions(&self) -> Vec<String> {
-        let Ok(list) = self.system.run("loginctl", &["list-sessions", "--no-legend"]) else {
+        let Ok(list) = self
+            .system
+            .run("loginctl", &["list-sessions", "--no-legend"])
+        else {
             return Vec::new();
         };
         session::parse_session_ids(&list)
             .into_iter()
             .filter(|id| {
                 self.system
-                    .run("loginctl", &["show-session", id, "-p", "Type", "-p", "Name"])
+                    .run(
+                        "loginctl",
+                        &["show-session", id, "-p", "Type", "-p", "Name"],
+                    )
                     .ok()
                     .and_then(|properties| session::parse_graphical_session(id, &properties))
                     .is_some()

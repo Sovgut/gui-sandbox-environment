@@ -330,6 +330,8 @@ restorecon -R /var/lib/flatpak
 "#;
 
 const EPILOGUE: &str = r#"step "cleanup"
+# What the system now puts in /home, for environments that keep their own.
+/usr/libexec/gse/home snapshot
 dnf clean all
 truncate -s 0 /etc/machine-id
 trap - ERR

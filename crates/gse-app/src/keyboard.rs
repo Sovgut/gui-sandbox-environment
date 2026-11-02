@@ -62,10 +62,12 @@ fn from_kde(kxkbrc: &str, shortcuts: Option<&str>) -> Option<Keyboard> {
         .split(',')
         .filter(|l| !l.is_empty())
         .enumerate()
-        .map(|(i, layout)| match variants.get(i).filter(|v| !v.is_empty()) {
-            Some(variant) => format!("{layout}({variant})"),
-            None => layout.to_owned(),
-        })
+        .map(
+            |(i, layout)| match variants.get(i).filter(|v| !v.is_empty()) {
+                Some(variant) => format!("{layout}({variant})"),
+                None => layout.to_owned(),
+            },
+        )
         .collect();
     if layouts.is_empty() {
         return None;
@@ -81,7 +83,13 @@ fn from_kde(kxkbrc: &str, shortcuts: Option<&str>) -> Option<Keyboard> {
         // KDE switches with a shortcut of its own, which XKB knows as an
         // option; one it has no option for falls back to Alt+Shift.
         let shortcut = shortcuts
-            .and_then(|s| value(s, "KDE Keyboard Layout Switcher", "Switch to Next Keyboard Layout"))
+            .and_then(|s| {
+                value(
+                    s,
+                    "KDE Keyboard Layout Switcher",
+                    "Switch to Next Keyboard Layout",
+                )
+            })
             .and_then(|v| v.split(',').next())
             .unwrap_or("");
         options.push(grp_option(shortcut).to_owned());

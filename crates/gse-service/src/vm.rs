@@ -210,20 +210,10 @@ pub fn launch_environment(
     // gone until the environment stops.
     let single = gse_host::plan::Mode::for_gpu(&attached) == gse_host::plan::Mode::Single;
     let host_input = if single {
-        crate::hostinput::discover()
+        single_gpu_input()
     } else {
         Vec::new()
     };
-    if single {
-        info!(
-            "single GPU: the environment drives the monitor and takes {}",
-            host_input
-                .iter()
-                .map(|i| i.device.display().to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-    }
     // The guest reads the layouts from fw_cfg; a file keeps QEMU's option
     // parser away from their commas.
     let keyboard = launch.keyboard.as_ref().map(|keyboard| {
@@ -236,6 +226,7 @@ pub fn launch_environment(
     let spec_for = |socket: PathBuf| VmSpec {
         name: launch.name.clone(),
         disk: launch.disk.clone(),
+        home_disk: Some(dir.join("home.qcow2")).filter(|home| home.exists()),
         read_only_disks: launch.read_only_disks.clone(),
         firmware_vars: dir.join("OVMF_VARS.qcow2"),
         memory_mib: launch.memory_mib,
@@ -290,6 +281,20 @@ pub fn launch_environment(
     }
     fs::remove_file(&screen).ok();
     outcome.and(returned)
+}
+
+/// The host's keyboards and mice, which a single-GPU environment takes.
+fn single_gpu_input() -> Vec<gse_host::vm::HostInput> {
+    let found = crate::hostinput::discover();
+    info!(
+        "single GPU: the environment drives the monitor and takes {}",
+        found
+            .iter()
+            .map(|i| i.device.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    found
 }
 
 /// Whether the installed QEMU has the `monitor-qmp` object, by its own

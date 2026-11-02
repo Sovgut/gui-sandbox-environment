@@ -100,6 +100,23 @@ fn screen_words(root: &Root, gpu: &str, mode: &str) -> String {
     }
 }
 
+/// How large an environment's /home may grow.
+const HOME_SIZE: &str = "512G";
+
+/// Runs `qemu-img` with `args`, then `path`, then `after`.
+fn qemu_img(args: &[&str], path: &Path, after: &[&str]) -> Result<()> {
+    let status = Command::new("qemu-img")
+        .args(args)
+        .arg(path)
+        .args(after)
+        .status()
+        .context("starting qemu-img")?;
+    if !status.success() {
+        bail!("qemu-img failed ({status})");
+    }
+    Ok(())
+}
+
 fn pci_address<'de, D: serde::Deserializer<'de>>(from: D) -> Result<PciAddress, D::Error> {
     let text = String::deserialize(from)?;
     text.parse().map_err(serde::de::Error::custom)
@@ -276,6 +293,12 @@ impl Store {
         self.dir(name).join("disk.qcow2")
     }
 
+    /// The environment's own /home, apart from its system so that a new
+    /// image of its set leaves it alone: only a reset empties it.
+    pub fn home_disk(&self, name: &str) -> PathBuf {
+        self.dir(name).join("home.qcow2")
+    }
+
     fn sorted_names(dir: &Path, keep: impl Fn(&Path) -> Option<String>) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
             .into_iter()
@@ -389,6 +412,11 @@ impl Store {
     /// Makes the disk of `name` once its image exists: a fresh overlay on
     /// the image, so every start after a reset begins from the image.
     fn ensure_disk(&self, name: &str) -> Result<()> {
+        let home = self.home_disk(name);
+        if !home.exists() {
+            // Sparse: it takes on the host what the guest writes into it.
+            qemu_img(&["create", "-q", "-f", "qcow2"], &home, &[HOME_SIZE])?;
+        }
         let disk = self.disk(name);
         if disk.exists() {
             return Ok(());
@@ -410,9 +438,17 @@ impl Store {
         Ok(())
     }
 
-    /// Throws away everything written into `name`; its next start begins
-    /// from its image again.
+    /// Throws away everything written into `name`, its /home included; its
+    /// next start begins from its image again.
     pub fn reset(&self, name: &str) -> Result<()> {
+        self.renew_system(name)?;
+        fs::remove_file(self.home_disk(name)).ok();
+        Ok(())
+    }
+
+    /// Throws away the system of `name`, which a new image of its set
+    /// replaces; its /home stays.
+    fn renew_system(&self, name: &str) -> Result<()> {
         self.image_of(name)?;
         let dir = self.dir(name);
         fs::remove_file(self.disk(name)).ok();
@@ -504,8 +540,8 @@ impl Store {
 
     /// Puts the freshly built `built` in place of the image `image`. An
     /// overlay cannot outlive a change of the image under it, so every
-    /// environment created from `image` is reset onto the new one; their
-    /// names come back.
+    /// environment created from `image` gets its system anew on the new one,
+    /// its /home kept; their names come back.
     fn replace_image(&self, image: &str, built: &Path) -> Result<Vec<String>> {
         fs::rename(built, self.image(image))
             .with_context(|| format!("putting the image '{image}' in place"))?;
@@ -519,7 +555,7 @@ impl Store {
             .into_iter()
             .filter(|(_, from)| from == image)
         {
-            match self.reset(&name) {
+            match self.renew_system(&name) {
                 Ok(()) => reset.push(name),
                 Err(e) => error!("resetting '{name}' onto the new image '{image}': {e:#}"),
             }

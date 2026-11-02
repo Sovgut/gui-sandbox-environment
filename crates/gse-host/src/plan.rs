@@ -286,7 +286,11 @@ pub fn attach(snapshot: &Snapshot) -> (Plan, Handoff) {
                 .map(|s| s.user.as_str())
                 .collect();
             users.dedup();
-            steps.extend(users.into_iter().map(|u| Step::StopUserManager(u.to_owned())));
+            steps.extend(
+                users
+                    .into_iter()
+                    .map(|u| Step::StopUserManager(u.to_owned())),
+            );
             steps.extend(snapshot.gpu_services.iter().cloned().map(Step::StopUnit));
             steps.push(Step::ReleaseGpu {
                 wait: Duration::from_secs(10),
@@ -347,7 +351,10 @@ pub fn attach(snapshot: &Snapshot) -> (Plan, Handoff) {
         } else {
             Vec::new()
         },
-        drivers: moved.iter().map(|f| (f.address, f.driver.clone())).collect(),
+        drivers: moved
+            .iter()
+            .map(|f| (f.address, f.driver.clone()))
+            .collect(),
     };
     (
         Plan {
@@ -522,11 +529,10 @@ mod tests {
         assert!(
             position("stop graphical-session.target of dreamer") < position("terminate session 2")
         );
+        assert!(position("terminate session 2") < position("stop the systemd instance of dreamer"));
         assert!(
-            position("terminate session 2") < position("stop the systemd instance of dreamer")
-        );
-        assert!(
-            position("stop the systemd instance of dreamer") < position("stop nvidia-powerd.service")
+            position("stop the systemd instance of dreamer")
+                < position("stop nvidia-powerd.service")
         );
         assert!(
             position("unbind the framebuffer consoles")
@@ -582,7 +588,10 @@ mod tests {
                 },
             );
         }
-        assert_eq!(crate::pci::movable_sound_cards(&root, &snapshot.gpu), Vec::new());
+        assert_eq!(
+            crate::pci::movable_sound_cards(&root, &snapshot.gpu),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -594,7 +603,10 @@ mod tests {
         assert!(steps.contains(&"load nvidia nvidia_modeset nvidia_drm nvidia_uvm".to_owned()));
         assert!(steps.contains(&"0000:09:00.0: expect nvidia".to_owned()));
         assert!(steps.contains(&"0000:09:00.1: expect snd_hda_intel".to_owned()));
-        let tail: Vec<&str> = steps[steps.len() - 4..].iter().map(String::as_str).collect();
+        let tail: Vec<&str> = steps[steps.len() - 4..]
+            .iter()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             tail,
             [

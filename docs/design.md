@@ -360,7 +360,16 @@ voice activation does.
   build passes; it reports each provisioning step to the app as it reaches
   the console, can stop a build, and builds only while no environment runs.
   An overlay cannot outlive a change of the image under it, so a rebuilt
-  image resets the environments created from it; the app asks first. The
+  image gives the environments created from it a new system; the app asks
+  first. Their /home stays: each environment has its own `home.qcow2`
+  (sparse, up to 512 GiB) beside its system overlay, which the guest finds
+  by its serial `gse-home` and mounts over /home at boot
+  (`gse-home.service`). A new one starts with the /home the system had.
+  What the system itself puts in /home (shortcuts, autostart entries,
+  `guest`'s units) is taken from the image at each boot: every image build
+  ends by keeping /home as `/usr/share/gse/home-template`, which is copied
+  over the disk, and the files an older template had and the new one
+  dropped go away. Only a reset empties the home disk. The
   service reads a preset's AppImages as root, and only those the user who
   asked for the build could read. The base image keeps cloud-init
   with only the NoCloud datasource: an environment boots without a seed volume and

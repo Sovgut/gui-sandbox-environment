@@ -1058,8 +1058,9 @@ impl Home {
                     "Sets of apps are out of date"
                 },
                 "They lack what this version of GSE puts into sandboxes. Updating \
-                 rebuilds what is out of date and resets the sandboxes made from it; it \
-                 takes a while and needs no sandbox running.",
+                 rebuilds what is out of date and gives the sandboxes made from it a new \
+                 system; their games, saves and files in /home stay. It takes a while and \
+                 needs no sandbox running.",
             )
             .child(button(
                 "update-everything",

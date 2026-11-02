@@ -28,8 +28,8 @@ use gse_protocol::ScreenAccess;
 use gse_screen::Reader;
 use smallvec::SmallVec;
 
-use gse_protocol::qmp::Input;
 use crate::ui::Theme;
+use gse_protocol::qmp::Input;
 
 /// Evdev codes the capture combination uses.
 const KEY_LEFT_CTRL: u32 = 29;

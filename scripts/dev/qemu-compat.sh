@@ -58,6 +58,7 @@ grep -vE '^(passt|nft) ' /lines | while read -r kind line; do
     dir=$(mktemp -d)
     chmod 755 "$dir"
     qemu-img create -q -f qcow2 "$dir/disk.qcow2" 1G
+    qemu-img create -q -f qcow2 "$dir/home.qcow2" 512G
     cp /usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2 "$dir/OVMF_VARS.qcow2"
     truncate -s 1M "$dir/seed.img"
     truncate -s 128M "$dir/screen"

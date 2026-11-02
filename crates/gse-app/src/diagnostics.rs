@@ -62,13 +62,25 @@ const HOST_COMMANDS: [(&str, &[&str]); 16] = [
         ],
     ),
     ("ls", &["-l", "/dev/kvm", "/dev/vfio"]),
-    ("sh", &["-c", "lsmod | grep -E 'vfio|nvidia|nouveau|amdgpu|i915|xe|kvm'"]),
+    (
+        "sh",
+        &[
+            "-c",
+            "lsmod | grep -E 'vfio|nvidia|nouveau|amdgpu|i915|xe|kvm'",
+        ],
+    ),
     ("nvidia-smi", &["-L"]),
     ("free", &["-m"]),
     ("df", &["-h", "/var/lib/gse", "/home"]),
     ("systemctl", &["status", "gse", "--no-pager"]),
-    ("journalctl", &["-u", "gse", "-b", "--no-pager", "-n", "5000"]),
-    ("journalctl", &["-u", "gse", "-b", "-1", "--no-pager", "-n", "5000"]),
+    (
+        "journalctl",
+        &["-u", "gse", "-b", "--no-pager", "-n", "5000"],
+    ),
+    (
+        "journalctl",
+        &["-u", "gse", "-b", "-1", "--no-pager", "-n", "5000"],
+    ),
 ];
 
 /// Makes the archive in the received files folder and says where it is.
@@ -106,7 +118,11 @@ fn write(archive: &Path) -> Result<()> {
     }
     let config = crate::config::path();
     add(&mut zip, "settings/app.toml".into(), &config)?;
-    add(&mut zip, "settings/gse.toml".into(), Path::new("/etc/gse/gse.toml"))?;
+    add(
+        &mut zip,
+        "settings/gse.toml".into(),
+        Path::new("/etc/gse/gse.toml"),
+    )?;
     for path in files_in(Path::new(SERVICE_LOGS)) {
         let name = path.strip_prefix(SERVICE_LOGS).unwrap_or(&path);
         add(&mut zip, format!("service/{}", name.display()), &path)?;
@@ -114,7 +130,11 @@ fn write(archive: &Path) -> Result<()> {
     for sandbox in folders_in(Path::new(ENVIRONMENTS)) {
         let name = sandbox.file_name().unwrap_or_default().to_string_lossy();
         for file in SANDBOX_FILES {
-            add(&mut zip, format!("sandboxes/{name}/{file}"), &sandbox.join(file))?;
+            add(
+                &mut zip,
+                format!("sandboxes/{name}/{file}"),
+                &sandbox.join(file),
+            )?;
         }
     }
 

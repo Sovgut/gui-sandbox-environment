@@ -248,6 +248,7 @@ fn build_spec(
     VmSpec {
         name: format!("build-{stem}"),
         disk: overlay.to_path_buf(),
+        home_disk: None,
         read_only_disks: vec![seed_img.to_path_buf()],
         firmware_vars: work.join("OVMF_VARS.qcow2"),
         memory_mib: 6144,

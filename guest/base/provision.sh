@@ -508,7 +508,79 @@ rm /tmp/gse_ntsync.cil
 semanage fcontext -a -t gse_ntsync_device_t /dev/ntsync
 echo 'z /dev/ntsync - - - -' > /etc/tmpfiles.d/gse-ntsync.conf
 
+step "home"
+# An environment keeps /home on a disk of its own (serial gse-home), so a
+# new image of its set leaves games and saves alone; only a reset empties
+# it. What the system itself puts in /home (shortcuts, autostart entries,
+# `guest`'s units) is kept in the image at /usr/share/gse/home-template,
+# taken at the end of every image build, and copied over the disk at each
+# boot; the files of an older template that the new one dropped go away.
+# A new disk starts with the /home the system had, its files included.
+cat > /usr/libexec/gse/home <<'EOF'
+#!/bin/sh
+set -eu
+template=/usr/share/gse/home-template
+case "${1:-}" in
+snapshot)
+    rm -rf "$template"
+    mkdir -p "$template"
+    cp -a /home/. "$template/"
+    exit 0
+    ;;
+mount) ;;
+*) echo "usage: $0 snapshot|mount" >&2; exit 2 ;;
+esac
+disk=/dev/disk/by-id/virtio-gse-home
+for _ in $(seq 50); do [ -e "$disk" ] && break; sleep 0.1; done
+# An image build has no such disk, and /home stays the system's.
+[ -e "$disk" ] || exit 0
+staging=/run/gse/home-disk
+mkdir -p "$staging"
+managed=$staging/.gse-managed
+if ! blkid "$disk" > /dev/null 2>&1; then
+    mkfs.btrfs -q -L gse-home "$disk"
+    mount "$disk" "$staging"
+    chcon --reference=/home "$staging"
+    cp -a /home/. "$staging/"
+else
+    mount "$disk" "$staging"
+    [ -d "$template" ] || { umount "$staging"; mount "$disk" /home; exit 0; }
+    listed=$(mktemp)
+    (cd "$template" && find . ! -type d | sort) > "$listed"
+    if [ -f "$managed" ]; then
+        sort "$managed" | comm -23 - "$listed" | while IFS= read -r gone; do
+            rm -f -- "$staging/$gone"
+        done
+    fi
+    cp -a "$template/." "$staging/"
+    mv "$listed" "$managed"
+fi
+[ -f "$managed" ] || (cd "$template" 2>/dev/null && find . ! -type d | sort) > "$managed" || true
+umount "$staging"
+mount "$disk" /home
+EOF
+chmod 0755 /usr/libexec/gse/home
+cat > /etc/systemd/system/gse-home.service <<'EOF'
+[Unit]
+Description=Mount the environment's own /home
+DefaultDependencies=no
+After=local-fs.target systemd-udevd.service
+Before=systemd-user-sessions.service greetd.service gse-agent.service
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/gse/home mount
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable gse-home.service
+restorecon -R /usr/libexec/gse
+
 step "cleanup"
+/usr/libexec/gse/home snapshot
 if [ "${GSE_DEV:-0}" != 1 ]; then
     systemctl disable sshd.service
     userdel --remove dev 2>/dev/null || true

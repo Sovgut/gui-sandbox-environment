@@ -635,8 +635,10 @@ impl Home {
                     .text_sm()
                     .text_color(Theme::muted())
                     .child(match users {
-                        1 => "Rebuilding resets its sandbox.".to_owned(),
-                        n => format!("Rebuilding resets its {n} sandboxes."),
+                        1 => "Its sandbox gets a new system; its files in /home stay.".to_owned(),
+                        n => format!(
+                            "Its {n} sandboxes get a new system; their files in /home stay."
+                        ),
                     }),
             )
             .child(button(
@@ -894,7 +896,7 @@ impl Home {
 
     /// Rebuilds the sandbox system when it is out of date, then every set
     /// built on an older one, one after another; the sandboxes made from a
-    /// set are reset onto its new build. What is left to do is asked of the
+    /// set get its new build as their system, their /home kept. What is left to do is asked of the
     /// service each time, so the work picks up where it stopped.
     pub(crate) fn update_everything(&mut self, cx: &mut Context<Self>) {
         let base = self.base_outdated();
@@ -1799,8 +1801,9 @@ impl Home {
         }
         view.child(list).child(self.base_row(cx)).child(
             div().text_xs().text_color(Theme::subtle()).child(
-                "Rebuilding a set resets the sandboxes made from it. A set in use by a \
-                 sandbox can't be deleted.",
+                "Rebuilding a set gives the sandboxes made from it a new system; their \
+                 games, saves and files in /home stay. A set in use by a sandbox can't be \
+                 deleted.",
             ),
         )
     }

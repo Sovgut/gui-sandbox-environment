@@ -16,6 +16,9 @@ pub struct VmSpec {
     pub name: String,
     /// The environment's writable disk, usually an overlay on a preset image.
     pub disk: PathBuf,
+    /// The environment's own /home, which the guest finds by its serial
+    /// `gse-home` and mounts over the system's; images are built without.
+    pub home_disk: Option<PathBuf>,
     /// Extra raw disks attached read-only, such as a cloud-init seed.
     pub read_only_disks: Vec<PathBuf>,
     /// This VM's copy of the UEFI variable store.
@@ -105,6 +108,34 @@ pub enum Network {
 }
 
 impl VmSpec {
+    /// The firmware and the disks.
+    fn disks(&self) -> Vec<String> {
+        let mut drives = vec![
+            format!("if=pflash,format=qcow2,readonly=on,file={OVMF_CODE}"),
+            format!(
+                "if=pflash,format=qcow2,file={}",
+                self.firmware_vars.display()
+            ),
+            format!("file={},if=virtio,format=qcow2", self.disk.display()),
+        ];
+        if let Some(home) = &self.home_disk {
+            drives.push(format!(
+                "file={},if=virtio,format=qcow2,serial=gse-home",
+                home.display()
+            ));
+        }
+        for disk in &self.read_only_disks {
+            drives.push(format!(
+                "file={},if=virtio,format=raw,readonly=on",
+                disk.display()
+            ));
+        }
+        drives
+            .into_iter()
+            .flat_map(|drive| ["-drive".to_owned(), drive])
+            .collect()
+    }
+
     /// The command line, program first.
     #[must_use]
     pub fn command_line(&self) -> Vec<String> {
@@ -126,27 +157,8 @@ impl VmSpec {
             self.cpus.to_string()
         };
         push(&["-smp", &smp, "-m", &format!("{}M", self.memory_mib)]);
-        push(&[
-            "-drive",
-            &format!("if=pflash,format=qcow2,readonly=on,file={OVMF_CODE}"),
-        ]);
-        push(&[
-            "-drive",
-            &format!(
-                "if=pflash,format=qcow2,file={}",
-                self.firmware_vars.display()
-            ),
-        ]);
-        push(&[
-            "-drive",
-            &format!("file={},if=virtio,format=qcow2", self.disk.display()),
-        ]);
-        for disk in &self.read_only_disks {
-            push(&[
-                "-drive",
-                &format!("file={},if=virtio,format=raw,readonly=on", disk.display()),
-            ]);
-        }
+        let disks = self.disks();
+        push(&disks.iter().map(String::as_str).collect::<Vec<_>>());
         for function in &self.passthrough {
             push(&["-device", &format!("vfio-pci,host={function}")]);
         }
@@ -191,7 +203,10 @@ impl VmSpec {
         // large while QEMU goes on writing.
         push(&[
             "-chardev",
-            &format!("file,id=console,path={},append=on", self.serial_log.display()),
+            &format!(
+                "file,id=console,path={},append=on",
+                self.serial_log.display()
+            ),
             "-serial",
             "chardev:console",
         ]);
@@ -307,6 +322,7 @@ mod tests {
         VmSpec {
             name: "proto".into(),
             disk: "/vm/disk.qcow2".into(),
+            home_disk: None,
             read_only_disks: vec!["/vm/seed.img".into()],
             firmware_vars: "/vm/OVMF_VARS.qcow2".into(),
             memory_mib: 12288,

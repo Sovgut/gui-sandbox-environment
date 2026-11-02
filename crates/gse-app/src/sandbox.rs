@@ -816,7 +816,7 @@ impl Home {
             )
             .child(line(
                 "Reset",
-                "Back to a clean copy of its set; everything inside is lost",
+                "Back to a clean copy of its set; everything inside, /home included, is lost",
                 self.discard_control(name, Confirm::Reset, running, cx),
             ))
             .child(line(
@@ -1094,15 +1094,10 @@ impl Home {
                             .flex()
                             .flex_col()
                             .child(div().text_sm().child("To come back to your desktop"))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(Theme::muted())
-                                    .child(
-                                        "Shut the sandbox down from its menu, or press both \
+                            .child(div().text_xs().text_color(Theme::muted()).child(
+                                "Shut the sandbox down from its menu, or press both \
                                          Ctrl keys together to stop it at once.",
-                                    ),
-                            ),
+                            )),
                     )
                     .child(keys),
             );

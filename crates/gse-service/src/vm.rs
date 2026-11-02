@@ -237,6 +237,7 @@ pub fn launch_environment(
             sound_server: PathBuf::from(format!("/run/user/{}/pulse/native", launch.owner.uid)),
         }),
         host_input: host_input.clone(),
+        qmp_object: qemu_has_qmp_object(),
         input_socket: Some(launch.input_socket()),
         agent_socket: Some(launch.agent_socket()),
         monitor_socket: state_path(&format!("{}.monitor", launch.name)),
@@ -276,6 +277,28 @@ pub fn launch_environment(
     }
     fs::remove_file(&screen).ok();
     outcome.and(returned)
+}
+
+/// Whether the installed QEMU has the `monitor-qmp` object, by its own
+/// list of object types; asked once.
+fn qemu_has_qmp_object() -> bool {
+    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let found = Command::new(gse_host::vm::QEMU)
+            .args(["-object", "help"])
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .any(|line| line.trim() == "monitor-qmp")
+            });
+        info!(
+            "QEMU {} the monitor-qmp object",
+            if found { "has" } else { "lacks" }
+        );
+        found
+    })
 }
 
 /// Where the pid of the VM `name`'s QEMU is kept while it runs.

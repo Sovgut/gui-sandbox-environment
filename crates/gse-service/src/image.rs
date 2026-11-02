@@ -274,6 +274,7 @@ fn build(
         serial_log: console.clone(),
         journal_log: None,
         host_input: Vec::new(),
+        qmp_object: false,
         run_as: job.run_as.clone(),
         image_build: true,
     };

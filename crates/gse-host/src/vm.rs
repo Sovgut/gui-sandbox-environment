@@ -42,6 +42,9 @@ pub struct VmSpec {
     /// nothing on the host is left to send input. Both Ctrl keys pressed
     /// together hand them back, which the service takes as the way out.
     pub host_input: Vec<HostInput>,
+    /// Whether this QEMU has the `monitor-qmp` object (QEMU 11 on), which
+    /// takes the place of the deprecated `-mon`; older ones only know `-mon`.
+    pub qmp_object: bool,
     /// A QMP socket through which the viewer of the environment screen sends input to
     /// the VM's virtual keyboard, its tablet (absolute pointer for the
     /// desktop) and its mouse (relative motion for games that lock the
@@ -274,11 +277,12 @@ impl VmSpec {
                     "socket,id=input,path={},server=on,wait=off",
                     socket.display()
                 ),
-                // `-mon`, not `-object monitor-qmp`: the object exists from
-                // QEMU 11 only, and Fedora 44 ships 10.2.
-                "-mon",
-                "chardev=input,mode=control",
             ]);
+            if self.qmp_object {
+                push(&["-object", "monitor-qmp,id=input-monitor,chardev=input"]);
+            } else {
+                push(&["-mon", "chardev=input,mode=control"]);
+            }
         }
         args
     }
@@ -309,6 +313,7 @@ mod tests {
             serial_log: "/vm/console.log".into(),
             journal_log: None,
             host_input: Vec::new(),
+            qmp_object: false,
             run_as: Some("sovhut".into()),
             image_build: false,
         }
@@ -338,12 +343,17 @@ mod tests {
     }
 
     #[test]
-    fn the_input_monitor_works_on_older_qemu() {
+    fn the_input_monitor_follows_what_qemu_has() {
         let mut spec = spec();
         spec.input_socket = Some("/run/gse/proto.input".into());
         let args = spec.command_line();
         assert_eq!(after(&args, "-mon"), ["chardev=input,mode=control"]);
         assert!(!args.iter().any(|a| a.contains("monitor-qmp")));
+
+        spec.qmp_object = true;
+        let args = spec.command_line();
+        assert_eq!(after(&args, "-mon"), Vec::<&str>::new());
+        assert!(after(&args, "-object").contains(&"monitor-qmp,id=input-monitor,chardev=input"));
     }
 
     fn after<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {

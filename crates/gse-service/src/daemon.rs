@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::agent::Agent;
-use crate::{checks, fedora, gpu, image, mailbox, net, nocow, presets, vm};
+use crate::{antivirus, checks, fedora, gpu, image, mailbox, net, nocow, presets, vm};
 
 /// The polkit action every client needs.
 pub const ACTION: &str = "io.github.sovgut.gse.manage";
@@ -277,6 +277,12 @@ impl Store {
 
     fn images_dir(&self) -> PathBuf {
         self.root.join("images")
+    }
+
+    /// Where the files of a take of `name` wait while the antivirus looks
+    /// at them.
+    fn scratch(&self, name: &str) -> PathBuf {
+        self.root.join("scan").join(name)
     }
 
     fn environments_dir(&self) -> PathBuf {
@@ -1504,20 +1510,14 @@ impl Service {
                 flag.store(true, Ordering::SeqCst);
                 info!("stopping the send of files into '{name}'");
             }
-            Request::TakeFiles { name } if !self.is_up(&name) => {
-                let dir = self.environment_dir(&name)?;
-                let count = mailbox::hand_over(&dir, out)?;
-                self.log(
-                    &name,
-                    format!(
-                        "{count} file(s) taken out of the Outbox while it ran handed to the host"
-                    ),
-                );
-            }
             Request::TakeFiles { name } => {
                 let dir = self.environment_dir(&name)?;
-                mailbox::hand_over(&dir, out)?;
-                let (passed, refused) = self.with_agent(&name, |agent| take(agent, out))?;
+                if self.is_up(&name) {
+                    self.with_agent(&name, |agent| mailbox::spool_outbox(&dir, agent))?;
+                }
+                mailbox::yield_to_others();
+                let scratch = self.lock().store.scratch(&name);
+                let (passed, refused) = mailbox::hand_over(&dir, out, &scratch, &scan)?;
                 self.log(
                     &name,
                     format!("{passed} file(s) of the Outbox taken to the host, {refused} refused"),
@@ -1766,6 +1766,19 @@ impl Service {
                 send(out, &Reply::Settings { settings, gpus })?;
             }
             Request::SetSettings { settings } => self.set_defaults(&settings)?,
+            Request::Antivirus => {
+                let state = antivirus::Antivirus::new(antivirus::ROOT).state();
+                send(
+                    out,
+                    &Reply::Antivirus {
+                        engine: state.engine,
+                        database: state.database,
+                        checked: state.checked,
+                        error: state.error,
+                    },
+                )?;
+            }
+            Request::UpdateAntivirus => antivirus::Antivirus::new(antivirus::ROOT).update()?,
         }
         send(out, &Reply::Done)?;
         Ok(())
@@ -1823,12 +1836,15 @@ fn refuse(out: &mut dyn std::io::Write, path: &str, reason: String) -> std::io::
     )
 }
 
-/// Copies the Outbox through `agent` to the client on `out`, file by file,
-/// past the checks for outbound files; counts what passed and what not.
-fn take(agent: &mut Agent, out: &mut UnixStream) -> Result<(usize, usize)> {
-    let files = agent.files()?;
-    let (passed, refused) = take_files(agent, out, &files.outbox)?;
-    Ok((passed.len(), refused))
+/// Has the antivirus look at the files below `staging`, which it may read
+/// then.
+fn scan(staging: &Path) -> Result<Vec<antivirus::Found>> {
+    if let Some(scratch) = staging.parent() {
+        antivirus::readable_by_scanner(scratch)?;
+    }
+    antivirus::Antivirus::new(antivirus::ROOT)
+        .scan(staging)
+        .context("the files cannot pass the antivirus")
 }
 
 /// Copies `files` of the Outbox through `agent` onto `out`, file by file,
@@ -1940,6 +1956,9 @@ fn host_files(paths: &[PathBuf], uid: u32) -> Result<Vec<(String, fs::File, u64)
         } else if metadata.is_file() {
             let file = open_as(&path, uid)?;
             let size = file.metadata()?.len();
+            if size > gse_protocol::agent::MAX_SENT_FILE {
+                bail!("{} is larger than 64 GiB", path.display());
+            }
             found.push((inbox_path, file, size));
             if found.len() > checks::MAX_TAKE_FILES {
                 bail!("at most {} files at once", checks::MAX_TAKE_FILES);
@@ -2092,6 +2111,7 @@ pub fn serve(root: Root) -> Result<()> {
     fedora::remove_partial(&store.cache_dir());
     presets::seed(&store.presets_dir())?;
     store.prune_images();
+    antivirus::keep_updated();
     let socket = Path::new(SOCKET);
     fs::create_dir_all(socket.parent().context("socket path")?)?;
     fs::remove_file(socket).ok();

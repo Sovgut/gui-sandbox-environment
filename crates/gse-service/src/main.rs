@@ -6,6 +6,7 @@
 //! for development and repair.
 
 mod agent;
+mod antivirus;
 mod checks;
 mod daemon;
 mod fedora;

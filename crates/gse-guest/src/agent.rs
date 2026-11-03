@@ -261,8 +261,8 @@ impl Agent {
     }
 
     fn start_upload(&mut self, id: u64, path: &str, size: u64, executable: bool) -> Result<()> {
-        if size > agent::MAX_FILE {
-            bail!("{path} is larger than {} bytes", agent::MAX_FILE);
+        if size > agent::MAX_SENT_FILE {
+            bail!("{path} is larger than {} bytes", agent::MAX_SENT_FILE);
         }
         if let Some(batch) = &mut self.incoming {
             batch.file(path);
@@ -383,8 +383,8 @@ impl Agent {
             bail!("{path} is not a file of {GUEST}'s own");
         }
         let size = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
-        if size > agent::MAX_FILE {
-            bail!("{path} is larger than {} bytes", agent::MAX_FILE);
+        if size > agent::MAX_TAKEN_FILE {
+            bail!("{path} is larger than {} bytes", agent::MAX_TAKEN_FILE);
         }
         let mut file = File::from(fd);
         let mut hash = Sha256::new();
@@ -396,8 +396,8 @@ impl Agent {
                 break;
             }
             sent += read as u64;
-            if sent > agent::MAX_FILE {
-                bail!("{path} grew past {} bytes", agent::MAX_FILE);
+            if sent > agent::MAX_TAKEN_FILE {
+                bail!("{path} grew past {} bytes", agent::MAX_TAKEN_FILE);
             }
             hash.update(&buffer[..read]);
             self.answer(

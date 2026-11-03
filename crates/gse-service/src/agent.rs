@@ -162,8 +162,19 @@ impl Agent {
         size: u64,
         executable: bool,
     ) -> Result<()> {
-        if size > agent::MAX_FILE {
-            bail!("{path} is larger than {} bytes", agent::MAX_FILE);
+        let limit = if self.version >= 2 {
+            agent::MAX_SENT_FILE
+        } else {
+            agent::MAX_TAKEN_FILE
+        };
+        if size > limit {
+            if limit < agent::MAX_SENT_FILE && size <= agent::MAX_SENT_FILE {
+                bail!(
+                    "{path} is larger than 4 GiB, which this sandbox's system takes at most; \
+                     after Update everything it takes up to 64 GiB"
+                );
+            }
+            bail!("{path} is larger than {limit} bytes");
         }
         let id = self.call(Call::Put {
             path: path.to_owned(),
@@ -228,7 +239,7 @@ impl Agent {
                 Answer::Chunk { data } => {
                     let bytes = BASE64.decode(data).context("a chunk is not base64")?;
                     received += bytes.len() as u64;
-                    if received > limit.min(agent::MAX_FILE) {
+                    if received > limit.min(agent::MAX_TAKEN_FILE) {
                         bail!("{path} is larger than allowed");
                     }
                     hash.update(&bytes);

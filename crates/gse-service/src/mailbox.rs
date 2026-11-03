@@ -306,20 +306,144 @@ pub fn collect(dir: &Path, agent: &mut Agent, seen: &mut HashSet<(String, u64)>)
     Ok(passed.len())
 }
 
-/// Sends the spool to the client on `out` as a take would, and empties it;
-/// returns how many files it held.
-pub fn hand_over(dir: &Path, out: &mut impl io::Write) -> Result<usize> {
-    let count = taken(dir).len();
-    match File::open(spool(dir)) {
-        Ok(mut spooled) => {
-            io::copy(&mut spooled, out)?;
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e.into()),
+/// Takes the whole Outbox through `agent` into the spool, past the checks
+/// by type; returns how many files passed and how many were refused.
+pub fn spool_outbox(dir: &Path, agent: &mut Agent) -> Result<(usize, usize)> {
+    let outbox = agent.files()?.outbox;
+    let mut spool = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(spool(dir))?;
+    let (passed, refused) = crate::daemon::take_files(agent, &mut spool, &outbox)?;
+    let mut index = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(spool_index(dir))?;
+    for file in &passed {
+        writeln!(index, "{} {}", file.size, file.path)?;
     }
+    Ok((passed.len(), refused))
+}
+
+/// What a spool holds, in order.
+enum Spooled {
+    File { path: String, staged: PathBuf },
+    Refused { path: String, reason: String },
+}
+
+/// Sends the spool to the client on `out` as a take would, every file past
+/// `scan` first, and empties it; returns how many files went and how many
+/// were refused. The files wait in `scratch` (a new folder) while `scan`
+/// looks at them; one it finds infected is refused with what it found. A
+/// scan that cannot run fails the take and keeps the spool for the next.
+pub fn hand_over(
+    dir: &Path,
+    out: &mut impl io::Write,
+    scratch: &Path,
+    scan: &dyn Fn(&Path) -> Result<Vec<crate::antivirus::Found>>,
+) -> Result<(usize, usize)> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use gse_protocol::{Reply, send};
+    use std::io::{BufRead as _, Read as _};
+    let spooled = match File::open(spool(dir)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(e.into()),
+    };
+    let staging = scratch.join("files");
+    fs::remove_dir_all(scratch).ok();
+    fs::create_dir_all(&staging)?;
+    fs::set_permissions(scratch, fs::Permissions::from_mode(0o750))?;
+    let outcome = (|| {
+        let mut entries = Vec::new();
+        let mut current: Option<File> = None;
+        for line in io::BufReader::new(spooled).lines() {
+            match serde_json::from_str::<Reply>(&line?)? {
+                Reply::FileStart { path, .. } => {
+                    if !plain(&path) {
+                        bail!("the spool names the path '{path}'");
+                    }
+                    let staged = staging.join(&path);
+                    if let Some(parent) = staged.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    current = Some(File::create(&staged)?);
+                    entries.push(Spooled::File { path, staged });
+                }
+                Reply::FileChunk { data } => {
+                    let bytes = BASE64
+                        .decode(data)
+                        .context("a spooled chunk is not base64")?;
+                    current
+                        .as_mut()
+                        .context("the spool holds bytes of no file")?
+                        .write_all(&bytes)?;
+                }
+                Reply::Refused { path, reason } => {
+                    // A file refused after it began never reaches the client.
+                    if let Some(Spooled::File { path: last, staged }) = entries.last()
+                        && *last == path
+                    {
+                        fs::remove_file(staged).ok();
+                        entries.pop();
+                        current = None;
+                    }
+                    entries.push(Spooled::Refused { path, reason });
+                }
+                other => bail!("the spool holds {other:?}"),
+            }
+        }
+        drop(current);
+        let found = scan(&staging)?;
+        let (mut passed, mut refused) = (0, 0);
+        for entry in entries {
+            match entry {
+                Spooled::File { path, staged } => {
+                    if let Some(hit) = found.iter().find(|hit| hit.path == staged) {
+                        refused += 1;
+                        send(
+                            out,
+                            &Reply::Refused {
+                                path,
+                                reason: format!("the antivirus found {}", hit.signature),
+                            },
+                        )?;
+                        continue;
+                    }
+                    let mut file = File::open(&staged)?;
+                    let size = file.metadata()?.len();
+                    send(out, &Reply::FileStart { path, size })?;
+                    let mut buffer = vec![0; gse_protocol::agent::CHUNK];
+                    loop {
+                        let read = file.read(&mut buffer)?;
+                        if read == 0 {
+                            break;
+                        }
+                        send(
+                            out,
+                            &Reply::FileChunk {
+                                data: BASE64.encode(&buffer[..read]),
+                            },
+                        )?;
+                    }
+                    passed += 1;
+                }
+                Spooled::Refused { path, reason } => {
+                    refused += 1;
+                    send(out, &Reply::Refused { path, reason })?;
+                }
+            }
+        }
+        Ok((passed, refused))
+    })();
+    fs::remove_dir_all(scratch).ok();
+    let counts = outcome?;
     fs::remove_file(spool(dir)).ok();
     fs::remove_file(spool_index(dir)).ok();
-    Ok(count)
+    Ok(counts)
 }
 
 #[cfg(test)]
@@ -403,7 +527,12 @@ mod tests {
     #[test]
     fn the_spool_is_handed_over_once() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(spool(dir.path()), "{\"reply\":\"file-start\"}\n").unwrap();
+        fs::write(
+            spool(dir.path()),
+            "{\"reply\":\"file-start\",\"path\":\"Screenshots/a.png\",\"size\":8}\n\
+             {\"reply\":\"file-chunk\",\"data\":\"cHJvZ3Jlc3M=\"}\n",
+        )
+        .unwrap();
         fs::write(spool_index(dir.path()), "8 Screenshots/a.png\n").unwrap();
         assert_eq!(
             taken(dir.path()),
@@ -412,10 +541,66 @@ mod tests {
                 size: 8,
             }]
         );
+        let scratch = dir.path().join("scan");
         let mut out = Vec::new();
-        assert_eq!(hand_over(dir.path(), &mut out).unwrap(), 1);
-        assert_eq!(out, b"{\"reply\":\"file-start\"}\n");
-        assert_eq!(hand_over(dir.path(), &mut out).unwrap(), 0);
+        let clean = |_: &Path| Ok(Vec::new());
+        assert_eq!(
+            hand_over(dir.path(), &mut out, &scratch, &clean).unwrap(),
+            (1, 0)
+        );
+        let replies: Vec<gse_protocol::Reply> = out
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(
+            replies,
+            [
+                gse_protocol::Reply::FileStart {
+                    path: "Screenshots/a.png".into(),
+                    size: 8
+                },
+                gse_protocol::Reply::FileChunk {
+                    data: "cHJvZ3Jlc3M=".into()
+                }
+            ]
+        );
+        assert_eq!(
+            hand_over(dir.path(), &mut out, &scratch, &clean).unwrap(),
+            (0, 0)
+        );
+
+        fs::write(
+            spool(dir.path()),
+            "{\"reply\":\"file-start\",\"path\":\"bad.dll\",\"size\":3}\n\
+             {\"reply\":\"file-chunk\",\"data\":\"YmFk\"}\n\
+             {\"reply\":\"refused\",\"path\":\"run.sh\",\"reason\":\"a script\"}\n",
+        )
+        .unwrap();
+        let infected = |staging: &Path| {
+            Ok(vec![crate::antivirus::Found {
+                path: staging.join("bad.dll"),
+                signature: "Win.Trojan.Test".into(),
+            }])
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            hand_over(dir.path(), &mut out, &scratch, &infected).unwrap(),
+            (0, 2)
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("the antivirus found Win.Trojan.Test"));
+        assert!(!text.contains("file-start"));
+        assert!(!scratch.exists());
+
+        fs::write(
+            spool(dir.path()),
+            "{\"reply\":\"refused\",\"path\":\"x\",\"reason\":\"y\"}\n",
+        )
+        .unwrap();
+        let broken = |_: &Path| -> Result<Vec<crate::antivirus::Found>> { bail!("no engine") };
+        assert!(hand_over(dir.path(), &mut Vec::new(), &scratch, &broken).is_err());
+        assert!(spool(dir.path()).exists());
         assert_eq!(taken(dir.path()), Vec::new());
     }
 }

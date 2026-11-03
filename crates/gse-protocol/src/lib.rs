@@ -33,7 +33,7 @@ pub const SOCKET: &str = "/run/gse/service.sock";
 /// The protocol's version: a client and a service speak to each other only
 /// when theirs match ([`Request::Hello`]). It changes with every change to
 /// the messages.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 
 /// The name a build of the base image goes by wherever a preset's name
 /// would stand: in [`Event::Build`], [`Event::BuildFinished`] and
@@ -153,6 +153,11 @@ pub enum Request {
     /// service, which comes back as whatever build is installed. Answered
     /// before the service exits.
     Restart,
+    /// What the antivirus is: [`Reply::Antivirus`].
+    Antivirus,
+    /// Bring the antivirus's engine and signatures up to date now; answered
+    /// once that is done or failed.
+    UpdateAntivirus,
     /// The presets and the image build in progress, if any.
     Presets,
     /// Create or replace the preset of the same name.
@@ -208,6 +213,15 @@ pub enum Reply {
     Settings {
         settings: Settings,
         gpus: Vec<Gpu>,
+    },
+    /// The antivirus every file taken out passes: its engine's version,
+    /// when its signatures were written and when it last updated, in
+    /// seconds since the epoch, and why that update failed if it did.
+    Antivirus {
+        engine: Option<String>,
+        database: Option<u64>,
+        checked: Option<u64>,
+        error: Option<String>,
     },
     Journal {
         entries: Vec<JournalEntry>,
@@ -480,8 +494,11 @@ pub mod agent {
     /// Raw bytes per chunk of a file; in base64 a chunk stays well under
     /// [`crate::MAX_LINE`].
     pub const CHUNK: usize = 32 * 1024;
-    /// The largest file either way.
-    pub const MAX_FILE: u64 = 4 << 30;
+    /// The largest file sent into the Inbox. Agents before version 2 take
+    /// at most [`MAX_TAKEN_FILE`].
+    pub const MAX_SENT_FILE: u64 = 64 << 30;
+    /// The largest file taken out of the Outbox.
+    pub const MAX_TAKEN_FILE: u64 = 4 << 30;
     /// The most files a listing of the Inbox or the Outbox holds.
     pub const MAX_FILES: usize = 10_000;
 

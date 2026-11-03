@@ -99,7 +99,7 @@ const FEDORA_SOURCES: Sources<'static> = Sources {
 };
 
 /// An HTTPS client that refuses plain HTTP, redirects included.
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .https_only(true)
         .timeout_connect(CONNECT_TIMEOUT)
@@ -175,7 +175,7 @@ fn fetch_from(
 }
 
 /// The text at `url`, which may be at most [`MAX_TEXT`] bytes.
-fn text(agent: &ureq::Agent, url: &str) -> Result<String> {
+pub(crate) fn text(agent: &ureq::Agent, url: &str) -> Result<String> {
     let mut text = String::new();
     agent
         .get(url)

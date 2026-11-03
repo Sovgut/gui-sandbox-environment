@@ -491,12 +491,27 @@ checks exist so that a reset really cleans: malware dropped into a save
 folder must not ride into the next environment or onto the host.
 
 1. Paths: no `..`, absolute paths, symlinks, hardlinks or device files.
-2. Limits: 4 GiB a file, 8 GiB and 1000 files a take, 16 levels deep.
+2. Limits: 4 GiB a file, 8 GiB and 1000 files a take, 16 levels deep. A
+   file sent in may be up to 64 GiB (4 GiB for an image older than agent
+   version 2).
 3. Type by content and name: programs (ELF, PE), scripts, Windows and
    desktop shortcuts, Office documents and installers that can carry
    macros, and archives are refused (`crates/gse-service/src/checks.rs`).
-4. To come: a per-game allowlist of paths and formats from the preset.
-5. To come: ClamAV with signatures refreshed before the scan.
+4. Antivirus: every file that passed the checks above waits in
+   `/var/lib/gse/scan/<name>` while ClamAV scans the take, and one it finds
+   infected is refused with what it found. The service keeps ClamAV itself
+   in `/var/lib/gse/clamav`, installed nowhere else: once a day it asks
+   GitHub for the latest Cisco Talos release, takes the Linux x86_64
+   package only with a valid signature of the Talos key it pins
+   (`dist/clamav/cisco-talos.asc`), unpacks it with `rpm2cpio` and `cpio`,
+   and updates the signatures with the engine's own freshclam; neither
+   waits for a gse release or touches the sandboxes' images. The scanner and
+   freshclam run as `gse-scan` in transient units (system read-only, no
+   privileges, the scan without network). A take fails, and a spool waits,
+   while there is no engine or its signatures are older than a week, so
+   nothing leaves unscanned. About and updates shows the engine, the age of
+   its signatures and Update now (`Antivirus`, `UpdateAntivirus`).
+5. To come: a per-game allowlist of paths and formats from the preset.
 
 What passes lands in one zip archive per take, which the app never opens;
 the app shows what passed and what was refused and why.

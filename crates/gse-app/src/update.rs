@@ -512,6 +512,86 @@ impl crate::Home {
         )
     }
 
+    /// The row of the service's antivirus: its engine, how old its
+    /// signatures are, and Update now.
+    fn antivirus_row(&self, cx: &mut gpui::Context<Self>) -> gpui::Div {
+        use crate::settings::Rows;
+        use crate::ui::{Kind, Size, button};
+
+        let when = |seconds: u64| {
+            let at = chrono::DateTime::from_timestamp(i64::try_from(seconds).unwrap_or(0), 0)
+                .map(|at| at.with_timezone(&chrono::Local));
+            match at {
+                Some(at) if crate::clock::now().date_naive() == at.date_naive() => {
+                    format!("today at {}", at.format("%H:%M"))
+                }
+                Some(at) => at.format("%-d %b at %H:%M").to_string(),
+                None => "at an unknown time".to_owned(),
+            }
+        };
+        let hint = match &self.antivirus {
+            _ if self.antivirus_updating => "Updating the engine and its signatures...".to_owned(),
+            None => "The service does not say".to_owned(),
+            Some(antivirus) => match (&antivirus.engine, antivirus.database, &antivirus.error) {
+                (_, _, Some(error)) => format!("The last update failed: {error}"),
+                (None, _, None) => {
+                    "Not installed yet; the service downloads it within a day of its start"
+                        .to_owned()
+                }
+                (Some(engine), Some(database), None) => {
+                    format!("ClamAV {engine} \u{b7} signatures from {}", when(database))
+                }
+                (Some(engine), None, None) => format!("ClamAV {engine} \u{b7} no signatures yet"),
+            },
+        };
+        Rows::Page.row(
+            "Antivirus",
+            Some(format!(
+                "{hint}. Every file taken out of a sandbox passes it."
+            )),
+            button(
+                "update-antivirus",
+                if self.antivirus_updating {
+                    "Updating..."
+                } else {
+                    "Update now"
+                },
+                Kind::Secondary,
+                !self.antivirus_updating,
+                cx.listener(|home, _, _, cx| home.update_antivirus(cx)),
+            )
+            .size(Size::Small),
+        )
+    }
+
+    /// Has the service bring its antivirus up to date now.
+    fn update_antivirus(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.preview_skips("updating the antivirus", cx) {
+            return;
+        }
+        self.antivirus_updating = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async {
+                    crate::client::command(&gse_protocol::Request::UpdateAntivirus)
+                        .and_then(|()| crate::client::antivirus())
+                })
+                .await;
+            this.update(cx, |home, cx| {
+                home.antivirus_updating = false;
+                match outcome {
+                    Ok(antivirus) => home.antivirus = Some(antivirus),
+                    Err(e) => home.say(format!("The antivirus was not updated: {e:#}"), true),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// App settings, About and updates: a newer release when there is one,
     /// what it brings, and how the app and its service stand.
     pub(crate) fn updates_card(&self, cx: &mut gpui::Context<Self>) -> gpui::Div {
@@ -565,6 +645,7 @@ impl crate::Home {
                         })),
                 ),
                 self.service_row(),
+                self.antivirus_row(cx),
                 rows.row(
                     "Diagnostics",
                     Some(

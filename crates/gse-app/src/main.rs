@@ -350,6 +350,10 @@ struct Home {
     /// The move of files under way for each sandbox: how far it got and
     /// the flag that stops it.
     flows: BTreeMap<String, transfer::Flow>,
+    /// The service's antivirus as it last said, and whether an update of it
+    /// runs now.
+    antivirus: Option<client::Antivirus>,
+    antivirus_updating: bool,
     app_config: config::AppConfig,
     update: update::State,
     /// The update banner was put off with Later until the app starts again.
@@ -462,6 +466,8 @@ impl Home {
             moved: None,
             last_taken: BTreeMap::new(),
             flows: BTreeMap::new(),
+            antivirus: None,
+            antivirus_updating: false,
             app_config,
             update: update::State::Idle,
             update_later: false,
@@ -631,14 +637,22 @@ impl Home {
     fn reload(cx: &mut Context<Self>) {
         Self::reload_presets(cx);
         cx.spawn(async move |this, cx| {
-            let (loaded, settings, service) = cx
+            let (loaded, settings, service, antivirus) = cx
                 .background_executor()
                 .spawn(async {
                     let loaded = client::environments().and_then(|e| Ok((e, client::images()?)));
-                    (loaded, client::settings(), client::hello())
+                    (
+                        loaded,
+                        client::settings(),
+                        client::hello(),
+                        client::antivirus(),
+                    )
                 })
                 .await;
             this.update(cx, |home, cx| {
+                if let Ok(antivirus) = antivirus {
+                    home.antivirus = Some(antivirus);
+                }
                 match &service {
                     Ok(found) if *found != home.service => {
                         tracing::info!("service: {found:?}");

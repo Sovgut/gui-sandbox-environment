@@ -72,6 +72,40 @@ pub fn send_files(
     Ok(stopped)
 }
 
+/// What the service says of its antivirus.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Antivirus {
+    /// The engine's version.
+    pub engine: Option<String>,
+    /// When its signatures were written and when it last updated, in
+    /// seconds since the epoch.
+    pub database: Option<u64>,
+    pub checked: Option<u64>,
+    /// Why the last update failed.
+    pub error: Option<String>,
+}
+
+pub fn antivirus() -> Result<Antivirus> {
+    let mut found = None;
+    call(&Request::Antivirus, |reply| {
+        if let Reply::Antivirus {
+            engine,
+            database,
+            checked,
+            error,
+        } = reply
+        {
+            found = Some(Antivirus {
+                engine,
+                database,
+                checked,
+                error,
+            });
+        }
+    })?;
+    found.context("no antivirus in the reply")
+}
+
 pub fn environments() -> Result<Vec<Environment>> {
     let mut found = None;
     call(&Request::List, |reply| {

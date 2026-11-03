@@ -117,6 +117,12 @@ impl Home {
         self.tour = None;
         self.setup = None;
         self.toasts.clear();
+        self.antivirus = Some(client::Antivirus {
+            engine: Some("1.5.4".into()),
+            database: Some(data::at(6, 12)),
+            checked: Some(data::at(6, 12)),
+            error: None,
+        });
         match states::STATES.iter().find(|s| s.name == state) {
             Some(found) => {
                 for name in found.flags {

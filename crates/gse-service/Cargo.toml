@@ -21,6 +21,7 @@ base64 = "0.22"
 sha2 = "0.10"
 toml.workspace = true
 ureq = "2"
+pgp = "0.16"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1186,6 +1186,7 @@ impl Home {
             .gap(px(22.))
             .child(name_section)
             .child(self.graphics_rows(Target::Sandbox, gpus, cx))
+            .children(self.devices_rows(gpus, cx))
             .child(group(
                 None,
                 vec![self.internet_row(

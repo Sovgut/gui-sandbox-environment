@@ -293,14 +293,27 @@ The app shows the running environment according to the switch mode:
   - USB devices with a sound or video interface (a USB microphone or
     headset, a webcam) and gamepads, whole, on an xHCI controller of the
     VM's own (`usb-host`, from `qemu-device-usb-host`;
-    `crates/gse-host/src/usb.rs`). A device that is also a keyboard, or
-    holds storage, stays with the host; a gamepad's touchpad, which shows
-    up as a mouse, goes with its gamepad. QEMU detaches the host's drivers
-    and does not bind them again when it is killed, so the service
-    enumerates each device anew once QEMU is gone (deauthorize, then
-    authorize), and a service that started over does it for the devices
-    named in `/run/gse/<name>.usb`. Without the USB module in QEMU the
-    devices stay with the host and the service log says so.
+    `crates/gse-host/src/usb.rs`). QEMU detaches the host's drivers and
+    does not bind them again when it is killed, so the service enumerates
+    each device anew once QEMU is gone (deauthorize, then authorize), and
+    a service that started over does it for the devices named in
+    `/run/gse/<name>.usb`. Without the USB module in QEMU the devices stay
+    with the host and the service log says so.
+
+  These are the defaults; a sandbox's settings (Devices) change them, in
+  either mode, and keep the changes in its `settings.toml` (`devices`): a
+  switch for the board's sound card, and one for each USB device plugged
+  into the host, which the service lists by kind (`HostDevices`) and
+  remembers by vendor, product and serial number, so a choice survives
+  another port. With another GPU nothing goes unless chosen; the host then
+  lacks what it gave while the sandbox runs. A keyboard or mouse is never
+  offered: on a single GPU it reaches the guest through `input-linux`, and
+  the way out is read from it; a gamepad's touchpad, which shows up as a
+  mouse, goes with its gamepad. A drive can go, with a warning that
+  programs inside can change everything on it. A Bluetooth adapter can go
+  too, and the base image then gets BlueZ (the `bluetooth` driver pack).
+  Network cards are not offered: a card in the guest would take it past
+  passt and the internet switch, onto the host's network.
 
   In the guest, games run as `guest`, so udev gives `guest` the event
   nodes of joysticks and every hidraw node too, after systemd's `uaccess`,

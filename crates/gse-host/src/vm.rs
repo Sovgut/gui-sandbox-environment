@@ -658,8 +658,12 @@ mod tests {
             name: "1-2".into(),
             bus: 1,
             address: 5,
-            vendor: 0x0c76,
-            product: 0x161e,
+            id: gse_protocol::UsbId {
+                vendor: 0x0c76,
+                product: 0x161e,
+                serial: None,
+            },
+            kind: gse_protocol::UsbKind::Sound,
             label: "USB PnP Audio Device".into(),
             events: Vec::new(),
         }];

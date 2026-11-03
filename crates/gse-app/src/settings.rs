@@ -4,7 +4,7 @@
 //! edits that sandbox's own. A change is saved as soon as it is made.
 
 use gpui::{Context, Div, FontWeight, Hsla, IntoElement, SharedString, div, prelude::*, px};
-use gse_protocol::{Gpu, Request, ScreenMode, Settings, SupportLevel, SwitchMode};
+use gse_protocol::{Gpu, Request, ScreenMode, Settings, SupportLevel, SwitchMode, UsbKind};
 
 use crate::client::{self, Unanswered};
 use crate::text_input::TextInput;
@@ -59,6 +59,19 @@ fn gpu_line(gpu: &Gpu) -> (String, Hsla) {
             Theme::warning_text(),
         ),
         _ => (mode.to_owned(), Theme::muted()),
+    }
+}
+
+/// What a USB device of `kind` is, for people.
+const fn usb_kind_text(kind: UsbKind) -> &'static str {
+    match kind {
+        UsbKind::Sound => "Sound: a microphone or headset",
+        UsbKind::Camera => "A camera, usually with a microphone",
+        UsbKind::Gamepad => "A gamepad",
+        UsbKind::Bluetooth => "A Bluetooth adapter",
+        UsbKind::Storage => "A drive",
+        UsbKind::Input => "A keyboard or mouse",
+        UsbKind::Other => "Another USB device",
     }
 }
 
@@ -231,7 +244,7 @@ impl Rows {
     /// One row: what it is, a line under it, and its control.
     pub(crate) fn row(
         self,
-        title: &'static str,
+        title: impl Into<SharedString>,
         hint: Option<String>,
         control: impl IntoElement,
     ) -> Div {
@@ -242,7 +255,7 @@ impl Rows {
     /// [`Theme::danger`] for a failure.
     pub(crate) fn tinted_row(
         self,
-        title: &'static str,
+        title: impl Into<SharedString>,
         hint: Option<String>,
         color: Hsla,
         control: impl IntoElement,
@@ -265,7 +278,7 @@ impl Rows {
                         div()
                             .text_sm()
                             .when(headline, |t| t.font_weight(FontWeight::SEMIBOLD))
-                            .child(title),
+                            .child(title.into()),
                     )
                     .children(hint.map(|h| {
                         div()
@@ -661,10 +674,10 @@ impl Home {
             rates.sort_unstable();
         }
         let screen: Div = if let (true, Some(gpu)) = (single, chosen) {
-            div()
-                .text_size(px(13.))
-                .text_color(Theme::muted())
-                .child(crate::shell::monitor_text(gpu))
+            div().text_size(px(13.)).text_color(Theme::muted()).child(
+                crate::shell::monitor_mode(gpu)
+                    .map_or_else(|| "The monitor's own".to_owned(), |(size, _)| size),
+            )
         } else {
             self.menu(
                 Picker::new(
@@ -694,10 +707,11 @@ impl Home {
             )
         };
         let rate: Div = if single {
-            div()
-                .text_size(px(13.))
-                .text_color(Theme::muted())
-                .child("The monitor's own")
+            div().text_size(px(13.)).text_color(Theme::muted()).child(
+                chosen
+                    .and_then(crate::shell::monitor_mode)
+                    .map_or_else(|| "The monitor's own".to_owned(), |(_, rate)| rate),
+            )
         } else {
             self.menu(
                 Picker::new(
@@ -794,6 +808,97 @@ impl Home {
                 home.change(target, |d| d.internet = on, cx);
             })),
         )
+    }
+
+    /// The sandbox's devices: the board's sound card and each USB device
+    /// plugged into the host, with a switch that says whether the sandbox
+    /// takes it while it runs. The defaults follow its GPU's mode: on a
+    /// single GPU the host session is gone meanwhile, so the sound card and
+    /// USB sound devices, cameras and gamepads go; with another GPU nothing
+    /// does. None when the host has nothing to take.
+    pub(crate) fn devices_rows(&self, gpus: &[Gpu], cx: &mut Context<Self>) -> Option<Div> {
+        let target = Target::Sandbox;
+        let draft = self.draft_of(target)?;
+        let single = gpus
+            .iter()
+            .find(|g| g.address == draft.gpu)
+            .is_some_and(|g| g.mode == SwitchMode::Single);
+        let open = self.graphics_open(target);
+        let rows = rows_of(target);
+        let mut list = Vec::new();
+        if self.host_devices.board_sound {
+            let on = draft.devices.takes_board_sound(single);
+            list.push(
+                rows.row(
+                    "Sound card on the board",
+                    Some(
+                        "Its 3.5 mm jacks: speakers, headphones and a microphone; the host has no \
+                     sound from them meanwhile"
+                            .to_owned(),
+                    ),
+                    ui::switch("sandbox-board-sound", on, SwitchSize::Row)
+                        .disabled(!open)
+                        .on_change(cx.listener(move |home, on: &bool, _, cx| {
+                            let on = *on;
+                            home.change(
+                                target,
+                                |d| d.devices.board_sound = (on != single).then_some(on),
+                                cx,
+                            );
+                        })),
+                ),
+            );
+        }
+        for (i, device) in self
+            .host_devices
+            .usb
+            .iter()
+            .filter(|d| d.kind.offered())
+            .enumerate()
+        {
+            let on = draft.devices.takes_usb(&device.id, device.kind, single);
+            let (id, kind) = (device.id.clone(), device.kind);
+            let what = usb_kind_text(device.kind);
+            let hint = match device.kind {
+                UsbKind::Storage => {
+                    format!("{what}. Programs in the sandbox can read and change everything on it")
+                }
+                UsbKind::Bluetooth => {
+                    format!("{what}. The base image gets Bluetooth at its next build")
+                }
+                _ => what.to_owned(),
+            };
+            list.push(
+                rows.row(
+                    device.label.clone(),
+                    Some(hint),
+                    ui::switch(
+                        SharedString::from(format!("sandbox-usb-{i}")),
+                        on,
+                        SwitchSize::Row,
+                    )
+                    .disabled(!open)
+                    .on_change(cx.listener(move |home, on: &bool, _, cx| {
+                        let on = *on;
+                        home.change(target, |d| d.devices.choose_usb(&id, kind, on, single), cx);
+                    })),
+                ),
+            );
+        }
+        if list.is_empty() {
+            return None;
+        }
+        list.push(rows.note_row(
+            if single {
+                "Keyboards and mice reach the sandbox anyway and stay the way out.".to_owned()
+            } else {
+                "Keyboards and mice stay with the host; the sandbox gets them in its window."
+                    .to_owned()
+            },
+            Theme::muted(),
+            div(),
+        ));
+        Some(rows.group(Some("Devices"), list))
     }
 
     /// App settings: what new sandboxes start with.

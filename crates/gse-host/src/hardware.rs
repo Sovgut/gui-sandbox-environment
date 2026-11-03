@@ -437,14 +437,30 @@ pub fn describe(root: &Root) -> String {
             support.reason.unwrap_or_default()
         );
     }
-    for device in crate::usb::for_guest(root) {
+    describe_usb(root, &mut out);
+    out
+}
+
+/// The USB devices of the host, each with its kind and whether a
+/// single-GPU sandbox takes it by default.
+fn describe_usb(root: &Root, out: &mut String) {
+    let single = crate::usb::for_guest(root, &gse_protocol::Devices::default(), true);
+    for device in crate::usb::host_devices(root) {
         let _ = writeln!(
             out,
-            "usb {} {:04x}:{:04x} {} goes to a single-GPU sandbox",
-            device.name, device.vendor, device.product, device.label
+            "usb {} {:04x}:{:04x} {} {:?}{}",
+            device.name,
+            device.id.vendor,
+            device.id.product,
+            device.label,
+            device.kind,
+            if single.iter().any(|d| d.name == device.name) {
+                ", goes to a single-GPU sandbox by default"
+            } else {
+                ""
+            }
         );
     }
-    out
 }
 
 #[cfg(test)]

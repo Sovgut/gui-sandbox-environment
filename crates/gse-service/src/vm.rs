@@ -81,6 +81,8 @@ pub struct Launch {
     pub read_only_disks: Vec<PathBuf>,
     /// Carriers of files waiting for the Inbox (see `VmSpec::inbox_disks`).
     pub inbox_disks: Vec<PathBuf>,
+    /// The host devices it takes, beyond the defaults.
+    pub devices: gse_protocol::Devices,
     pub gpu: PciAddress,
     pub memory_mib: u32,
     pub cpus: u16,
@@ -172,6 +174,7 @@ pub fn run(root: &Root, args: &RunArgs, stop: &AtomicBool, dry_run: bool) -> Res
             .map(|p| fs::canonicalize(p).with_context(|| format!("disk {}", p.display())))
             .collect::<Result<Vec<_>>>()?,
         inbox_disks: Vec::new(),
+        devices: gse_protocol::Devices::default(),
         gpu: args.gpu,
         memory_mib: args.memory_mib,
         cpus: args.cpus,
@@ -205,7 +208,8 @@ pub fn launch_environment(
         create_screen(&screen, launch.owner.uid)?;
     }
     progress(Stage::SwitchingGpu);
-    let (attached, moved) = match gpu::attach(root, launch.gpu, dry_run) {
+    let (attached, moved) = match gpu::attach(root, launch.gpu, launch.devices.board_sound, dry_run)
+    {
         Ok(attached) => attached,
         Err(e) => {
             fs::remove_file(&screen).ok();
@@ -221,7 +225,7 @@ pub fn launch_environment(
     // host's keyboards and mice: the host session, and the app with it, is
     // gone until the environment stops.
     let single = gse_host::plan::Mode::for_gpu(&attached) == gse_host::plan::Mode::Single;
-    let (usb, host_input) = single_gpu_devices(root, &launch.name, single, dry_run);
+    let (usb, host_input) = guest_devices(root, &launch.name, &launch.devices, single, dry_run);
     // The guest reads the layouts from fw_cfg; a file keeps QEMU's option
     // parser away from their commas.
     let keyboard = launch.keyboard.as_ref().map(|keyboard| {
@@ -301,20 +305,22 @@ pub fn launch_environment(
     outcome.and(returned)
 }
 
-/// The USB devices and the keyboards and mice the environment `name`
-/// takes on a single-GPU machine; none with another GPU, where the host
-/// session stays.
-fn single_gpu_devices(
+/// The USB devices the environment `name` takes, as its `devices` choose,
+/// and on a single-GPU machine the keyboards and mice, which it takes
+/// there as well.
+fn guest_devices(
     root: &Root,
     name: &str,
+    devices: &gse_protocol::Devices,
     single: bool,
     dry_run: bool,
 ) -> (Vec<gse_host::usb::UsbDevice>, Vec<gse_host::vm::HostInput>) {
-    if !single {
-        return (Vec::new(), Vec::new());
-    }
-    let usb = single_gpu_usb(root, name, dry_run);
-    let input = single_gpu_input(&usb);
+    let usb = guest_usb(root, name, devices, single, dry_run);
+    let input = if single {
+        single_gpu_input(&usb)
+    } else {
+        Vec::new()
+    };
     (usb, input)
 }
 
@@ -337,12 +343,18 @@ fn single_gpu_input(usb: &[gse_host::usb::UsbDevice]) -> Vec<gse_host::vm::HostI
     found
 }
 
-/// The USB devices a single-GPU environment takes (see `gse_host::usb`),
-/// when this QEMU can take them. Their names wait in a state file while
-/// they are away, so a service that dies meanwhile gives them back when it
-/// starts again ([`recover`]).
-fn single_gpu_usb(root: &Root, name: &str, dry_run: bool) -> Vec<gse_host::usb::UsbDevice> {
-    let found = gse_host::usb::for_guest(root);
+/// The USB devices an environment takes (see `gse_host::usb`), when this
+/// QEMU can take them. Their names wait in a state file while they are
+/// away, so a service that dies meanwhile gives them back when it starts
+/// again ([`recover`]).
+fn guest_usb(
+    root: &Root,
+    name: &str,
+    devices: &gse_protocol::Devices,
+    single: bool,
+    dry_run: bool,
+) -> Vec<gse_host::usb::UsbDevice> {
+    let found = gse_host::usb::for_guest(root, devices, single);
     if found.is_empty() {
         return found;
     }
@@ -357,7 +369,7 @@ fn single_gpu_usb(root: &Root, name: &str, dry_run: bool) -> Vec<gse_host::usb::
         );
         return Vec::new();
     }
-    info!("single GPU: the environment takes the USB devices {labels}");
+    info!("the environment takes the USB devices {labels}");
     if !dry_run {
         let names: Vec<&str> = found.iter().map(|d| d.name.as_str()).collect();
         fs::write(usb_state_file(name), names.join("\n")).ok();

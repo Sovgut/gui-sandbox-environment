@@ -174,12 +174,21 @@ fn handoff_path(gpu: PciAddress) -> PathBuf {
     state_path(&format!("gpu-{gpu}.handoff"))
 }
 
-/// Hands the GPU to vfio-pci, with a free sound card in single mode, and
-/// returns the GPU as it was before and every function that moved. A
-/// failed attach returns them to the host.
-pub fn attach(root: &Root, gpu: PciAddress, dry_run: bool) -> Result<(Gpu, Vec<PciAddress>)> {
+/// Hands the GPU to vfio-pci, with the board's sound card when
+/// `board_sound` says so (by default in single mode), and returns the GPU
+/// as it was before and every function that moved. A failed attach returns
+/// them to the host.
+pub fn attach(
+    root: &Root,
+    gpu: PciAddress,
+    board_sound: Option<bool>,
+    dry_run: bool,
+) -> Result<(Gpu, Vec<PciAddress>)> {
     let system = HostSystem;
-    let snapshot = exec::snapshot(root, &system, gpu)?;
+    let mut snapshot = exec::snapshot(root, &system, gpu)?;
+    if !board_sound.unwrap_or(Mode::for_gpu(&snapshot.gpu) == Mode::Single) {
+        snapshot.sound_cards.clear();
+    }
     let gpu = snapshot.gpu.display().address;
     if snapshot.gpu.display().driver.as_deref() == Some(VFIO_PCI) {
         bail!("{gpu} is already on {VFIO_PCI}");

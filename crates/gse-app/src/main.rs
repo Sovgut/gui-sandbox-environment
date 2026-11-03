@@ -360,6 +360,8 @@ struct Home {
     /// Where the sandboxes are kept, as the service last said; the folder
     /// chosen to move them to, waiting for a yes; the move under way.
     storage: Option<client::Storage>,
+    /// The host's devices a sandbox can take, as last listed.
+    host_devices: client::HostDevices,
     storage_target: Option<std::path::PathBuf>,
     moving_storage: Option<transfer::Flow>,
     app_config: config::AppConfig,
@@ -477,6 +479,7 @@ impl Home {
             antivirus: None,
             finish_update: std::env::var_os(update::FINISH_UPDATE).is_some(),
             storage: None,
+            host_devices: client::HostDevices::default(),
             storage_target: None,
             moving_storage: None,
             app_config,
@@ -648,7 +651,7 @@ impl Home {
     fn reload(cx: &mut Context<Self>) {
         Self::reload_presets(cx);
         cx.spawn(async move |this, cx| {
-            let (loaded, settings, service, antivirus, storage) = cx
+            let (loaded, settings, service, antivirus, storage, devices) = cx
                 .background_executor()
                 .spawn(async {
                     let loaded = client::environments().and_then(|e| Ok((e, client::images()?)));
@@ -658,10 +661,14 @@ impl Home {
                         client::hello(),
                         client::antivirus(),
                         client::storage(),
+                        client::host_devices(),
                     )
                 })
                 .await;
             this.update(cx, |home, cx| {
+                if let Ok(devices) = devices {
+                    home.host_devices = devices;
+                }
                 if let Ok(antivirus) = antivirus {
                     home.antivirus = Some(antivirus);
                 }

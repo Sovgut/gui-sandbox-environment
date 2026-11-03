@@ -53,8 +53,10 @@ pub struct Snapshot {
     /// Running units of the host driver's
     /// [`crate::drivers::HostDriver::services`].
     pub gpu_services: Vec<String>,
-    /// Sound cards that go with the GPU in single mode (see
-    /// [`crate::pci::movable_sound_cards`]).
+    /// Sound cards that go with the GPU (see
+    /// [`crate::pci::movable_sound_cards`]): the speakers and microphone on
+    /// the board's jacks, by default only in single mode, where the host
+    /// session is gone and they are free.
     pub sound_cards: Vec<crate::pci::PciFunction>,
 }
 
@@ -308,17 +310,8 @@ pub fn attach(snapshot: &Snapshot) -> (Plan, Handoff) {
         }
     }
 
-    // With one GPU the host session is gone, so its sound card is free too
-    // and goes with it: the speakers and microphone on the board's jacks.
-    let moved: Vec<&crate::pci::PciFunction> = gpu
-        .functions
-        .iter()
-        .chain(if mode == Mode::Single {
-            snapshot.sound_cards.iter()
-        } else {
-            [].iter()
-        })
-        .collect();
+    let moved: Vec<&crate::pci::PciFunction> =
+        gpu.functions.iter().chain(&snapshot.sound_cards).collect();
     steps.push(Step::LoadModules(vec![VFIO_PCI.into()]));
     for function in &moved {
         let address = function.address;

@@ -1,17 +1,21 @@
-//! USB devices a sandbox takes on a single-GPU machine.
+//! USB devices of the host and the ones a sandbox takes.
 //!
-//! There the host session is gone while the sandbox runs, so the devices it
-//! would have used are free: a USB microphone or headset, a webcam, a
-//! gamepad. QEMU takes each whole (`usb-host`), detaching the host's drivers
-//! from it. Keyboards and mice stay with the host and reach the guest
-//! through `input-linux` instead, since the way out of the sandbox is read
-//! from them (see `VmSpec::host_input`); so do storage devices, which the
-//! host may be copying files from. A gamepad whose touchpad also shows up as
-//! a mouse goes as a gamepad, and that mouse with it.
+//! Each device gets a [`UsbKind`] from its interfaces and input devices,
+//! and a sandbox takes the ones its settings choose
+//! (`gse_protocol::Devices`): by default, on a single-GPU machine, where the
+//! host session is gone while the sandbox runs, a USB microphone or headset,
+//! a webcam, a gamepad; with another GPU, none. QEMU takes each whole
+//! (`usb-host`), detaching the host's drivers from it. Keyboards and mice
+//! are never taken: on a single GPU they reach the guest through
+//! `input-linux`, since the way out of the sandbox is read from them (see
+//! `VmSpec::host_input`). A gamepad whose touchpad also shows up as a mouse
+//! is a gamepad, and that mouse goes with it.
 //!
 //! Detaching the drivers lasts until something binds them again, which QEMU
 //! does not do when it is killed, so the service gives each device back by
 //! enumerating it anew ([`give_back`]).
+
+use gse_protocol::{Devices, HostUsb, UsbId, UsbKind};
 
 use crate::{Result, Root};
 
@@ -27,16 +31,17 @@ const AUDIO: u8 = 0x01;
 const MASS_STORAGE: u8 = 0x08;
 const HUB: u8 = 0x09;
 const VIDEO: u8 = 0x0e;
+const WIRELESS: u8 = 0xe0;
 
-/// A USB device for a sandbox.
+/// A USB device of the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsbDevice {
     /// Its name in sysfs, such as `1-2` or `3-1.4`.
     pub name: String,
     pub bus: u16,
     pub address: u16,
-    pub vendor: u16,
-    pub product: u16,
+    pub id: UsbId,
+    pub kind: UsbKind,
     /// What it calls itself, for people.
     pub label: String,
     /// Its input event nodes (`/dev/input/eventN`), which leave the host
@@ -106,11 +111,55 @@ fn hex(root: &Root, path: &str) -> Option<u16> {
     u16::from_str_radix(root.read_opt(path)?.trim(), 16).ok()
 }
 
-/// The USB devices a sandbox takes on a single-GPU machine: every one with
-/// a sound or video interface, or that is a gamepad, unless it is also a
-/// keyboard or holds storage.
+/// What a device with these interface classes and input devices is. A
+/// keyboard is a keyboard whatever else it has, a gamepad a gamepad even
+/// with a touchpad mouse; a webcam has sound too.
+fn kind(interfaces: &[u8], own: &[&Input]) -> UsbKind {
+    let gamepad = own.iter().any(|i| i.joystick);
+    if own.iter().any(|i| i.keyboard) || (own.iter().any(|i| i.mouse) && !gamepad) {
+        UsbKind::Input
+    } else if gamepad {
+        UsbKind::Gamepad
+    } else if interfaces.contains(&MASS_STORAGE) {
+        UsbKind::Storage
+    } else if interfaces.contains(&VIDEO) {
+        UsbKind::Camera
+    } else if interfaces.contains(&AUDIO) {
+        UsbKind::Sound
+    } else if interfaces.contains(&WIRELESS) {
+        UsbKind::Bluetooth
+    } else {
+        UsbKind::Other
+    }
+}
+
+/// The USB devices a sandbox whose settings name `devices` takes, on a
+/// single-GPU machine when `single`.
 #[must_use]
-pub fn for_guest(root: &Root) -> Vec<UsbDevice> {
+pub fn for_guest(root: &Root, devices: &Devices, single: bool) -> Vec<UsbDevice> {
+    host_devices(root)
+        .into_iter()
+        .filter(|d| devices.takes_usb(&d.id, d.kind, single))
+        .collect()
+}
+
+/// Every USB device plugged into the host but its hubs, as the settings
+/// list them.
+#[must_use]
+pub fn listed(root: &Root) -> Vec<HostUsb> {
+    host_devices(root)
+        .into_iter()
+        .map(|d| HostUsb {
+            id: d.id,
+            label: d.label,
+            kind: d.kind,
+        })
+        .collect()
+}
+
+/// Every USB device plugged into the host but its hubs.
+#[must_use]
+pub fn host_devices(root: &Root) -> Vec<UsbDevice> {
     let inputs = inputs(&root.read_opt(INPUT_DEVICES).unwrap_or_default());
     let mut devices = Vec::new();
     for name in root.list(USB_DEVICES) {
@@ -133,14 +182,6 @@ pub fn for_guest(root: &Root) -> Vec<UsbDevice> {
             .filter_map(|i| class(&format!("{USB_DEVICES}/{i}/bInterfaceClass")))
             .collect();
         let own: Vec<&Input> = inputs.iter().filter(|i| inside(&i.sysfs, &name)).collect();
-        let media = interfaces.iter().any(|c| matches!(*c, AUDIO | VIDEO));
-        let gamepad = own.iter().any(|i| i.joystick);
-        let keyboard = own.iter().any(|i| i.keyboard);
-        let storage = interfaces.contains(&MASS_STORAGE);
-        let mouse_only = own.iter().any(|i| i.mouse) && !gamepad;
-        if !(media || gamepad) || keyboard || storage || mouse_only {
-            continue;
-        }
         let number = |file: &str| root.read_opt(format!("{dir}/{file}"))?.trim().parse().ok();
         let (Some(bus), Some(address)) = (number("busnum"), number("devnum")) else {
             continue;
@@ -149,8 +190,15 @@ pub fn for_guest(root: &Root) -> Vec<UsbDevice> {
             label: root
                 .read_opt(format!("{dir}/product"))
                 .map_or_else(|| name.clone(), |p| p.trim().to_owned()),
-            vendor: hex(root, &format!("{dir}/idVendor")).unwrap_or_default(),
-            product: hex(root, &format!("{dir}/idProduct")).unwrap_or_default(),
+            id: UsbId {
+                vendor: hex(root, &format!("{dir}/idVendor")).unwrap_or_default(),
+                product: hex(root, &format!("{dir}/idProduct")).unwrap_or_default(),
+                serial: root
+                    .read_opt(format!("{dir}/serial"))
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty()),
+            },
+            kind: kind(&interfaces, &own),
             events: own.iter().filter_map(|i| i.event.clone()).collect(),
             name,
             bus,
@@ -253,15 +301,31 @@ mod tests {
     #[test]
     fn microphones_webcams_and_gamepads_go_and_the_rest_stays() {
         let (_dir, root) = machine();
-        let devices = for_guest(&root);
+        let devices = for_guest(&root, &Devices::default(), true);
         let names: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, ["1-1.5", "1-2", "3-1"]);
+        // With another GPU the host keeps them unless the settings say.
+        assert_eq!(for_guest(&root, &Devices::default(), false), Vec::new());
+        let kinds: Vec<(String, UsbKind)> = listed(&root)
+            .into_iter()
+            .map(|d| (d.label, d.kind))
+            .collect();
+        assert!(kinds.contains(&("Flash Disk".into(), UsbKind::Storage)));
+        assert!(kinds.contains(&("Keychron Q6 Max".into(), UsbKind::Input)));
+        assert!(kinds.contains(&("HD Webcam".into(), UsbKind::Camera)));
+        let mut chosen = Devices::default();
+        let disk = listed(&root)
+            .into_iter()
+            .find(|d| d.kind == UsbKind::Storage)
+            .unwrap();
+        chosen.choose_usb(&disk.id, disk.kind, true, true);
+        assert_eq!(for_guest(&root, &chosen, true).len(), 4);
         let gamepad = &devices[0];
         assert_eq!(gamepad.label, "DualSense Wireless Controller");
         // Its touchpad, a mouse, leaves the host with it.
         assert_eq!(gamepad.events, ["/dev/input/event28", "/dev/input/event30"]);
         let microphone = &devices[1];
-        assert_eq!((microphone.bus, microphone.vendor), (1, 0x0c76));
+        assert_eq!((microphone.bus, microphone.id.vendor), (1, 0x0c76));
     }
 
     #[test]

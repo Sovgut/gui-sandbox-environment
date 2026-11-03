@@ -45,12 +45,24 @@ fn has_guest_program() -> bool {
 
 /// The guest driver packs the base image needs for the GPUs the settings
 /// name, new environments' and each environment's own, with the drivers
-/// chosen for them (see `gse_host::hardware::packs`).
+/// chosen for them (see `gse_host::hardware::packs`), and `bluetooth` when
+/// an environment takes a Bluetooth adapter plugged in now.
 fn base_packs(root: &Root, config: &Config, store: &Store) -> Result<Vec<&'static str>> {
     let defaults = config.settings();
     let mut named = vec![(defaults.gpu.clone(), defaults.gpu_driver.clone())];
+    let mut bluetooth = false;
+    let adapters: Vec<gse_protocol::UsbId> = gse_host::usb::listed(root)
+        .into_iter()
+        .filter(|d| d.kind == gse_protocol::UsbKind::Bluetooth)
+        .map(|d| d.id)
+        .collect();
     named.extend(store.environments().into_iter().map(|(name, _)| {
         let settings = store.settings(&name, &defaults);
+        bluetooth |= settings
+            .devices
+            .usb
+            .iter()
+            .any(|c| c.take && adapters.contains(&c.id));
         (settings.gpu, settings.gpu_driver)
     }));
     let gpus: Vec<(gse_host::families::Family, Option<String>)> = named
@@ -66,7 +78,11 @@ fn base_packs(root: &Root, config: &Config, store: &Store) -> Result<Vec<&'stati
         .collect();
     let chosen: Vec<(gse_host::families::Family, Option<&str>)> =
         gpus.iter().map(|(f, d)| (*f, d.as_deref())).collect();
-    gse_host::hardware::packs(&chosen).map_err(anyhow::Error::msg)
+    let mut packs = gse_host::hardware::packs(&chosen).map_err(anyhow::Error::msg)?;
+    if bluetooth {
+        packs.push("bluetooth");
+    }
+    Ok(packs)
 }
 
 /// How a start's journal line begins; the time a sandbox last played is
@@ -237,6 +253,7 @@ impl Config {
             screen_mode: self.screen_mode.clone(),
             internet: self.internet,
             gpu_driver: self.gpu_driver.clone(),
+            devices: gse_protocol::Devices::default(),
         }
     }
 }
@@ -293,6 +310,7 @@ fn validate(settings: &Settings, gpus: &[gse_protocol::Gpu]) -> Result<Settings>
         screen_mode: mode.to_string(),
         internet: settings.internet,
         gpu_driver,
+        devices: settings.devices.clone(),
     })
 }
 
@@ -1062,6 +1080,7 @@ impl Service {
                 disk: shared.store.disk(name),
                 read_only_disks: Vec::new(),
                 inbox_disks: inbox_disks.clone(),
+                devices: settings.devices.clone(),
                 gpu,
                 memory_mib: shared.config.memory_mib,
                 cpus: shared.config.cpus,
@@ -2041,6 +2060,21 @@ impl Service {
                     },
                 )?;
             }
+            Request::HostDevices => {
+                let (root, gpu) = {
+                    let shared = self.lock();
+                    (shared.root.clone(), shared.config.gpu)
+                };
+                let board_sound = gse_host::pci::Gpu::read(&root, gpu)
+                    .is_ok_and(|gpu| !gse_host::pci::movable_sound_cards(&root, &gpu).is_empty());
+                send(
+                    out,
+                    &Reply::HostDevices {
+                        usb: gse_host::usb::listed(&root),
+                        board_sound,
+                    },
+                )?;
+            }
             Request::Hardware => {
                 let root = self.lock().root.clone();
                 let cpu = gse_host::hardware::Cpu::read(&root)
@@ -2519,12 +2553,14 @@ mod tests {
             screen_mode: screen_mode.into(),
             internet: true,
             gpu_driver: None,
+            devices: gse_protocol::Devices::default(),
         };
         let checked = validate(&settings("0e:00.0", "3840x2160@120"), &gpus).unwrap();
         assert_eq!(checked.gpu, "0000:0e:00.0");
         assert_eq!(checked.screen_mode, "3840x2160@120");
         let with = |driver: &str| Settings {
             gpu_driver: Some(driver.into()),
+            devices: gse_protocol::Devices::default(),
             ..settings("0e:00.0", "1920x1080@60")
         };
         assert_eq!(
@@ -2629,6 +2665,7 @@ mod tests {
             screen_mode: "2560x1440@60".into(),
             internet: true,
             gpu_driver: None,
+            devices: gse_protocol::Devices::default(),
         }
     }
 
@@ -2656,6 +2693,7 @@ mod tests {
             screen_mode: "1920x1080@144".into(),
             internet: false,
             gpu_driver: None,
+            devices: gse_protocol::Devices::default(),
         };
         store.set_settings("a", &own).unwrap();
         assert_eq!(store.settings("a", &defaults()), own);

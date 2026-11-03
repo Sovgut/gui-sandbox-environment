@@ -31,6 +31,7 @@ pub fn settings(gpu: &str) -> Settings {
         screen_mode: "2560x1440@60".into(),
         internet: true,
         gpu_driver: None,
+        devices: gse_protocol::Devices::default(),
     }
 }
 
@@ -566,6 +567,35 @@ pub fn files() -> GuestFiles {
 
 /// A stopped sandbox's: files waiting for its next start, and what was
 /// taken out of it while it ran on the whole screen.
+/// The host's devices: a USB microphone, a gamepad, a flash drive and the
+/// keyboard, which no sandbox takes, beside the board's sound card.
+pub fn host_devices() -> crate::client::HostDevices {
+    use gse_protocol::{HostUsb, UsbId, UsbKind};
+    let usb = |vendor, product, label: &str, kind| HostUsb {
+        id: UsbId {
+            vendor,
+            product,
+            serial: None,
+        },
+        label: label.to_owned(),
+        kind,
+    };
+    crate::client::HostDevices {
+        usb: vec![
+            usb(0x0c76, 0x161e, "Fifine K669 Microphone", UsbKind::Sound),
+            usb(
+                0x054c,
+                0x0ce6,
+                "DualSense Wireless Controller",
+                UsbKind::Gamepad,
+            ),
+            usb(0x0781, 0x5581, "SanDisk Ultra", UsbKind::Storage),
+            usb(0x3434, 0x0860, "Keychron Q6 Max", UsbKind::Input),
+        ],
+        board_sound: true,
+    }
+}
+
 pub fn files_between_runs() -> GuestFiles {
     GuestFiles {
         inbox: vec![

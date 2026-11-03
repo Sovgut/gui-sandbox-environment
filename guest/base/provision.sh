@@ -85,6 +85,13 @@ pack_intel_media() {
     test -e /usr/lib64/dri/iHD_drv_video.so
 }
 
+# BlueZ and a tray applet, for a Bluetooth adapter the host hands over.
+pack_bluetooth() {
+    dnf -y install bluez blueman
+    systemctl enable bluetooth.service
+    test -x /usr/libexec/bluetooth/bluetoothd
+}
+
 for pack in $packs; do
     step "driver $pack"
     case "$pack" in
@@ -92,6 +99,7 @@ for pack in $packs; do
         nvidia) pack_nvidia ;;
         nvidia-legacy) pack_nvidia_legacy ;;
         intel-media) pack_intel_media ;;
+        bluetooth) pack_bluetooth ;;
         *) echo "unknown driver pack '$pack'" > /dev/ttyS0; false ;;
     esac
 done

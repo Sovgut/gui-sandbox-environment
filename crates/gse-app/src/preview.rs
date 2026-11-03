@@ -101,6 +101,7 @@ impl Home {
         self.connected = Some(true);
         self.service = client::Match::Same;
         self.settings = Ok((data::settings(data::SPARE_GPU), data::gpus()));
+        self.host_devices = data::host_devices();
         self.draft = Some(data::settings(data::SPARE_GPU));
         self.images = vec!["launchers".into(), "desktop".into()];
         self.environments = data::environments();

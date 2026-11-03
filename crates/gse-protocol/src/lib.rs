@@ -33,7 +33,7 @@ pub const SOCKET: &str = "/run/gse/service.sock";
 /// The protocol's version: a client and a service speak to each other only
 /// when theirs match ([`Request::Hello`]). It changes with every change to
 /// the messages.
-pub const VERSION: u32 = 13;
+pub const VERSION: u32 = 14;
 
 /// The name a build of the base image goes by wherever a preset's name
 /// would stand: in [`Event::Build`], [`Event::BuildFinished`] and
@@ -166,6 +166,8 @@ pub enum Request {
     Antivirus,
     /// What the service reads about the machine: [`Reply::Hardware`].
     Hardware,
+    /// The devices of the host a sandbox can take: [`Reply::HostDevices`].
+    HostDevices,
     /// Where the sandboxes are kept: [`Reply::Storage`].
     Storage,
     /// Move everything the service keeps to the folder `gse` in `to`, or
@@ -258,6 +260,12 @@ pub enum Reply {
     Hardware {
         text: String,
         cpu: Support,
+    },
+    /// The USB devices plugged into the host, and whether it has a sound
+    /// card a sandbox can take whole (the board's, behind its 3.5 mm jacks).
+    HostDevices {
+        usb: Vec<HostUsb>,
+        board_sound: bool,
     },
     Journal {
         entries: Vec<JournalEntry>,
@@ -801,6 +809,56 @@ pub mod carrier {
     }
 }
 
+#[cfg(test)]
+mod devices_tests {
+    use super::*;
+
+    #[test]
+    fn choices_override_the_defaults_of_each_mode() {
+        let mic = UsbId {
+            vendor: 0x0c76,
+            product: 0x161e,
+            serial: None,
+        };
+        let mut devices = Devices::default();
+        assert!(devices.takes_usb(&mic, UsbKind::Sound, true));
+        assert!(!devices.takes_usb(&mic, UsbKind::Sound, false));
+        assert!(!devices.takes_usb(&mic, UsbKind::Storage, true));
+        assert!(!devices.takes_usb(&mic, UsbKind::Input, true));
+        devices.choose_usb(&mic, UsbKind::Sound, true, false);
+        assert!(devices.takes_usb(&mic, UsbKind::Sound, false));
+        devices.choose_usb(&mic, UsbKind::Sound, false, true);
+        assert!(!devices.takes_usb(&mic, UsbKind::Sound, true));
+        devices.choose_usb(&mic, UsbKind::Sound, true, true);
+        assert!(devices.is_empty());
+        assert!(devices.takes_board_sound(true));
+        assert!(!devices.takes_board_sound(false));
+    }
+
+    #[test]
+    fn settings_with_devices_survive_toml() {
+        let settings = Settings {
+            gpu: "0000:09:00.0".into(),
+            screen_mode: "1920x1080@60".into(),
+            internet: true,
+            gpu_driver: None,
+            devices: Devices {
+                board_sound: Some(false),
+                usb: vec![UsbChoice {
+                    id: UsbId {
+                        vendor: 1,
+                        product: 2,
+                        serial: Some("A1".into()),
+                    },
+                    take: true,
+                }],
+            },
+        };
+        let text = toml::to_string(&settings).unwrap();
+        assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
+    }
+}
+
 /// One line of an environment's journal, written by the service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalEntry {
@@ -936,6 +994,117 @@ pub struct Settings {
     /// [`Gpu::guest_drivers`]; none for the GPU's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_driver: Option<String>,
+    /// The host's devices it takes while it runs, beyond the defaults.
+    /// Last, since in TOML a table follows the plain values.
+    #[serde(default, skip_serializing_if = "Devices::is_empty")]
+    pub devices: Devices,
+}
+
+/// A USB device by what it is rather than where it is plugged in.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UsbId {
+    pub vendor: u16,
+    pub product: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+}
+
+/// What a USB device is, as far as a sandbox cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UsbKind {
+    /// A microphone, a headset, a sound card.
+    Sound,
+    /// A webcam, usually with a microphone.
+    Camera,
+    Gamepad,
+    Bluetooth,
+    /// A flash drive or a disk.
+    Storage,
+    /// A keyboard or a mouse: it reaches a single-GPU sandbox through QEMU's
+    /// `input-linux`, since the way out is read from it, and is never taken.
+    Input,
+    Other,
+}
+
+impl UsbKind {
+    /// Whether a single-GPU sandbox takes it unless its settings say no.
+    #[must_use]
+    pub const fn by_default(self) -> bool {
+        matches!(self, Self::Sound | Self::Camera | Self::Gamepad)
+    }
+
+    /// Whether a sandbox may take it at all.
+    #[must_use]
+    pub const fn offered(self) -> bool {
+        !matches!(self, Self::Input)
+    }
+}
+
+/// A USB device of the host, as the settings list it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostUsb {
+    pub id: UsbId,
+    /// What it calls itself.
+    pub label: String,
+    pub kind: UsbKind,
+}
+
+/// Whether a sandbox takes one USB device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbChoice {
+    pub id: UsbId,
+    pub take: bool,
+}
+
+/// The host devices a sandbox takes while it runs, where its settings
+/// differ from the defaults: on a single-GPU machine, where the host
+/// session is gone meanwhile, the board's sound card and USB sound devices,
+/// cameras and gamepads; with another GPU, none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Devices {
+    /// The board's sound card, behind its 3.5 mm jacks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_sound: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usb: Vec<UsbChoice>,
+}
+
+impl Devices {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.board_sound.is_none() && self.usb.is_empty()
+    }
+
+    /// Whether the sandbox takes the board's sound card, on a single-GPU
+    /// machine when `single`.
+    #[must_use]
+    pub fn takes_board_sound(&self, single: bool) -> bool {
+        self.board_sound.unwrap_or(single)
+    }
+
+    /// Whether the sandbox takes the USB device `id` of `kind`.
+    #[must_use]
+    pub fn takes_usb(&self, id: &UsbId, kind: UsbKind, single: bool) -> bool {
+        kind.offered()
+            && self
+                .usb
+                .iter()
+                .find(|c| c.id == *id)
+                .map_or(single && kind.by_default(), |c| c.take)
+    }
+
+    /// Records whether the sandbox takes `id`; a choice that matches what
+    /// it does anyway, on a single GPU when `single`, is dropped.
+    pub fn choose_usb(&mut self, id: &UsbId, kind: UsbKind, take: bool, single: bool) {
+        self.usb.retain(|c| c.id != *id);
+        if take != (single && kind.by_default()) {
+            self.usb.push(UsbChoice {
+                id: id.clone(),
+                take,
+            });
+        }
+    }
 }
 
 const fn internet_by_default() -> bool {
@@ -1180,6 +1349,7 @@ mod tests {
                 screen_mode: "1920x1080@144".into(),
                 internet: true,
                 gpu_driver: None,
+                devices: crate::Devices::default(),
             },
         };
         send(&mut wire, &request).unwrap();
@@ -1196,6 +1366,7 @@ mod tests {
                 screen_mode: "2560x1440@60".into(),
                 internet: true,
                 gpu_driver: None,
+                devices: crate::Devices::default(),
             },
             gpus: vec![Gpu {
                 address: "0000:0e:00.0".into(),
@@ -1339,6 +1510,7 @@ mod tests {
                     screen_mode: "1920x1080@60".into(),
                     internet: true,
                     gpu_driver: None,
+                    devices: crate::Devices::default(),
                 },
             },
             Request::Presets,

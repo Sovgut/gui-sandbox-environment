@@ -192,7 +192,7 @@ fn run(cli: &Cli) -> Result<()> {
             GpuAction::Holders { gpu } => gpu::holders(&root, *gpu),
             GpuAction::Attach { gpu } => {
                 require_root(cli.dry_run)?;
-                gpu::attach(&root, *gpu, cli.dry_run).map(drop)
+                gpu::attach(&root, *gpu, None, cli.dry_run).map(drop)
             }
             GpuAction::Detach { gpu } => {
                 require_root(cli.dry_run)?;

@@ -104,6 +104,24 @@ pub fn storage() -> Result<Storage> {
     found.context("no storage in the reply")
 }
 
+/// The host's devices a sandbox can take.
+#[derive(Debug, Clone, Default)]
+pub struct HostDevices {
+    pub usb: Vec<gse_protocol::HostUsb>,
+    /// Whether the board has a sound card a sandbox can take whole.
+    pub board_sound: bool,
+}
+
+pub fn host_devices() -> Result<HostDevices> {
+    let mut found = None;
+    call(&Request::HostDevices, |reply| {
+        if let Reply::HostDevices { usb, board_sound } = reply {
+            found = Some(HostDevices { usb, board_sound });
+        }
+    })?;
+    found.context("no devices in the reply")
+}
+
 /// Moves the sandboxes to the disk of `to`, telling `progress` the bytes
 /// moved and in all.
 pub fn move_storage(to: &std::path::Path, mut progress: impl FnMut(u64, u64)) -> Result<()> {

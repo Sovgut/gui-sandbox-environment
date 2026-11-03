@@ -253,17 +253,18 @@ impl Antivirus {
                 engine.join("etc/certs").display()
             ),
         )?;
-        let output = confined(&engine, &[&database], true)
-            .arg(engine.join("bin/freshclam"))
-            .arg(format!("--config-file={}", config.display()))
-            .arg("--stdout")
-            .output()
-            .context("starting freshclam")?;
-        if !output.status.success() {
-            bail!(
-                "freshclam failed: {}",
-                last_line(&output.stdout, &output.stderr)
-            );
+        let ran = self.run_confined(
+            &engine,
+            &[&database],
+            true,
+            &[
+                engine.join("bin/freshclam").into_os_string(),
+                format!("--config-file={}", config.display()).into(),
+                "--stdout".into(),
+            ],
+        )?;
+        if ran.code != Some(0) {
+            bail!("freshclam failed: {}", last_line(&ran.stdout, &ran.stderr));
         }
         Ok(())
     }
@@ -282,10 +283,12 @@ impl Antivirus {
             bail!("the antivirus's signatures are missing or older than a week");
         }
         let engine = self.engine_dir(&version);
-        let output = confined(&engine, &[], false)
-            .arg(engine.join("bin/clamscan"))
-            .arg(format!("--database={}", self.database().display()))
-            .args([
+        let mut args = vec![
+            engine.join("bin/clamscan").into_os_string(),
+            format!("--database={}", self.database().display()).into(),
+        ];
+        args.extend(
+            [
                 "--infected",
                 "--no-summary",
                 "--stdout",
@@ -293,58 +296,131 @@ impl Antivirus {
                 "--max-filesize=4000M",
                 "--max-scansize=4000M",
                 "--alert-exceeds-max=yes",
-            ])
-            .arg(dir)
-            .output()
-            .context("starting clamscan")?;
-        match output.status.code() {
+            ]
+            .map(std::ffi::OsString::from),
+        );
+        args.push(dir.as_os_str().to_owned());
+        let ran = self.run_confined(&engine, &[], false, &args)?;
+        match ran.code {
             Some(0) => Ok(Vec::new()),
-            Some(1) => Ok(found(&String::from_utf8_lossy(&output.stdout))),
-            _ => bail!(
-                "clamscan failed: {}",
-                last_line(&output.stdout, &output.stderr)
-            ),
+            Some(1) => Ok(found(&String::from_utf8_lossy(&ran.stdout))),
+            _ => bail!("clamscan failed: {}", last_line(&ran.stdout, &ran.stderr)),
         }
+    }
+
+    /// Runs `args` (a program of `engine` first) as [`ACCOUNT`] and waits
+    /// for it. It runs as a transient unit: no privileges, the system
+    /// read-only but for `writable`, no network unless `network`, the
+    /// engine's own libraries first. Its output goes to files the manager
+    /// opens, since handing pipes over D-Bus fails on some systems
+    /// (Bazzite's manager drops the request). Where no transient unit can
+    /// start at all, it runs as [`ACCOUNT`] directly, with fewer walls.
+    fn run_confined(
+        &self,
+        engine: &Path,
+        writable: &[&Path],
+        network: bool,
+        args: &[std::ffi::OsString],
+    ) -> Result<Ran> {
+        let runs = self.root.join("runs");
+        fs::create_dir_all(&runs)?;
+        fs::set_permissions(&runs, fs::Permissions::from_mode(0o700))?;
+        let (out, err) = (runs.join("stdout"), runs.join("stderr"));
+        fs::remove_file(&out).ok();
+        fs::remove_file(&err).ok();
+        let libraries = engine.join("lib64");
+        let mut unit = Command::new("systemd-run");
+        unit.args([
+            "--wait",
+            "--quiet",
+            "--collect",
+            "--service-type=exec",
+            &format!("--property=User={ACCOUNT}"),
+            &format!("--property=Group={ACCOUNT}"),
+            "--property=NoNewPrivileges=yes",
+            "--property=ProtectSystem=strict",
+            "--property=ProtectHome=yes",
+            "--property=PrivateTmp=yes",
+            "--property=PrivateDevices=yes",
+            "--property=ProtectKernelTunables=yes",
+            "--property=ProtectKernelModules=yes",
+            "--property=ProtectControlGroups=yes",
+            "--property=RestrictSUIDSGID=yes",
+            "--property=LockPersonality=yes",
+            "--property=MemoryMax=4G",
+            &format!("--property=StandardOutput=truncate:{}", out.display()),
+            &format!("--property=StandardError=truncate:{}", err.display()),
+            &format!("--setenv=LD_LIBRARY_PATH={}", libraries.display()),
+        ]);
+        if !network {
+            unit.arg("--property=PrivateNetwork=yes");
+        }
+        for path in writable {
+            unit.arg(format!("--property=ReadWritePaths={}", path.display()));
+        }
+        let started = unit
+            .arg("--")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .context("starting systemd-run")?;
+        let manager = String::from_utf8_lossy(&started.stderr);
+        if !manager.contains("Failed to start transient") {
+            return Ok(Ran {
+                code: started.status.code(),
+                stdout: fs::read(&out).unwrap_or_default(),
+                stderr: fs::read(&err).unwrap_or_else(|_| started.stderr.clone()),
+            });
+        }
+        warn!(
+            "no transient unit for the antivirus ({}); running it as {ACCOUNT} directly",
+            manager.trim()
+        );
+        let (uid, gid) = account_ids()?;
+        let (program, rest) = args.split_first().context("nothing to run")?;
+        let output = {
+            use std::os::unix::process::CommandExt as _;
+            Command::new(program)
+                .args(rest)
+                .env_clear()
+                .env("LD_LIBRARY_PATH", &libraries)
+                .env("PATH", "/usr/bin:/bin")
+                .uid(uid)
+                .gid(gid)
+                .current_dir("/")
+                .stdin(Stdio::null())
+                .output()
+                .context("starting the antivirus")?
+        };
+        Ok(Ran {
+            code: output.status.code(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
     }
 }
 
-/// A transient unit running a program of `engine` as [`ACCOUNT`]: no
-/// privileges, the system read-only but for `writable`, no network unless
-/// `network`, the engine's own libraries first.
-fn confined(engine: &Path, writable: &[&Path], network: bool) -> Command {
-    let mut command = Command::new("systemd-run");
-    command.args([
-        "--wait",
-        "--pipe",
-        "--quiet",
-        "--collect",
-        "--service-type=exec",
-        &format!("--property=User={ACCOUNT}"),
-        &format!("--property=Group={ACCOUNT}"),
-        "--property=NoNewPrivileges=yes",
-        "--property=ProtectSystem=strict",
-        "--property=ProtectHome=yes",
-        "--property=PrivateTmp=yes",
-        "--property=PrivateDevices=yes",
-        "--property=ProtectKernelTunables=yes",
-        "--property=ProtectKernelModules=yes",
-        "--property=ProtectControlGroups=yes",
-        "--property=RestrictSUIDSGID=yes",
-        "--property=LockPersonality=yes",
-        "--property=MemoryMax=4G",
-        &format!(
-            "--setenv=LD_LIBRARY_PATH={}",
-            engine.join("lib64").display()
-        ),
-    ]);
-    if !network {
-        command.arg("--property=PrivateNetwork=yes");
-    }
-    for path in writable {
-        command.arg(format!("--property=ReadWritePaths={}", path.display()));
-    }
-    command.arg("--").stdin(Stdio::null());
-    command
+/// How a run of the antivirus ended, and what it printed.
+struct Ran {
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// The user and group ids of [`ACCOUNT`].
+fn account_ids() -> Result<(u32, u32)> {
+    let id = |flag: &str| -> Result<u32> {
+        let output = Command::new("id")
+            .args([flag, ACCOUNT])
+            .stderr(Stdio::null())
+            .output()
+            .context("starting id")?;
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .with_context(|| format!("there is no account {ACCOUNT}"))
+    };
+    Ok((id("-u")?, id("-g")?))
 }
 
 /// Gives `path` to [`ACCOUNT`].

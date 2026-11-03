@@ -362,7 +362,137 @@ fn outbox_list(listed: Listed, empty: &'static str) -> Option<gpui::Stateful<Div
     Some(list)
 }
 
+/// Which buffer of the host a file is in while its sandbox is stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Buffer {
+    /// Waiting for the Inbox at the next start.
+    Waiting,
+    /// Taken out of the Outbox during a run, for the app to take.
+    Taken,
+}
+
 impl Home {
+    /// Removes `paths` from the host's `buffer` of `name`, then lists its
+    /// files again.
+    fn remove_buffered(
+        &mut self,
+        name: &str,
+        buffer: Buffer,
+        paths: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() || self.preview_skips("removing files from the buffer", cx) {
+            return;
+        }
+        let key = format!("{name}/files");
+        self.busy.insert(key.clone(), "Removing files");
+        cx.notify();
+        let (waiting, taken) = match buffer {
+            Buffer::Waiting => (paths, Vec::new()),
+            Buffer::Taken => (Vec::new(), paths),
+        };
+        let request = Request::RemoveBuffered {
+            name: name.to_owned(),
+            waiting,
+            taken,
+        };
+        let name = name.to_owned();
+        cx.spawn(async move |this, cx| {
+            let removed = cx
+                .background_executor()
+                .spawn(async move { client::command(&request) })
+                .await;
+            this.update(cx, |home, cx| {
+                home.busy.remove(&key);
+                if let Err(e) = removed {
+                    home.say(format!("The files were not removed: {e:#}"), true);
+                }
+                Self::load_files(&name, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The files of `buffer` as a list, each with a button that removes it,
+    /// and one under the list that removes them all.
+    fn buffer_list(
+        name: &str,
+        buffer: Buffer,
+        files: &[GuestFile],
+        busy: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let tag = match buffer {
+            Buffer::Waiting => "waiting",
+            Buffer::Taken => "taken",
+        };
+        let mut list = div()
+            .id(gpui::SharedString::from(format!("{tag}-files")))
+            .flex()
+            .flex_col()
+            .max_h(px(180.))
+            .overflow_y_scroll()
+            .rounded(px(10.))
+            .bg(Theme::well())
+            .border_1()
+            .border_color(Theme::border())
+            .text_size(px(13.));
+        for (i, file) in files.iter().enumerate() {
+            let (owner, path) = (name.to_owned(), file.path.clone());
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .pl_3()
+                    .pr_1()
+                    .py(px(5.))
+                    .when(i > 0, |row| row.border_t_1().border_color(Theme::divider()))
+                    .child(div().flex_1().min_w_0().truncate().child(file.path.clone()))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(Theme::muted())
+                            .child(size_text(file.size)),
+                    )
+                    .child(
+                        ui::small_icon_button(
+                            gpui::SharedString::from(format!("remove-{tag}-{i}")),
+                            Icon::Trash,
+                            "Remove it from the host",
+                            Kind::Danger,
+                            cx.listener(move |home, _, _, cx| {
+                                home.remove_buffered(&owner, buffer, vec![path.clone()], cx);
+                            }),
+                        )
+                        .icon_size(12.)
+                        .when(busy, |b| b.disabled(true)),
+                    ),
+            );
+        }
+        let all: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+        let owner = name.to_owned();
+        div().flex().flex_col().gap_2().child(list).child(
+            div().flex().justify_end().child(
+                button(
+                    gpui::SharedString::from(format!("remove-all-{tag}")),
+                    match files.len() {
+                        1 => "Remove it".to_owned(),
+                        n => format!("Remove all {n}"),
+                    },
+                    Kind::Secondary,
+                    !busy,
+                    cx.listener(move |home, _, _, cx| {
+                        home.remove_buffered(&owner, buffer, all.clone(), cx);
+                    }),
+                )
+                .size(Size::Toolbar)
+                .icon(Icon::Trash),
+            ),
+        )
+    }
+
     pub(crate) fn open_transfer(&mut self, name: &str, cx: &mut Context<Self>) {
         self.moved = None;
         self.modal = Some(Modal::Transfer {
@@ -831,14 +961,24 @@ impl Home {
                     )
                 },
             ))
-            .children(outbox_list(
-                outbox,
-                if up {
-                    "The Outbox is empty."
-                } else {
-                    "Nothing was taken out of it."
-                },
-            ))
+            .children(match outbox {
+                Listed::Files(files) if !up && !files.is_empty() => Some(Self::buffer_list(
+                    name,
+                    Buffer::Taken,
+                    files,
+                    busy.is_some(),
+                    cx,
+                )),
+                _ => outbox_list(
+                    outbox,
+                    if up {
+                        "The Outbox is empty."
+                    } else {
+                        "Nothing was taken out of it."
+                    },
+                )
+                .map(|list| div().child(list)),
+            })
             .child(
                 button(
                     "take-files",
@@ -859,14 +999,15 @@ impl Home {
             .children(self.take_outcome(name, busy, cx))
     }
 
-    fn send_section(
-        &self,
+    /// What the send part says of the Inbox under its drop zone: a line,
+    /// and while the sandbox is stopped the list of what waits, with its
+    /// remove buttons.
+    fn inbox_lines(
         name: &str,
         inbox: Listed,
         (busy, up): (Option<&'static str>, bool),
         cx: &mut Context<Self>,
-    ) -> Div {
-        let (send_files, send_folders) = (name.to_owned(), name.to_owned());
+    ) -> (Option<Div>, Option<Div>) {
         let place = if up {
             "In the Inbox now"
         } else {
@@ -877,6 +1018,7 @@ impl Home {
             Listed::Failed => None,
             Listed::Files([]) if up => Some("The Inbox is empty.".to_owned()),
             Listed::Files([]) => Some("Nothing waits to go in.".to_owned()),
+            Listed::Files(_) if !up => Some(format!("{place}:")),
             Listed::Files([one]) => Some(format!(
                 "{place}: {} \u{b7} {}",
                 one.path,
@@ -884,6 +1026,34 @@ impl Home {
             )),
             Listed::Files(many) => Some(format!("{place}: {} items", many.len())),
         };
+        let waiting = match inbox {
+            Listed::Files(files) if !up && !files.is_empty() => Some(Self::buffer_list(
+                name,
+                Buffer::Waiting,
+                files,
+                busy.is_some(),
+                cx,
+            )),
+            _ => None,
+        };
+        let now = now.map(|now| {
+            div()
+                .text_size(px(13.))
+                .text_color(Theme::muted())
+                .child(now)
+        });
+        (now, waiting)
+    }
+
+    fn send_section(
+        &self,
+        name: &str,
+        inbox: Listed,
+        (busy, up): (Option<&'static str>, bool),
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let (send_files, send_folders) = (name.to_owned(), name.to_owned());
+        let (now, waiting) = Self::inbox_lines(name, inbox, (busy, up), cx);
         div()
             .flex()
             .flex_col()
@@ -949,12 +1119,8 @@ impl Home {
                             ),
                     ),
             )
-            .children(now.map(|now| {
-                div()
-                    .text_size(px(13.))
-                    .text_color(Theme::muted())
-                    .child(now)
-            }))
+            .children(now)
+            .children(waiting)
             .children(self.send_outcome(name, up, busy, cx))
     }
 

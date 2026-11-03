@@ -1725,6 +1725,25 @@ impl Service {
                 })?;
                 self.log(&name, format!("Killed {title} with everything it started"));
             }
+            Request::RemoveBuffered {
+                name,
+                waiting,
+                taken,
+            } => {
+                if self.lock().current.as_ref().is_some_and(|c| c.name == name) {
+                    bail!("'{name}' is running");
+                }
+                if self.lock().sends.contains_key(&name) {
+                    bail!("files are being sent to '{name}'");
+                }
+                let dir = self.environment_dir(&name)?;
+                let removed =
+                    mailbox::remove_waiting(&dir, &waiting)? + mailbox::remove_taken(&dir, &taken)?;
+                self.log(
+                    &name,
+                    format!("{removed} file(s) removed from the host's buffer"),
+                );
+            }
             Request::Files { name } if !self.is_up(&name) => {
                 let dir = self.environment_dir(&name)?;
                 let files = gse_protocol::GuestFiles {
@@ -1958,6 +1977,7 @@ impl Service {
             | Request::EndProcess { .. }
             | Request::EndApp { .. }
             | Request::Files { .. }
+            | Request::RemoveBuffered { .. }
             | Request::SendFiles { .. }
             | Request::TakeFiles { .. }
             | Request::CancelTransfer { .. }) => self.handle_guest(request, peer, out)?,

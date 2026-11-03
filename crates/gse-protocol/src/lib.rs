@@ -33,7 +33,7 @@ pub const SOCKET: &str = "/run/gse/service.sock";
 /// The protocol's version: a client and a service speak to each other only
 /// when theirs match ([`Request::Hello`]). It changes with every change to
 /// the messages.
-pub const VERSION: u32 = 12;
+pub const VERSION: u32 = 13;
 
 /// The name a build of the base image goes by wherever a preset's name
 /// would stand: in [`Event::Build`], [`Event::BuildFinished`] and
@@ -148,6 +148,15 @@ pub enum Request {
     /// closes the connection.
     CancelTransfer {
         name: String,
+    },
+    /// Remove files that wait for the Inbox of `name` (`waiting`) and files
+    /// taken out of its Outbox that the app has not taken yet (`taken`), by
+    /// the paths [`Request::Files`] lists them under. `name` must not be
+    /// running.
+    RemoveBuffered {
+        name: String,
+        waiting: Vec<String>,
+        taken: Vec<String>,
     },
     /// Stop any running environment or image build and restart the
     /// service, which comes back as whatever build is installed. Answered

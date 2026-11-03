@@ -640,7 +640,12 @@ version. A preset installs it as an `appimage` entry.
   files stay, the one under way goes. While a single-GPU environment runs, the service takes what is new
   in its Outbox every 5 s, past the same checks as a take, into a spool of
   the lines a take sends (`outbox-taken`); the app's Files panel lists and
-  takes it after the run like a live Outbox. The guest shows each round
+  takes it after the run like a live Outbox. While the environment is
+  stopped the panel lists both buffers, what waits to go in and what was
+  taken out, and removes any file from them or all at once
+  (`RemoveBuffered`): a file leaves a carrier's index and the space its
+  bytes took is punched out of the carrier, a carrier left empty goes, and
+  a taken file leaves the spool with its lines. The guest shows each round
   (agent version 4): a window with a bar while files leave, then a
   notification of what left for the host and what stays, with why. A
   power-off from the guest's own menu waits up to a minute until the host

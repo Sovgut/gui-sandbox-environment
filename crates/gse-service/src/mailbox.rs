@@ -474,6 +474,129 @@ pub fn taken(dir: &Path) -> Vec<GuestFile> {
         .collect()
 }
 
+/// Removes the waiting files at the Inbox paths `paths`: loose files go,
+/// and a carrier loses them from its index, with the space their bytes took
+/// given back to the file system; a carrier left with none goes. Returns
+/// how many files went.
+pub fn remove_waiting(dir: &Path, paths: &[String]) -> Result<usize> {
+    let mut removed = 0;
+    for (path, full, _) in loose_files(dir) {
+        if paths.contains(&path) && fs::remove_file(&full).is_ok() {
+            removed += 1;
+            let waiting = waiting_dir(dir);
+            let mut parent = full.parent();
+            while let Some(folder) = parent.filter(|p| *p != waiting) {
+                if fs::remove_dir(folder).is_err() {
+                    break;
+                }
+                parent = folder.parent();
+            }
+        }
+    }
+    for carrier in carriers(dir) {
+        let index = carrier_index(&carrier)?;
+        let (gone, kept): (Vec<Entry>, Vec<Entry>) = index
+            .files
+            .into_iter()
+            .partition(|f| paths.contains(&f.path));
+        if gone.is_empty() {
+            continue;
+        }
+        removed += gone.len();
+        if kept.is_empty() {
+            fs::remove_file(&carrier)?;
+            continue;
+        }
+        rewrite_index(&carrier, &kept, &gone)?;
+    }
+    Ok(removed)
+}
+
+/// Gives the carrier at `path` the index `kept` in place of its own, and
+/// punches the bytes of `gone` out of it.
+fn rewrite_index(path: &Path, kept: &[Entry], gone: &[Entry]) -> Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    let file = fs::OpenOptions::new().write(true).open(path)?;
+    // The index goes where the old one began: past every file it names.
+    let offset = gone
+        .iter()
+        .chain(kept)
+        .map(|f| carrier::align(f.offset + f.size))
+        .max()
+        .unwrap_or(0);
+    let index = serde_json::to_vec(&Index {
+        files: kept.to_vec(),
+    })?;
+    let len = index.len() as u64;
+    let trailer = carrier::align(offset + len);
+    file.write_all_at(&index, offset)?;
+    file.write_all_at(&carrier::trailer(offset, len), trailer)?;
+    file.set_len(trailer + carrier::BLOCK)?;
+    for entry in gone {
+        rustix::fs::fallocate(
+            &file,
+            rustix::fs::FallocateFlags::PUNCH_HOLE | rustix::fs::FallocateFlags::KEEP_SIZE,
+            entry.offset,
+            carrier::align(entry.size),
+        )
+        .ok();
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Removes the files at `paths` from the spool of what was taken out, with
+/// their refusals; an emptied spool goes. Returns how many files went.
+pub fn remove_taken(dir: &Path, paths: &[String]) -> Result<usize> {
+    use gse_protocol::Reply;
+    use std::io::BufRead as _;
+    let Ok(spooled) = File::open(spool(dir)) else {
+        return Ok(0);
+    };
+    let rewritten = dir.join("outbox-taken.new");
+    let mut out = io::BufWriter::new(
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&rewritten)?,
+    );
+    let mut skipping = false;
+    let mut kept = 0;
+    for line in io::BufReader::new(spooled).lines() {
+        let line = line?;
+        match serde_json::from_str::<Reply>(&line)? {
+            Reply::FileStart { path, .. } => {
+                skipping = paths.contains(&path);
+                kept += usize::from(!skipping);
+            }
+            Reply::Refused { path, .. } => skipping = paths.contains(&path),
+            Reply::FileChunk { .. } => {}
+            other => bail!("the spool holds {other:?}"),
+        }
+        if !skipping {
+            writeln!(out, "{line}")?;
+        }
+    }
+    out.into_inner()?.sync_all()?;
+    let before = taken(dir);
+    let after: Vec<String> = before
+        .iter()
+        .filter(|f| !paths.contains(&f.path))
+        .map(|f| format!("{} {}\n", f.size, f.path))
+        .collect();
+    if kept == 0 {
+        fs::remove_file(&rewritten).ok();
+        fs::remove_file(spool(dir)).ok();
+        fs::remove_file(spool_index(dir)).ok();
+    } else {
+        fs::rename(&rewritten, spool(dir))?;
+        fs::write(spool_index(dir), after.concat())?;
+    }
+    Ok(before.len() - after.len())
+}
+
 /// Takes what is new in the Outbox through `agent` into the spool; `seen`
 /// holds what earlier rounds took, by path and size, so a file taken once
 /// is taken again only when it changed. Returns how many passed.
@@ -750,6 +873,62 @@ mod tests {
         // Files left as plain files by an older service still count.
         fs::write(waiting_dir(dir.path()).join("old.sav"), "x").unwrap();
         assert_eq!(waiting(dir.path()).len(), 3);
+    }
+
+    #[test]
+    fn waiting_files_can_be_taken_back_out_of_their_carrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src");
+        fs::write(&source, vec![1_u8; 9000]).unwrap();
+        let open = || File::open(&source).unwrap();
+        let files = vec![
+            ("a.bin".to_owned(), open(), 9000),
+            ("b.bin".to_owned(), open(), 9000),
+        ];
+        queue(dir.path(), files, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        fs::create_dir_all(waiting_dir(dir.path()).join("Old")).unwrap();
+        fs::write(waiting_dir(dir.path()).join("Old/c.sav"), "x").unwrap();
+        assert_eq!(
+            remove_waiting(dir.path(), &["a.bin".into(), "Old/c.sav".into()]).unwrap(),
+            2
+        );
+        let left = waiting(dir.path());
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].path, "b.bin");
+        assert!(!waiting_dir(dir.path()).join("Old").exists());
+        let index = carrier_index(&carriers(dir.path())[0]).unwrap();
+        assert_eq!(index.files[0].offset, 12288);
+        assert_eq!(remove_waiting(dir.path(), &["b.bin".into()]).unwrap(), 1);
+        assert_eq!(carriers(dir.path()), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn taken_files_can_be_dropped_from_the_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            spool(dir.path()),
+            "{\"reply\":\"file-start\",\"path\":\"a.png\",\"size\":8}\n\
+             {\"reply\":\"file-chunk\",\"data\":\"cHJvZ3Jlc3M=\"}\n\
+             {\"reply\":\"file-start\",\"path\":\"b.png\",\"size\":8}\n\
+             {\"reply\":\"file-chunk\",\"data\":\"cHJvZ3Jlc3M=\"}\n",
+        )
+        .unwrap();
+        fs::write(spool_index(dir.path()), "8 a.png\n8 b.png\n").unwrap();
+        assert_eq!(remove_taken(dir.path(), &["a.png".into()]).unwrap(), 1);
+        assert_eq!(
+            taken(dir.path()),
+            [GuestFile {
+                path: "b.png".into(),
+                size: 8
+            }]
+        );
+        assert!(
+            !fs::read_to_string(spool(dir.path()))
+                .unwrap()
+                .contains("a.png")
+        );
+        assert_eq!(remove_taken(dir.path(), &["b.png".into()]).unwrap(), 1);
+        assert!(!spool(dir.path()).exists());
     }
 
     #[test]

@@ -57,12 +57,14 @@ const SYSUSERS_TEXT: &str = include_str!("../../../dist/sysusers.d/gse.conf");
 const SETTINGS_TEXT: &str = include_str!("../../../dist/gse/gse.toml");
 
 /// The Fedora packages that hold what the service runs: QEMU with the
-/// PulseAudio sound backend it plays through, the UEFI firmware, passt with
-/// its SELinux policy, and nftables.
-const PACKAGES: [&str; 7] = [
+/// PulseAudio sound backend it plays through and the module that hands USB
+/// devices to a guest, the UEFI firmware, passt with its SELinux policy, and
+/// nftables.
+const PACKAGES: [&str; 8] = [
     "qemu-system-x86-core",
     "qemu-img",
     "qemu-audio-pa",
+    "qemu-device-usb-host",
     "edk2-ovmf",
     "passt",
     "passt-selinux",

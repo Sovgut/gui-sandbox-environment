@@ -437,6 +437,13 @@ pub fn describe(root: &Root) -> String {
             support.reason.unwrap_or_default()
         );
     }
+    for device in crate::usb::for_guest(root) {
+        let _ = writeln!(
+            out,
+            "usb {} {:04x}:{:04x} {} goes to a single-GPU sandbox",
+            device.name, device.vendor, device.product, device.label
+        );
+    }
     out
 }
 

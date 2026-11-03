@@ -20,6 +20,7 @@ pub mod preset;
 pub mod root;
 pub mod seed;
 pub mod session;
+pub mod usb;
 pub mod vm;
 
 pub use root::Root;

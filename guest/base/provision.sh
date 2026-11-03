@@ -692,6 +692,26 @@ rm /tmp/gse_ntsync.cil
 semanage fcontext -a -t gse_ntsync_device_t /dev/ntsync
 echo 'z /dev/ntsync - - - -' > /etc/tmpfiles.d/gse-ntsync.conf
 
+# On a single-GPU machine the host hands its USB gamepads to the guest. udev
+# gives their nodes to the desktop's user (`uaccess`), but games run as
+# `guest`: it gets them too, the event nodes of joysticks and every hidraw
+# node, which Steam and SDL read controllers through. The guest has no other
+# HID devices than the ones the host chose to hand over. The policy keeps
+# `user_t` off input and USB device nodes, so it may use these. The rules
+# run after systemd's `uaccess` (73-seat-late.rules), which drops every other
+# user's ACL from a node it hands to the seat.
+dnf -y install acl
+cat > /etc/udev/rules.d/99-gse-gamepads.rules <<'EOF'
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_JOYSTICK}=="1", RUN+="/usr/bin/setfacl -m u:guest:rw $env{DEVNAME}"
+SUBSYSTEM=="hidraw", RUN+="/usr/bin/setfacl -m u:guest:rw $env{DEVNAME}"
+EOF
+cat > /tmp/gse_gamepads.cil <<'EOF'
+(allow user_t event_device_t (chr_file (getattr open read write ioctl)))
+(allow user_t usb_device_t (chr_file (getattr open read write ioctl)))
+EOF
+semodule -i /tmp/gse_gamepads.cil
+rm /tmp/gse_gamepads.cil
+
 step "home"
 # An environment keeps /home on a disk of its own (serial gse-home), so a
 # new image of its set leaves games and saves alone; only a reset empties

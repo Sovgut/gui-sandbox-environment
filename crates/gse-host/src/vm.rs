@@ -73,6 +73,9 @@ pub struct VmSpec {
     /// mice come back with the keyboard and the next move of the mouse
     /// tells the service at once.
     pub host_input: Vec<HostInput>,
+    /// USB devices QEMU takes whole for the guest, on an xHCI controller of
+    /// its own (see `crate::usb`).
+    pub usb: Vec<crate::usb::UsbDevice>,
     /// A file with the host user's keyboard layouts
     /// (`gse_protocol::Keyboard::to_guest_text`), handed over as the `fw_cfg`
     /// item `opt/gse/keyboard`.
@@ -383,6 +386,18 @@ impl VmSpec {
                 ]);
             }
         }
+        if !self.usb.is_empty() {
+            push(&["-device", "qemu-xhci,id=usb"]);
+        }
+        for (index, device) in self.usb.iter().enumerate() {
+            push(&[
+                "-device",
+                &format!(
+                    "usb-host,bus=usb.0,id=usb-host{index},hostbus={},hostaddr={}",
+                    device.bus, device.address
+                ),
+            ]);
+        }
         // Grabbing any of them grabs all, and ctrl-ctrl lets all go.
         for (index, input) in self.host_input.iter().enumerate() {
             push(&[
@@ -445,6 +460,7 @@ mod tests {
             serial_log: "/vm/console.log".into(),
             journal_log: None,
             host_input: Vec::new(),
+            usb: Vec::new(),
             qmp_object: false,
             keyboard: None,
             run_as: Some("sovhut".into()),
@@ -613,6 +629,31 @@ mod tests {
             ]
         );
         assert!(after(&args, "-device").contains(&"virtio-sound-pci,audiodev=audio,streams=2"));
+    }
+
+    #[test]
+    fn usb_devices_go_on_an_xhci_controller_of_their_own() {
+        let mut environment = spec();
+        assert!(!environment.command_line().iter().any(|a| a.contains("usb")));
+        environment.usb = vec![crate::usb::UsbDevice {
+            name: "1-2".into(),
+            bus: 1,
+            address: 5,
+            vendor: 0x0c76,
+            product: 0x161e,
+            label: "USB PnP Audio Device".into(),
+            events: Vec::new(),
+        }];
+        assert_eq!(
+            after(&environment.command_line(), "-device")
+                .into_iter()
+                .filter(|d| d.contains("usb"))
+                .collect::<Vec<_>>(),
+            [
+                "qemu-xhci,id=usb",
+                "usb-host,bus=usb.0,id=usb-host0,hostbus=1,hostaddr=5"
+            ]
+        );
     }
 
     #[test]

@@ -33,6 +33,7 @@ fn base(name: &str) -> VmSpec {
         vnc_display: None,
         screen: None,
         host_input: Vec::new(),
+        usb: Vec::new(),
         qmp_object: false,
         keyboard: None,
         input_socket: None,

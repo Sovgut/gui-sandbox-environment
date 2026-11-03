@@ -46,6 +46,7 @@ const HOST_COMMANDS: [(&str, &[&str]); 16] = [
             "qemu-system-x86-core",
             "qemu-img",
             "qemu-audio-pa",
+            "qemu-device-usb-host",
             "edk2-ovmf",
             "passt",
             "passt-selinux",

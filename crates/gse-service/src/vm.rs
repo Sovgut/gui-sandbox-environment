@@ -218,11 +218,7 @@ pub fn launch_environment(
     // host's keyboards and mice: the host session, and the app with it, is
     // gone until the environment stops.
     let single = gse_host::plan::Mode::for_gpu(&attached) == gse_host::plan::Mode::Single;
-    let host_input = if single {
-        single_gpu_input()
-    } else {
-        Vec::new()
-    };
+    let (usb, host_input) = single_gpu_devices(root, &launch.name, single, dry_run);
     // The guest reads the layouts from fw_cfg; a file keeps QEMU's option
     // parser away from their commas.
     let keyboard = launch.keyboard.as_ref().map(|keyboard| {
@@ -254,6 +250,7 @@ pub fn launch_environment(
             sound_server: PathBuf::from(format!("/run/user/{}/pulse/native", launch.owner.uid)),
         }),
         host_input: host_input.clone(),
+        usb: usb.clone(),
         qmp_object: qemu_has_qmp_object(),
         keyboard: keyboard.clone(),
         input_socket: Some(launch.input_socket()),
@@ -289,6 +286,9 @@ pub fn launch_environment(
             spec_for,
         )
     };
+    if !dry_run {
+        give_back_usb(root, &launch.name, usb.iter().map(|d| d.name.as_str()));
+    }
     let returned = gpu::detach(root, attached.display().address, dry_run);
     if let Err(e) = &returned {
         error!("returning the GPU failed: {e:#}");
@@ -297,9 +297,31 @@ pub fn launch_environment(
     outcome.and(returned)
 }
 
-/// The host's keyboards and mice, which a single-GPU environment takes.
-fn single_gpu_input() -> Vec<gse_host::vm::HostInput> {
-    let found = crate::hostinput::discover();
+/// The USB devices and the keyboards and mice the environment `name`
+/// takes on a single-GPU machine; none with another GPU, where the host
+/// session stays.
+fn single_gpu_devices(
+    root: &Root,
+    name: &str,
+    single: bool,
+    dry_run: bool,
+) -> (Vec<gse_host::usb::UsbDevice>, Vec<gse_host::vm::HostInput>) {
+    if !single {
+        return (Vec::new(), Vec::new());
+    }
+    let usb = single_gpu_usb(root, name, dry_run);
+    let input = single_gpu_input(&usb);
+    (usb, input)
+}
+
+/// The host's keyboards and mice, which a single-GPU environment takes,
+/// but for those of the USB devices in `usb`, which leave the host whole.
+fn single_gpu_input(usb: &[gse_host::usb::UsbDevice]) -> Vec<gse_host::vm::HostInput> {
+    let mut found = crate::hostinput::discover();
+    found.retain(|input| {
+        !usb.iter()
+            .any(|d| d.events.iter().any(|e| Path::new(e) == input.device))
+    });
     info!(
         "single GPU: the environment drives the monitor and takes {}",
         found
@@ -309,6 +331,66 @@ fn single_gpu_input() -> Vec<gse_host::vm::HostInput> {
             .join(" ")
     );
     found
+}
+
+/// The USB devices a single-GPU environment takes (see `gse_host::usb`),
+/// when this QEMU can take them. Their names wait in a state file while
+/// they are away, so a service that dies meanwhile gives them back when it
+/// starts again ([`recover`]).
+fn single_gpu_usb(root: &Root, name: &str, dry_run: bool) -> Vec<gse_host::usb::UsbDevice> {
+    let found = gse_host::usb::for_guest(root);
+    if found.is_empty() {
+        return found;
+    }
+    let labels = found
+        .iter()
+        .map(|d| format!("{} ({})", d.label, d.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !qemu_has_device("usb-host") {
+        warn!(
+            "QEMU cannot take USB devices (qemu-device-usb-host is missing), so {labels} stay with the host"
+        );
+        return Vec::new();
+    }
+    info!("single GPU: the environment takes the USB devices {labels}");
+    if !dry_run {
+        let names: Vec<&str> = found.iter().map(|d| d.name.as_str()).collect();
+        fs::write(usb_state_file(name), names.join("\n")).ok();
+    }
+    found
+}
+
+fn usb_state_file(name: &str) -> PathBuf {
+    state_path(&format!("{name}.usb"))
+}
+
+/// Gives the USB devices `names` back to the host's drivers, after the
+/// environment `name` had them.
+fn give_back_usb<'a>(root: &Root, name: &str, names: impl Iterator<Item = &'a str>) {
+    for device in names {
+        match gse_host::usb::give_back(root, device) {
+            Ok(()) => info!("USB device {device} is back with the host"),
+            Err(e) => warn!("giving USB device {device} back: {e}"),
+        }
+    }
+    fs::remove_file(usb_state_file(name)).ok();
+}
+
+/// Whether the installed QEMU has the device `device`, by its own list of
+/// devices, which is asked once.
+fn qemu_has_device(device: &str) -> bool {
+    static DEVICES: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DEVICES
+        .get_or_init(|| {
+            Command::new(gse_host::vm::QEMU)
+                .args(["-device", "help"])
+                .stdin(Stdio::null())
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                .unwrap_or_default()
+        })
+        .contains(&format!("name \"{device}\""))
 }
 
 /// Whether the installed QEMU has the `monitor-qmp` object, by its own
@@ -363,6 +445,10 @@ pub fn recover(root: &Root) {
                 kill_qemu(name, pid);
             }
             fs::remove_file(&path).ok();
+        } else if let Some(name) = file.strip_suffix(".usb") {
+            warn!("giving back the USB devices a previous service left with {name}");
+            let names = fs::read_to_string(&path).unwrap_or_default();
+            give_back_usb(root, name, names.lines().filter(|l| !l.is_empty()));
         } else if matches!(
             path.extension().and_then(|e| e.to_str()),
             Some("input" | "monitor")

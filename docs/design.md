@@ -115,8 +115,9 @@ topology of each logical CPU, and on hybrid Intel CPUs
 `/sys/devices/cpu_core/cpus` and `cpu_atom/cpus`) and every GPU (sysfs, as
 `pci.rs` reads it, with `reset_method`) through a `Root`, so every test runs
 it on a fake tree. Hardware decisions are made from it.
-`gse-service gpu hardware` prints it, `Request::Hardware` answers it, and
-diagnostics carry it as `hardware.txt`.
+`gse-service gpu hardware` prints it, with the USB devices a single-GPU
+sandbox would take, `Request::Hardware` answers it, and diagnostics carry
+it as `hardware.txt`.
 
 - **Families** (`crates/gse-host/src/families.rs`) come from the PCI vendor
   and device ID. NVIDIA hands out device IDs in ascending blocks per
@@ -282,12 +283,31 @@ The app shows the running environment according to the switch mode:
   hides the bar, and Ctrl+Alt+F leaves it. Keyboard and mouse go to the
   environment while its view has focus.
 - **single**: the environment owns the monitor and the input. The guest gets
-  no screen mode, so labwc drives the GPU's connectors; QEMU gets the host's
-  keyboards and mice (see the emergency exit above) and no host sound card,
-  since the host session is gone: sound plays through the GPU's own HDMI
-  function. The app warns that the session closes as at a logout and goes
-  with it. Shutting the environment down from its menu, or the emergency
-  exit, brings the login screen back.
+  no screen mode, so labwc drives the GPU's connectors. The host session is
+  gone, so the devices it used are free, and the guest takes them:
+  - the host's keyboards and mice, through `input-linux` (see the emergency
+    exit above);
+  - the GPU's own HDMI sound, and the board's sound card (its speakers and
+    microphone jacks) when that card is alone in its IOMMU group but for
+    bridges;
+  - USB devices with a sound or video interface (a USB microphone or
+    headset, a webcam) and gamepads, whole, on an xHCI controller of the
+    VM's own (`usb-host`, from `qemu-device-usb-host`;
+    `crates/gse-host/src/usb.rs`). A device that is also a keyboard, or
+    holds storage, stays with the host; a gamepad's touchpad, which shows
+    up as a mouse, goes with its gamepad. QEMU detaches the host's drivers
+    and does not bind them again when it is killed, so the service
+    enumerates each device anew once QEMU is gone (deauthorize, then
+    authorize), and a service that started over does it for the devices
+    named in `/run/gse/<name>.usb`. Without the USB module in QEMU the
+    devices stay with the host and the service log says so.
+
+  In the guest, games run as `guest`, so udev gives `guest` the event
+  nodes of joysticks and every hidraw node too, after systemd's `uaccess`,
+  which would drop that ACL again; a policy module lets `user_t` use input
+  and USB device nodes. The app warns that the session closes as at a
+  logout and goes with it. Shutting the environment down from its menu, or
+  the emergency exit, brings the login screen back.
 
 In secondary mode the passed-through GPU usually has no monitor, as on a
 laptop whose discrete GPU has no outputs. The guest compositor still runs on
@@ -714,8 +734,9 @@ the app shows what passed and what was refused and why.
      the AppImage's FUSE mount, and one polkit prompt runs
      `gse-service install` from there. Install:
      - installs the Fedora packages the service runs when they are missing
-       (`qemu-system-x86-core`, `qemu-img`, `qemu-audio-pa`, `edk2-ovmf`,
-       `passt`, `passt-selinux`, `nftables`): with dnf, or layered live
+       (`qemu-system-x86-core`, `qemu-img`, `qemu-audio-pa`,
+       `qemu-device-usb-host`, `edk2-ovmf`, `passt`, `passt-selinux`,
+       `nftables`): with dnf, or layered live
        with `rpm-ostree install --apply-live` on Fedora Atomic systems,
        which ask for a restart when that fails. Elsewhere it names what
        to install;

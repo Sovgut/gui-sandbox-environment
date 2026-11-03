@@ -297,6 +297,7 @@ fn build_spec(
         serial_log: console.to_path_buf(),
         journal_log: None,
         host_input: Vec::new(),
+        usb: Vec::new(),
         qmp_object: false,
         keyboard: None,
         run_as: job.run_as.clone(),

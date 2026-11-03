@@ -33,7 +33,7 @@ pub const SOCKET: &str = "/run/gse/service.sock";
 /// The protocol's version: a client and a service speak to each other only
 /// when theirs match ([`Request::Hello`]). It changes with every change to
 /// the messages.
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 
 /// The name a build of the base image goes by wherever a preset's name
 /// would stand: in [`Event::Build`], [`Event::BuildFinished`] and
@@ -155,6 +155,8 @@ pub enum Request {
     Restart,
     /// What the antivirus is: [`Reply::Antivirus`].
     Antivirus,
+    /// What the service reads about the machine: [`Reply::Hardware`].
+    Hardware,
     /// Where the sandboxes are kept: [`Reply::Storage`].
     Storage,
     /// Move everything the service keeps to the folder `gse` in `to`, or
@@ -241,6 +243,12 @@ pub enum Reply {
         database: Option<u64>,
         checked: Option<u64>,
         error: Option<String>,
+    },
+    /// The machine as the service reads it, for people and diagnostics,
+    /// and how well gse knows its CPU to work.
+    Hardware {
+        text: String,
+        cpu: Support,
     },
     Journal {
         entries: Vec<JournalEntry>,
@@ -737,6 +745,10 @@ pub struct Settings {
     /// Whether it reaches the internet.
     #[serde(default = "internet_by_default")]
     pub internet: bool,
+    /// The driver the sandbox runs the GPU with, one of its
+    /// [`Gpu::guest_drivers`]; none for the GPU's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_driver: Option<String>,
 }
 
 const fn internet_by_default() -> bool {
@@ -763,6 +775,40 @@ pub struct Gpu {
     pub monitor_mode: Option<String>,
     /// How it changes hands when an environment gets it.
     pub mode: SwitchMode,
+    /// The family gse knows it as, such as `NVIDIA Ampere`.
+    #[serde(default)]
+    pub family: Option<String>,
+    /// Whether it is part of the CPU or the board rather than a card.
+    #[serde(default)]
+    pub integrated: bool,
+    /// How well gse knows it to work in a sandbox.
+    #[serde(default)]
+    pub support: Support,
+    /// The drivers a sandbox can run it with, its default first; empty
+    /// when gse knows none.
+    #[serde(default)]
+    pub guest_drivers: Vec<String>,
+}
+
+/// How well gse knows a piece of hardware to work, worst first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupportLevel {
+    /// Known not to work, or known to take the host something it needs.
+    Unsupported,
+    /// Not run yet, with nothing known against it.
+    #[default]
+    Expected,
+    /// gse has run on it.
+    Tested,
+}
+
+/// A [`SupportLevel`] and what people should know about it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Support {
+    pub level: SupportLevel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// How a GPU changes hands; see `gse_host::plan::Mode`.
@@ -946,6 +992,7 @@ mod tests {
                 gpu: "0000:0e:00.0".into(),
                 screen_mode: "1920x1080@144".into(),
                 internet: true,
+                gpu_driver: None,
             },
         };
         send(&mut wire, &request).unwrap();
@@ -961,6 +1008,7 @@ mod tests {
                 gpu: "0000:0e:00.0".into(),
                 screen_mode: "2560x1440@60".into(),
                 internet: true,
+                gpu_driver: None,
             },
             gpus: vec![Gpu {
                 address: "0000:0e:00.0".into(),
@@ -972,6 +1020,10 @@ mod tests {
                 monitor: false,
                 monitor_mode: Some("1920x1080@60".into()),
                 mode: SwitchMode::Secondary,
+                family: None,
+                integrated: false,
+                support: Support::default(),
+                guest_drivers: Vec::new(),
             }],
         };
         send(&mut wire, &reply).unwrap();
@@ -1099,6 +1151,7 @@ mod tests {
                     gpu: "0000:0e:00.0".into(),
                     screen_mode: "1920x1080@60".into(),
                     internet: true,
+                    gpu_driver: None,
                 },
             },
             Request::Presets,

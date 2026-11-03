@@ -44,9 +44,10 @@ impl Holder {
     }
 }
 
-/// Device nodes through which `gpu` can be held: its DRM nodes and, for an
-/// NVIDIA card, the driver's control nodes. The NVIDIA nodes are shared by all
-/// NVIDIA cards, so on a machine with several of them this over-reports.
+/// Device nodes through which `gpu` can be held: its DRM nodes and its host
+/// driver's control nodes ([`crate::drivers::HostDriver::control_nodes`]),
+/// which every GPU on that driver shares, so on a machine with several of
+/// them this over-reports.
 #[must_use]
 pub fn device_nodes(root: &Root, gpu: &Gpu) -> Vec<PathBuf> {
     let mut nodes: Vec<PathBuf> = gpu
@@ -54,14 +55,14 @@ pub fn device_nodes(root: &Root, gpu: &Gpu) -> Vec<PathBuf> {
         .iter()
         .map(|n| PathBuf::from("/dev/dri").join(n))
         .collect();
-    if gpu.is_nvidia() && gpu.display().driver.as_deref() == Some("nvidia") {
-        nodes.extend(
-            root.list("/dev")
-                .into_iter()
-                .filter(|n| n.starts_with("nvidia") && n != "nvidia-caps")
-                .map(|n| PathBuf::from("/dev").join(n)),
-        );
-    }
+    let prefixes = crate::drivers::host_driver(gpu.display().driver.as_deref()).control_nodes;
+    nodes.extend(
+        root.list("/dev")
+            .into_iter()
+            .filter(|n| prefixes.iter().any(|p| n.starts_with(p)))
+            .map(|n| PathBuf::from("/dev").join(n))
+            .filter(|n| !root.path(n).is_dir()),
+    );
     nodes
 }
 

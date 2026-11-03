@@ -9,6 +9,7 @@ mod agent;
 mod antivirus;
 mod checks;
 mod daemon;
+mod desktop;
 mod fedora;
 mod gpu;
 mod hostinput;
@@ -84,7 +85,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ImageAction {
-    /// Build the base image every environment shares: NVIDIA driver, desktop and the
+    /// Build the base image every environment shares: GPU drivers, desktop and the
     /// `sandbox` and `guest` accounts, in a VM without a GPU.
     BuildBase(image::BuildBaseArgs),
     /// Build a preset image: the base image with a preset's applications.
@@ -114,6 +115,9 @@ enum Switch {
 enum GpuAction {
     /// Every GPU, its driver, IOMMU group and switch mode.
     List,
+    /// The CPU and every GPU as gse reads them: families, companions,
+    /// reset methods, guest drivers and how well gse knows each to work.
+    Hardware,
     /// Processes holding a GPU's device nodes.
     Holders { gpu: PciAddress },
     /// Hand a GPU to vfio-pci. In single mode this stops the desktop; in
@@ -181,6 +185,10 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Command::Gpu { action } => match action {
             GpuAction::List => gpu::list(&root),
+            GpuAction::Hardware => {
+                print!("{}", gse_host::hardware::describe(&root));
+                Ok(())
+            }
             GpuAction::Holders { gpu } => gpu::holders(&root, *gpu),
             GpuAction::Attach { gpu } => {
                 require_root(cli.dry_run)?;

@@ -1,7 +1,7 @@
 //! Everything worth sending when something goes wrong, in one zip archive:
 //! the logs of the app, its install, the service, image builds, the
-//! antivirus's last run and every sandbox, the settings, and what the
-//! computer is. It reads only files a
+//! antivirus's last run and every sandbox, the settings, what the
+//! computer is, and what the service makes of its CPU and GPUs. It reads only files a
 //! user may read and runs only commands a user may run, so it works without
 //! the service and without the window: `gse --diagnostics` makes the same
 //! archive from a terminal.
@@ -148,6 +148,11 @@ fn write(archive: &Path) -> Result<()> {
 
     zip.start_file("host.txt", options)?;
     zip.write_all(host().as_bytes())?;
+    zip.start_file("hardware.txt", options)?;
+    match crate::client::hardware() {
+        Ok(text) => zip.write_all(text.as_bytes())?,
+        Err(e) => zip.write_all(format!("the service did not answer: {e:#}\n").as_bytes())?,
+    }
     if !missing.is_empty() {
         zip.start_file("unreadable.txt", options)?;
         zip.write_all(missing.join("\n").as_bytes())?;

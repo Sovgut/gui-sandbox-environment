@@ -1,9 +1,10 @@
 #!/bin/bash
 # Builds the base layer every environment image shares, inside a fresh Fedora Cloud
-# guest that cloud-init boots once: the NVIDIA driver, a light Wayland desktop
-# that logs `sandbox` in on its own, the confined `guest` account for untrusted programs,
-# PipeWire and Flatpak. The build VM has no GPU, so the driver module is built
-# for the newest installed kernel rather than the running one.
+# guest that cloud-init boots once: the GPU drivers the host asked for, a light
+# Wayland desktop that logs `sandbox` in on its own, the confined `guest`
+# account for untrusted programs, PipeWire and Flatpak. The build VM has no GPU,
+# so driver modules are built for the newest installed kernel rather than the
+# running one.
 #
 # The last line on the serial console is the verdict the host reads:
 # "GSE-BUILD: OK" or "GSE-BUILD: FAILED <line>". The guest powers off
@@ -31,17 +32,91 @@ dnf -y install \
     "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$fedora.noarch.rpm" \
     "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$fedora.noarch.rpm"
 
-step "NVIDIA driver"
+step "kernel modules"
 # Cloud images carry kernel-core without the `kernel` meta package, so the
 # installed kernels are read from their module directories.
 kernel="$(find /lib/modules -mindepth 1 -maxdepth 1 -printf '%f\n' | sort -V | tail -1)"
 # kernel-modules carries the sound drivers (HDMI audio of the GPU, the sound
-# card the host provides in window mode); cloud images leave it out.
-dnf -y install akmod-nvidia xorg-x11-drv-nvidia-cuda "kernel-devel-$kernel" \
-    "kernel-modules-$kernel"
-akmods --force --kernels "$kernel"
-# A missing module would only show at the first environment boot as a black screen.
-modinfo -k "$kernel" nvidia > /dev/null
+# card the host provides in window mode) and amdgpu, i915, xe and nouveau;
+# cloud images leave it out.
+dnf -y install "kernel-modules-$kernel"
+
+# The seed volume carries gse-guest and `drivers`: the GPU driver packs this
+# image needs, one a line, which the service picks from the GPUs its settings
+# name (gse_host::hardware::packs). A pack fails the build when what it
+# installs is not there afterwards: a missing driver would only show at the
+# first start as a black screen.
+mkdir -p /run/gse-seed
+mount -o ro LABEL=CIDATA /run/gse-seed
+packs="$(cat /run/gse-seed/drivers)"
+
+# Mesa's OpenGL, Vulkan (RADV, ANV, NVK) and video decoding, with the GPU
+# firmware: AMD and Intel cards and nouveau need nothing else.
+pack_mesa() {
+    dnf -y install mesa-dri-drivers mesa-vulkan-drivers mesa-va-drivers \
+        amd-gpu-firmware intel-gpu-firmware nvidia-gpu-firmware
+    test -e /usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+    test -e /usr/share/vulkan/icd.d/intel_icd.x86_64.json
+}
+
+# NVIDIA's driver from RPM Fusion, its module built by akmods for `kernel`.
+nvidia_driver() {
+    dnf -y install "$@" "kernel-devel-$kernel"
+    akmods --force --kernels "$kernel"
+    modinfo -k "$kernel" nvidia > /dev/null
+}
+
+# Turing and newer: the current branch with its open kernel module.
+pack_nvidia() {
+    nvidia_driver akmod-nvidia xorg-x11-drv-nvidia-cuda
+}
+
+# Maxwell, Pascal and Volta: the legacy branch, whose closed module is the
+# only one that takes them.
+pack_nvidia_legacy() {
+    install -d /etc/nvidia
+    echo MODULE_VARIANT=kernel > /etc/nvidia/kernel.conf
+    nvidia_driver akmod-nvidia-580xx xorg-x11-drv-nvidia-580xx-cuda
+}
+
+# Intel's VA-API driver for video decoding on Intel GPUs.
+pack_intel_media() {
+    dnf -y install intel-media-driver
+    test -e /usr/lib64/dri/iHD_drv_video.so
+}
+
+for pack in $packs; do
+    step "driver $pack"
+    case "$pack" in
+        mesa) pack_mesa ;;
+        nvidia) pack_nvidia ;;
+        nvidia-legacy) pack_nvidia_legacy ;;
+        intel-media) pack_intel_media ;;
+        *) echo "unknown driver pack '$pack'" > /dev/ttyS0; false ;;
+    esac
+done
+
+step "GPU driver choice"
+# No GPU module loads on its own: gse-gpu-driver.service loads the one the
+# host chose for this start, so one image runs a card on any driver it has.
+# udev loads only modules that are not blacklisted, and the initramfs leaves
+# them all out; an explicit modprobe ignores the blacklist.
+cat > /etc/modprobe.d/gse-gpu.conf <<'EOF'
+blacklist nouveau
+blacklist nvidia
+blacklist nvidia_drm
+blacklist nvidia_modeset
+blacklist nvidia_uvm
+blacklist amdgpu
+blacklist radeon
+blacklist i915
+blacklist xe
+options nvidia_drm modeset=1 fbdev=1
+EOF
+cat > /etc/dracut.conf.d/gse-gpu.conf <<'EOF'
+omit_drivers+=" nouveau nvidia nvidia_drm nvidia_modeset nvidia_uvm amdgpu radeon i915 xe "
+EOF
+dracut -f --kver "$kernel"
 
 step "desktop"
 # Budgie on labwc: a desktop with a panel at the bottom, a start menu and
@@ -198,10 +273,75 @@ fi
 dconf update
 EOF
 chmod 0755 /usr/libexec/gse/keyboard
+# The host names the GPU driver for each start in fw_cfg opt/gse/gpu-driver:
+# a module (`nvidia`, `nouveau`, `amdgpu`, `i915`, `xe`), and for `xe` on a
+# card it does not take by default, `:` and the device ID. When the host
+# names none, or its choice leaves the GPU without a driver, the vendor's
+# default loads instead. The driver in use goes to the serial console as
+# "GSE-GPU: <driver>", or "GSE-GPU: none".
+cat > /usr/libexec/gse/gpu-driver <<'EOF'
+#!/bin/sh
+raw=/sys/firmware/qemu_fw_cfg/by_name/opt/gse/gpu-driver/raw
+gpu=
+for dev in /sys/bus/pci/devices/*; do
+    case "$(cat "$dev/class")" in 0x0300*|0x0302*) gpu=$dev; break ;; esac
+done
+# An image build has no GPU.
+[ -n "$gpu" ] || exit 0
+chosen=
+[ -r "$raw" ] && chosen=$(cat "$raw")
+case "$(cat "$gpu/vendor")" in
+    0x10de) fallback=nouveau; modinfo nvidia > /dev/null 2>&1 && fallback=nvidia ;;
+    0x1002) fallback=amdgpu ;;
+    0x8086) fallback=i915 ;;
+    *) fallback= ;;
+esac
+load() {
+    case "$1" in
+        nvidia) modprobe nvidia_drm && modprobe nvidia_uvm ;;
+        xe:*) modprobe xe force_probe="${1#xe:}" ;;
+        # NVIDIA's packages set nouveau's modeset=0, which leaves no screen.
+        nouveau) modprobe nouveau modeset=1 ;;
+        amdgpu|i915|xe) modprobe "$1" ;;
+        *) false ;;
+    esac
+}
+bound() {
+    for i in $(seq 20); do
+        [ -e "$gpu/driver" ] && return 0
+        sleep 0.5
+    done
+    return 1
+}
+for driver in $chosen $fallback; do
+    if load "$driver" && bound; then
+        echo "GSE-GPU: $driver" > /dev/ttyS0
+        exit 0
+    fi
+done
+echo "GSE-GPU: none" > /dev/ttyS0
+EOF
+chmod 0755 /usr/libexec/gse/gpu-driver
+cat > /etc/systemd/system/gse-gpu-driver.service <<'EOF'
+[Unit]
+Description=GPU driver the host chose for this environment
+After=systemd-udevd.service systemd-modules-load.service
+Before=greetd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/modprobe qemu_fw_cfg
+ExecStart=/usr/libexec/gse/gpu-driver
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable gse-gpu-driver.service
 mkdir -p /etc/systemd/system/greetd.service.d
 cat > /etc/systemd/system/greetd.service.d/gse.conf <<'EOF'
 [Unit]
-After=gse-screen-mode.service
+After=gse-screen-mode.service gse-gpu-driver.service
 ConditionPathExists=!/run/gse/build
 EOF
 install -d /usr/libexec/gse
@@ -249,8 +389,6 @@ systemctl set-default graphical.target
 
 step "guest runtime"
 # gse-guest travels on the seed volume next to the cloud-init files.
-mkdir -p /run/gse-seed
-mount -o ro LABEL=CIDATA /run/gse-seed
 install -D -m 0755 /run/gse-seed/gse-guest /usr/libexec/gse/gse-guest
 umount /run/gse-seed
 restorecon -R /usr/libexec/gse

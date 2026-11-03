@@ -1,1 +1,1 @@
-doc-valid-idents = ["PipeWire", "PulseAudio", "SELinux", "KWin", "NoCloud", "AppImage", "AppImages", "Flatpak", "Flathub", "ClamAV", ".."]
+doc-valid-idents = ["PipeWire", "PulseAudio", "SELinux", "KWin", "NoCloud", "AppImage", "AppImages", "Flatpak", "Flathub", "ClamAV", "PCIe", "NVIDIA", "RADV", "ANV", "NVK", "VA-API", "IOMMU", ".."]

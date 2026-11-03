@@ -13,6 +13,11 @@ tracing.workspace = true
 fatfs.workspace = true
 serde.workspace = true
 toml.workspace = true
+tempfile = { workspace = true, optional = true }
+
+[features]
+# The fake sysfs trees of `pci::fixture`, for other crates' tests.
+fixtures = ["dep:tempfile"]
 
 [dev-dependencies]
 tempfile.workspace = true

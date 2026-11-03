@@ -30,6 +30,7 @@ pub fn settings(gpu: &str) -> Settings {
         gpu: gpu.into(),
         screen_mode: "2560x1440@60".into(),
         internet: true,
+        gpu_driver: None,
     }
 }
 
@@ -45,6 +46,17 @@ pub fn gpus() -> Vec<Gpu> {
             monitor: true,
             monitor_mode: Some("2560x1440@59.95".into()),
             mode: SwitchMode::Single,
+            family: Some("Intel Arc Alchemist".into()),
+            integrated: false,
+            support: gse_protocol::Support {
+                level: gse_protocol::SupportLevel::Expected,
+                reason: Some(
+                    "gse has not run on an Intel card yet; it needs Resizable BAR turned on in \
+                     the firmware to run at full speed"
+                        .into(),
+                ),
+            },
+            guest_drivers: vec!["i915".into(), "xe".into()],
         },
         Gpu {
             address: SPARE_GPU.into(),
@@ -56,6 +68,13 @@ pub fn gpus() -> Vec<Gpu> {
             monitor: false,
             monitor_mode: None,
             mode: SwitchMode::Secondary,
+            family: Some("NVIDIA Ampere".into()),
+            integrated: false,
+            support: gse_protocol::Support {
+                level: gse_protocol::SupportLevel::Tested,
+                reason: None,
+            },
+            guest_drivers: vec!["nvidia".into(), "nouveau".into()],
         },
     ]
 }
@@ -83,6 +102,13 @@ pub fn one_gpu() -> Vec<Gpu> {
         monitor: true,
         monitor_mode: Some("1920x1080@60".into()),
         mode: SwitchMode::Single,
+        family: Some("NVIDIA Ampere".into()),
+        integrated: false,
+        support: gse_protocol::Support {
+            level: gse_protocol::SupportLevel::Tested,
+            reason: None,
+        },
+        guest_drivers: vec!["nvidia".into(), "nouveau".into()],
     }]
 }
 

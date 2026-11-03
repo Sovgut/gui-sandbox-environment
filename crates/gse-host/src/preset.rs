@@ -325,12 +325,17 @@ step() { echo "=== $*" > /dev/ttyS0; }
 
 /// Flatpak programs reach the NVIDIA driver only through a runtime extension
 /// matching its exact version. Flatpak picks it by the loaded module, which
-/// the GPU-less build VM does not have, so it is named from the package.
-/// Installed files keep the label of the repository objects they link to
-/// until relabelled, and `guest` cannot run them before that.
-const NVIDIA_FLATPAK_GL: &str = r#"nvidia="$(rpm -q --qf '%{VERSION}' xorg-x11-drv-nvidia | tr . -)"
-flatpak install --system -y --noninteractive flathub \
-    "org.freedesktop.Platform.GL.nvidia-$nvidia" "org.freedesktop.Platform.GL32.nvidia-$nvidia"
+/// the GPU-less build VM does not have, so it is named from the package,
+/// the current branch's or a legacy one's (`xorg-x11-drv-nvidia-580xx`); an
+/// image without NVIDIA's driver needs none. Installed files keep the label
+/// of the repository objects they link to until relabelled, and `guest`
+/// cannot run them before that.
+const NVIDIA_FLATPAK_GL: &str = r#"nvidia="$(rpm -qa --qf '%{NAME} %{VERSION}\n' 'xorg-x11-drv-nvidia*' \
+    | awk '$1 ~ /^xorg-x11-drv-nvidia(-[0-9]+xx)?$/ { print $2; exit }' | tr . -)"
+if [ -n "$nvidia" ]; then
+    flatpak install --system -y --noninteractive flathub \
+        "org.freedesktop.Platform.GL.nvidia-$nvidia" "org.freedesktop.Platform.GL32.nvidia-$nvidia"
+fi
 restorecon -R /var/lib/flatpak
 "#;
 

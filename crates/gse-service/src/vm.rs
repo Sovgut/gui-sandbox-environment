@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use gse_host::Root;
 use gse_host::pci::PciAddress;
-use gse_host::vm::{Network, OVMF_VARS_TEMPLATE, Screen, VmSpec};
+use gse_host::vm::{GuestCpu, Network, OVMF_VARS_TEMPLATE, Screen, VmSpec};
 use gse_protocol::Stage;
 use tracing::{error, info, warn};
 
@@ -85,6 +85,9 @@ pub struct Launch {
     pub internet: bool,
     /// The mode of the environment screen shown on the host.
     pub screen_mode: String,
+    /// The `fw_cfg` item `opt/gse/gpu-driver` (see
+    /// `gse_host::vm::VmSpec::gpu_driver`).
+    pub gpu_driver: Option<String>,
     pub owner: Owner,
     /// Development only: forward 127.0.0.1:PORT to the guest's SSH port.
     pub dev_ssh_port: Option<u16>,
@@ -171,6 +174,7 @@ pub fn run(root: &Root, args: &RunArgs, stop: &AtomicBool, dry_run: bool) -> Res
         cpus: args.cpus,
         internet: !args.offline,
         screen_mode: args.screen_mode.clone(),
+        gpu_driver: crate::gpu::guest_driver_item(&Root::system(), args.gpu, None),
         owner: Owner::invoking().context("run this through sudo or pkexec")?,
         dev_ssh_port: args.dev_ssh_port,
         dev_vnc: args.dev_vnc,
@@ -231,6 +235,7 @@ pub fn launch_environment(
     let home = Some(dir.join("home.qcow2")).filter(|home| home.exists());
     let direct_io = nocow::is_set(&launch.disk) && home.as_deref().is_none_or(nocow::is_set);
     let guest_program = guest_program_disk(dir, dry_run);
+    let cpu = host_cpu();
     let spec_for = |socket: PathBuf| VmSpec {
         name: launch.name.clone(),
         disk: launch.disk.clone(),
@@ -238,7 +243,8 @@ pub fn launch_environment(
         read_only_disks: launch.read_only_disks.clone(),
         firmware_vars: dir.join("OVMF_VARS.qcow2"),
         memory_mib: launch.memory_mib,
-        cpus: launch.cpus,
+        cpus: guest_cpus(launch.cpus, &cpu),
+        cpu: cpu.clone(),
         passthrough: moved.clone(),
         network: Network::Passt { socket },
         vnc_display: launch.dev_vnc,
@@ -259,6 +265,7 @@ pub fn launch_environment(
         direct_io,
         guest_program: guest_program.clone(),
         image_build: false,
+        gpu_driver: launch.gpu_driver.clone(),
     };
 
     let outcome = if dry_run {
@@ -592,14 +599,16 @@ fn run_qemu(spec: &VmSpec, stop: &AtomicBool, watch: &mut Watch<'_>) -> Result<(
     // VFIO pins all guest memory. QEMU runs in its own process group so a
     // Ctrl+C in the terminal reaches only this service, which then kills QEMU
     // and still gives the GPU back.
-    let mut child = Command::new("prlimit")
-        .arg("--memlock=unlimited:unlimited")
-        .arg("--")
-        .args(&command_line)
-        .stdin(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .context("starting QEMU")?;
+    let mut child = with_affinity(spec.cpu.affinity.as_deref(), || {
+        Command::new("prlimit")
+            .arg("--memlock=unlimited:unlimited")
+            .arg("--")
+            .args(&command_line)
+            .stdin(Stdio::null())
+            .process_group(0)
+            .spawn()
+    })
+    .context("starting QEMU")?;
     // A service that dies leaves QEMU running in its own process group; the
     // next service finds it through this file (see `recover`).
     let pid_file = qemu_pid_file(&spec.name);
@@ -660,4 +669,48 @@ fn guest_program_disk(dir: &Path, dry_run: bool) -> Option<gse_host::vm::GuestPr
         size: program.len() as u64,
         sha256,
     })
+}
+
+/// The guest CPU this host gives its VMs (see
+/// `gse_host::hardware::Cpu::guest`); the plain host CPU when its CPUs
+/// cannot be read.
+pub fn host_cpu() -> GuestCpu {
+    gse_host::hardware::Cpu::read(&Root::system()).map_or_else(
+        |_| GuestCpu {
+            model: "host".to_owned(),
+            threads_per_core: 1,
+            affinity: None,
+        },
+        |cpu| cpu.guest(),
+    )
+}
+
+/// The CPUs a VM asking for `wanted` gets: no more than the host CPUs it
+/// may run on.
+fn guest_cpus(wanted: u16, cpu: &GuestCpu) -> u16 {
+    cpu.affinity.as_ref().map_or(wanted, |cpus| {
+        wanted.min(u16::try_from(cpus.len()).unwrap_or(u16::MAX).max(1))
+    })
+}
+
+/// Runs `spawn` with this thread bound to `cpus`, which a process it starts
+/// inherits, and binds the thread as it was afterwards.
+fn with_affinity<T>(cpus: Option<&[u32]>, spawn: impl FnOnce() -> T) -> T {
+    use rustix::thread::{CpuSet, sched_getaffinity, sched_setaffinity};
+    let Some(cpus) = cpus.filter(|c| !c.is_empty()) else {
+        return spawn();
+    };
+    let before = sched_getaffinity(None).ok();
+    let mut set = CpuSet::new();
+    for cpu in cpus {
+        set.set(*cpu as usize);
+    }
+    if let Err(e) = sched_setaffinity(None, &set) {
+        tracing::warn!("binding QEMU to CPUs {cpus:?}: {e}");
+    }
+    let spawned = spawn();
+    if let Some(before) = before {
+        sched_setaffinity(None, &before).ok();
+    }
+    spawned
 }

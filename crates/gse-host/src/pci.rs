@@ -1,7 +1,7 @@
 //! PCI functions and GPUs as sysfs describes them.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::{Error, Result, Root};
@@ -111,6 +111,51 @@ impl PciFunction {
     pub fn is_display(&self) -> bool {
         matches!(self.class >> 8, 0x0300 | 0x0302)
     }
+
+    #[must_use]
+    pub fn is_bridge(&self) -> bool {
+        self.class >> 16 == 0x06
+    }
+}
+
+/// The directory of `address` at its place in the PCI tree, below the
+/// bridges it sits behind.
+fn device_dir(root: &Root, address: PciAddress) -> Option<PathBuf> {
+    std::fs::canonicalize(root.path(address.sysfs())).ok()
+}
+
+fn address_of(dir: &Path) -> Option<PciAddress> {
+    dir.file_name()?.to_str()?.parse().ok()
+}
+
+/// The upstream port of a PCIe switch on the card itself, which cards such
+/// as Intel's Arc carry: their HDMI audio sits behind it as a device of its
+/// own, in another slot and IOMMU group. It is the bridge two levels above
+/// the GPU when that bridge has the GPU's vendor and is no root port (a root
+/// port's parent is the host bridge, `pci0000:00`, which has no address).
+fn card_switch(root: &Root, display: &PciFunction) -> Option<PathBuf> {
+    let dir = device_dir(root, display.address)?;
+    let downstream = dir.parent()?;
+    let upstream = downstream.parent()?;
+    address_of(downstream)?;
+    let port = PciFunction::read(root, address_of(upstream)?).ok()?;
+    address_of(upstream.parent()?)?;
+    (port.vendor == display.vendor && port.is_bridge()).then(|| upstream.to_owned())
+}
+
+/// Functions that share an IOMMU group with one of `gpu`'s and are neither
+/// part of it nor bridges. VFIO hands over whole groups, so the GPU cannot
+/// go without them, and they would leave the host with it.
+#[must_use]
+pub fn foreign_group_members(root: &Root, gpu: &Gpu) -> Vec<PciFunction> {
+    let groups: Vec<u32> = gpu.functions.iter().filter_map(|f| f.iommu_group).collect();
+    root.list(PCI_DEVICES)
+        .into_iter()
+        .filter_map(|name| name.parse::<PciAddress>().ok())
+        .filter(|a| !gpu.functions.iter().any(|f| f.address == *a))
+        .filter_map(|address| PciFunction::read(root, address).ok())
+        .filter(|f| !f.is_bridge() && f.iommu_group.is_some_and(|g| groups.contains(&g)))
+        .collect()
 }
 
 /// A display connector of a GPU, such as `card1-HDMI-A-1`.
@@ -144,7 +189,8 @@ pub fn edid_preferred_mode(edid: &[u8]) -> Option<String> {
     Some(format!("{width}x{height}@{rate}"))
 }
 
-/// A GPU and every function in its slot (usually its HDMI audio).
+/// A GPU and its companions: every function in its slot (usually its HDMI
+/// audio) and every device behind the card's own PCIe switch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gpu {
     /// The display function first, then the others in address order.
@@ -167,7 +213,7 @@ pub fn movable_sound_cards(root: &Root, gpu: &Gpu) -> Vec<PciFunction> {
         .filter_map(|name| name.parse::<PciAddress>().ok())
         .filter_map(|address| PciFunction::read(root, address).ok())
         .collect();
-    let is_bridge = |f: &PciFunction| f.class >> 16 == 0x06;
+    let is_bridge = PciFunction::is_bridge;
     all.iter()
         .filter(|f| f.class >> 8 == 0x0403)
         .filter(|f| !gpu.functions.iter().any(|g| g.address == f.address))
@@ -185,19 +231,35 @@ pub fn movable_sound_cards(root: &Root, gpu: &Gpu) -> Vec<PciFunction> {
 impl Gpu {
     /// Reads the GPU whose display function sits in `address`'s slot.
     pub fn read(root: &Root, address: PciAddress) -> Result<Self> {
+        let addresses: Vec<PciAddress> = root
+            .list(PCI_DEVICES)
+            .into_iter()
+            .filter_map(|name| name.parse().ok())
+            .collect();
         let mut functions = Vec::new();
-        for name in root.list(PCI_DEVICES) {
-            let Ok(candidate) = name.parse::<PciAddress>() else {
-                continue;
-            };
-            if candidate.same_slot(&address) {
-                functions.push(PciFunction::read(root, candidate)?);
-            }
+        for candidate in addresses.iter().filter(|a| a.same_slot(&address)) {
+            functions.push(PciFunction::read(root, *candidate)?);
         }
         functions.sort_by_key(|f| (!f.is_display(), f.address));
         let Some(display) = functions.first().filter(|f| f.is_display()) else {
             return Err(Error::NoGpu(address.to_string()));
         };
+        if let Some(switch) = card_switch(root, display) {
+            for candidate in &addresses {
+                if functions.iter().any(|f| f.address == *candidate) {
+                    continue;
+                }
+                let inside = device_dir(root, *candidate)
+                    .is_some_and(|dir| dir != switch && dir.starts_with(&switch));
+                if inside {
+                    let function = PciFunction::read(root, *candidate)?;
+                    if !function.is_bridge() {
+                        functions.push(function);
+                    }
+                }
+            }
+        }
+        let display = &functions[0];
         let drm = display.address.sysfs().join("drm");
         let drm_nodes: Vec<String> = root
             .list(&drm)
@@ -309,15 +371,17 @@ mod edid_tests {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod fixture {
-    //! A fake sysfs tree shaped like the development PC: an Arc A380 that
-    //! drives the monitor and an RTX 3070 with its HDMI audio and no monitor.
+#[cfg(any(test, feature = "fixtures"))]
+// Test fixtures: they panic on any failure to build the fake tree.
+#[allow(clippy::missing_panics_doc, clippy::must_use_candidate)]
+pub mod fixture {
+    //! Fake sysfs trees: PCI functions placed behind their bridges as the
+    //! kernel lays them out, and the development PC built from them.
 
     use std::fs;
     use std::os::unix::fs::symlink;
 
-    use super::*;
+    use super::{PCI_DEVICES, PathBuf, Root};
 
     pub struct Function<'a> {
         pub address: &'a str,
@@ -329,9 +393,23 @@ pub(crate) mod fixture {
         pub boot_vga: bool,
     }
 
+    /// Adds `f` on the root bus.
     pub fn add(root: &Root, f: &Function<'_>) {
-        let dir = root.path(PathBuf::from(PCI_DEVICES).join(f.address));
+        add_at(root, f, &root.path("/sys/devices/pci0000:00"));
+    }
+
+    /// Adds `f` behind the bridge `parent`, added before it.
+    pub fn add_under(root: &Root, f: &Function<'_>, parent: &str) {
+        let parent = fs::canonicalize(root.path(PathBuf::from(PCI_DEVICES).join(parent))).unwrap();
+        add_at(root, f, &parent);
+    }
+
+    fn add_at(root: &Root, f: &Function<'_>, parent: &std::path::Path) {
+        let dir = parent.join(f.address);
         fs::create_dir_all(&dir).unwrap();
+        let link = root.path(PathBuf::from(PCI_DEVICES).join(f.address));
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&dir, &link).unwrap();
         fs::write(dir.join("vendor"), format!("0x{:04x}\n", f.vendor)).unwrap();
         fs::write(dir.join("device"), format!("0x{:04x}\n", f.device)).unwrap();
         fs::write(dir.join("class"), format!("0x{:06x}\n", f.class)).unwrap();
@@ -374,10 +452,42 @@ pub(crate) mod fixture {
         }
     }
 
+    /// A PCIe bridge (a root port or a switch port).
+    pub fn bridge(address: &str, vendor: u16, device: u16, group: u32) -> Function<'_> {
+        Function {
+            address,
+            vendor,
+            device,
+            class: 0x06_0400,
+            driver: Some("pcieport"),
+            group,
+            boot_vga: false,
+        }
+    }
+
+    /// The development PC: the Arc A380 behind its own switch, with its
+    /// HDMI audio behind another port of it, and the RTX 3070 with its
+    /// audio in one slot on a root port.
     pub fn dev_pc() -> (tempfile::TempDir, Root) {
         let dir = tempfile::tempdir().unwrap();
         let root = Root::at(dir.path());
-        add(
+        add(&root, &bridge("0000:00:01.2", 0x1022, 0x1483, 2));
+        add_under(
+            &root,
+            &bridge("0000:05:00.0", 0x8086, 0x4fa1, 24),
+            "0000:00:01.2",
+        );
+        add_under(
+            &root,
+            &bridge("0000:06:01.0", 0x8086, 0x4fa4, 25),
+            "0000:05:00.0",
+        );
+        add_under(
+            &root,
+            &bridge("0000:06:04.0", 0x8086, 0x4fa4, 26),
+            "0000:05:00.0",
+        );
+        add_under(
             &root,
             &Function {
                 address: "0000:07:00.0",
@@ -388,8 +498,9 @@ pub(crate) mod fixture {
                 group: 27,
                 boot_vga: true,
             },
+            "0000:06:01.0",
         );
-        add(
+        add_under(
             &root,
             &Function {
                 address: "0000:08:00.0",
@@ -400,8 +511,10 @@ pub(crate) mod fixture {
                 group: 28,
                 boot_vga: false,
             },
+            "0000:06:04.0",
         );
-        add(
+        add(&root, &bridge("0000:00:03.1", 0x1022, 0x1483, 5));
+        add_under(
             &root,
             &Function {
                 address: "0000:0e:00.0",
@@ -412,8 +525,9 @@ pub(crate) mod fixture {
                 group: 31,
                 boot_vga: false,
             },
+            "0000:00:03.1",
         );
-        add(
+        add_under(
             &root,
             &Function {
                 address: "0000:0e:00.1",
@@ -424,6 +538,7 @@ pub(crate) mod fixture {
                 group: 31,
                 boot_vga: false,
             },
+            "0000:00:03.1",
         );
         add_card(
             &root,
@@ -483,6 +598,35 @@ mod tests {
         let arc = &gpus[0];
         assert!(arc.display().boot_vga);
         assert!(arc.drives_display());
+        // Its audio is behind the card's own switch, in a group of its own.
+        let arc_functions: Vec<String> = arc
+            .functions
+            .iter()
+            .map(|f| f.address.to_string())
+            .collect();
+        assert_eq!(arc_functions, ["0000:07:00.0", "0000:08:00.0"]);
+    }
+
+    #[test]
+    fn a_device_sharing_the_gpus_group_is_foreign() {
+        let (_dir, root) = fixture::dev_pc();
+        let rtx = Gpu::read(&root, "0e:00".parse().unwrap()).unwrap();
+        assert_eq!(foreign_group_members(&root, &rtx), []);
+        fixture::add(
+            &root,
+            &fixture::Function {
+                address: "0000:0f:00.0",
+                vendor: 0x1022,
+                device: 0x149c,
+                class: 0x0c_0330,
+                driver: Some("xhci_hcd"),
+                group: 31,
+                boot_vga: false,
+            },
+        );
+        let foreign = foreign_group_members(&root, &rtx);
+        assert_eq!(foreign.len(), 1);
+        assert_eq!(foreign[0].address.to_string(), "0000:0f:00.0");
     }
 
     #[test]

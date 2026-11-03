@@ -11,6 +11,29 @@ pub const QEMU: &str = "qemu-system-x86_64";
 pub const OVMF_CODE: &str = "/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2";
 pub const OVMF_VARS_TEMPLATE: &str = "/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2";
 
+/// The CPU a VM shows its guest, from the host's (see
+/// `crate::hardware::Cpu::guest`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestCpu {
+    /// QEMU's `-cpu`.
+    pub model: String,
+    pub threads_per_core: u16,
+    /// The host CPUs QEMU may run on, when not all of them.
+    pub affinity: Option<Vec<u32>>,
+}
+
+impl GuestCpu {
+    /// The host's CPU on an AMD machine with two threads per core.
+    #[must_use]
+    pub fn amd_smt() -> Self {
+        Self {
+            model: "host,topoext=on".to_owned(),
+            threads_per_core: 2,
+            affinity: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmSpec {
     pub name: String,
@@ -24,9 +47,10 @@ pub struct VmSpec {
     /// This VM's copy of the UEFI variable store.
     pub firmware_vars: PathBuf,
     pub memory_mib: u32,
-    /// Logical CPUs, given to the guest as one socket of two-thread cores
-    /// when the count is even.
+    /// Logical CPUs, given to the guest as one socket of cores with
+    /// [`GuestCpu::threads_per_core`] threads when the count divides by it.
     pub cpus: u16,
+    pub cpu: GuestCpu,
     /// PCI functions handed over whole, all already on vfio-pci.
     pub passthrough: Vec<PciAddress>,
     pub network: Network,
@@ -91,6 +115,11 @@ pub struct VmSpec {
     /// `opt/gse/build` and starts no desktop, which a VM without a GPU could
     /// only start and lose in a loop.
     pub image_build: bool,
+    /// The kernel driver the guest runs the GPU with, as the `fw_cfg` item
+    /// `opt/gse/gpu-driver`: the module's name, with `:` and the GPU's
+    /// device ID in hex when the driver has to be told to take it (`xe` on
+    /// an Arc Alchemist).
+    pub gpu_driver: Option<String>,
 }
 
 /// The `gse-guest` program a start hands over: a disk image that holds it
@@ -182,6 +211,21 @@ impl VmSpec {
 
     /// The command line, program first.
     #[must_use]
+    /// QEMU's `-smp`: one socket of cores with the guest CPU's threads
+    /// each, when the count divides by them.
+    fn smp(&self) -> String {
+        let threads = self.cpu.threads_per_core;
+        if threads >= 2 && self.cpus >= threads && self.cpus.is_multiple_of(threads) {
+            format!(
+                "{},sockets=1,cores={},threads={threads}",
+                self.cpus,
+                self.cpus / threads
+            )
+        } else {
+            self.cpus.to_string()
+        }
+    }
+
     pub fn command_line(&self) -> Vec<String> {
         let mut args: Vec<String> = Vec::new();
         let mut push = |parts: &[&str]| args.extend(parts.iter().map(|s| (*s).to_owned()));
@@ -193,14 +237,9 @@ impl VmSpec {
             "-machine",
             "q35,accel=kvm",
             "-cpu",
-            "host,topoext=on",
+            &self.cpu.model,
         ]);
-        let smp = if self.cpus >= 2 && self.cpus.is_multiple_of(2) {
-            format!("{},sockets=1,cores={},threads=2", self.cpus, self.cpus / 2)
-        } else {
-            self.cpus.to_string()
-        };
-        push(&["-smp", &smp, "-m", &format!("{}M", self.memory_mib)]);
+        push(&["-smp", &self.smp(), "-m", &format!("{}M", self.memory_mib)]);
         let disks = self.disks();
         push(&disks.iter().map(String::as_str).collect::<Vec<_>>());
         for function in &self.passthrough {
@@ -241,6 +280,12 @@ impl VmSpec {
             push(&[
                 "-fw_cfg",
                 &format!("name=opt/gse/keyboard,file={}", keyboard.display()),
+            ]);
+        }
+        if let Some(driver) = &self.gpu_driver {
+            push(&[
+                "-fw_cfg",
+                &format!("name=opt/gse/gpu-driver,string={driver}"),
             ]);
         }
         if let Some(guest) = &self.guest_program {
@@ -386,6 +431,7 @@ mod tests {
             firmware_vars: "/vm/OVMF_VARS.qcow2".into(),
             memory_mib: 12288,
             cpus: 8,
+            cpu: GuestCpu::amd_smt(),
             passthrough: vec![
                 "0000:0e:00.0".parse().unwrap(),
                 "0000:0e:00.1".parse().unwrap(),
@@ -405,6 +451,7 @@ mod tests {
             guest_program: None,
             direct_io: false,
             image_build: false,
+            gpu_driver: None,
         }
     }
 
@@ -577,6 +624,24 @@ mod tests {
             after(&build.command_line(), "-fw_cfg"),
             ["name=opt/gse/build,string=1"]
         );
+    }
+
+    #[test]
+    fn the_guest_learns_its_gpu_driver_and_cpu_shape() {
+        let mut environment = spec();
+        environment.gpu_driver = Some("xe:56a5".into());
+        environment.cpu = GuestCpu {
+            model: "host".into(),
+            threads_per_core: 1,
+            affinity: Some(vec![0, 1, 2, 3]),
+        };
+        let args = environment.command_line();
+        assert_eq!(
+            after(&args, "-fw_cfg"),
+            ["name=opt/gse/gpu-driver,string=xe:56a5"]
+        );
+        assert_eq!(after(&args, "-cpu"), ["host"]);
+        assert_eq!(after(&args, "-smp"), ["8"]);
     }
 
     #[test]

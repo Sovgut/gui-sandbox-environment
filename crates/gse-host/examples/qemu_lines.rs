@@ -25,6 +25,7 @@ fn base(name: &str) -> VmSpec {
         firmware_vars: "@DIR@/OVMF_VARS.qcow2".into(),
         memory_mib: 2048,
         cpus: 2,
+        cpu: gse_host::vm::GuestCpu::amd_smt(),
         passthrough: Vec::new(),
         network: Network::Passt {
             socket: "@PASST@".into(),
@@ -43,6 +44,7 @@ fn base(name: &str) -> VmSpec {
         guest_program: None,
         direct_io: false,
         image_build: false,
+        gpu_driver: Some("nvidia".into()),
     }
 }
 

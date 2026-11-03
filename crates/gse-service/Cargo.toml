@@ -25,6 +25,7 @@ pgp = "0.19"
 
 [dev-dependencies]
 tempfile.workspace = true
+gse-host = { path = "../gse-host", features = ["fixtures"] }
 
 [lints]
 workspace = true

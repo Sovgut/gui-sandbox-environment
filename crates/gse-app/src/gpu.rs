@@ -6,10 +6,14 @@
 //! a live user corrupts kernel memory, so the service refuses. The app
 //! therefore restarts itself once with `VK_LOADER_DRIVERS_DISABLE` set to the
 //! Vulkan drivers of the vendors of every GPU an environment's settings name,
-//! as long as a GPU of another vendor is left to draw on. `GSE_APP_OFF_GPU`
-//! names the GPUs that restart was made for; an app started again after they
-//! changed (the settings views restart it) inherits both variables and
-//! restarts once more for the GPUs now set.
+//! as long as a GPU of another vendor is left to draw on. When the desktop's
+//! GPU shares the vendor (an Intel iGPU beside an Arc card, an AMD APU
+//! beside a Radeon), leaving the driver out would leave the app nothing to
+//! draw with, so it restarts inside bubblewrap instead, with a `/dev/dri`
+//! that holds only the other GPUs' nodes. `GSE_APP_OFF_GPU` names the GPUs
+//! that restart was made for; an app started again after they changed (the
+//! settings views restart it) inherits both variables and restarts once
+//! more for the GPUs now set.
 
 use std::fs;
 use std::os::unix::process::CommandExt as _;
@@ -20,6 +24,7 @@ const CONFIG: &str = "/etc/gse/gse.toml";
 const ENVIRONMENTS: &str = "/var/lib/gse/environments";
 const VARIABLE: &str = "VK_LOADER_DRIVERS_DISABLE";
 const MARKER: &str = "GSE_APP_OFF_GPU";
+const BUBBLEWRAP: &str = "/usr/bin/bwrap";
 
 /// The Vulkan driver manifests of a PCI vendor, as loader globs.
 fn drivers(vendor: u32) -> Option<&'static str> {
@@ -82,9 +87,20 @@ pub fn reserved_gpus() -> Vec<String> {
     gpus
 }
 
-/// The Vulkan drivers the app leaves out to stay off `addresses`, if it
-/// can.
-fn drivers_to_skip(addresses: &[String]) -> Option<String> {
+/// How the app stays off the GPUs environments get.
+#[derive(Debug, PartialEq, Eq)]
+enum StayOff {
+    /// Leave these Vulkan drivers (loader globs) out.
+    Drivers(String),
+    /// Run with only these DRM nodes in `/dev/dri`, since the desktop's
+    /// GPU needs the same driver.
+    Nodes(Vec<String>),
+    /// Nothing to stay off.
+    Nothing,
+}
+
+/// How the app stays off `addresses`.
+fn stay_off(addresses: &[String]) -> StayOff {
     let mut vendors: Vec<u32> = addresses
         .iter()
         .filter_map(|a| read_hex(&format!("/sys/bus/pci/devices/{a}/vendor")))
@@ -92,15 +108,53 @@ fn drivers_to_skip(addresses: &[String]) -> Option<String> {
     vendors.sort_unstable();
     vendors.dedup();
     let others = other_gpu_vendors(addresses);
-    if let Some(shared) = vendors.iter().find(|v| others.contains(v)) {
-        eprintln!(
-            "the desktop GPU is from the same vendor ({shared:04x}) as a GPU environments get; \
-             the app cannot leave that vendor's Vulkan driver unloaded"
-        );
-        return None;
+    if vendors.iter().any(|v| others.contains(v)) {
+        return StayOff::Nodes(other_gpu_nodes(addresses));
     }
     let globs: Vec<&str> = vendors.into_iter().filter_map(drivers).collect();
-    (!globs.is_empty()).then(|| globs.join(","))
+    if globs.is_empty() {
+        StayOff::Nothing
+    } else {
+        StayOff::Drivers(globs.join(","))
+    }
+}
+
+/// The DRM nodes (`card*`, `renderD*`) of every display controller but
+/// those in `except`.
+fn other_gpu_nodes(except: &[String]) -> Vec<String> {
+    let mut nodes: Vec<String> = fs::read_dir("/sys/bus/pci/devices")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| !except.contains(&e.file_name().to_string_lossy().into_owned()))
+        .filter(|e| {
+            read_hex(&format!("{}/class", e.path().display())).is_some_and(|c| c >> 16 == 0x03)
+        })
+        .flat_map(|e| {
+            fs::read_dir(e.path().join("drm"))
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .map(|n| n.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("card") || n.starts_with("renderD"))
+        .collect();
+    nodes.sort();
+    nodes
+}
+
+/// bubblewrap's arguments for a system as it is but with only `nodes` in
+/// `/dev/dri`.
+fn bubblewrap_args(nodes: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = ["--dev-bind", "/", "/", "--tmpfs", "/dev/dri"]
+        .map(str::to_owned)
+        .to_vec();
+    for node in nodes {
+        let path = format!("/dev/dri/{node}");
+        args.extend(["--dev-bind".to_owned(), path.clone(), path]);
+    }
+    args.push("--".to_owned());
+    args
 }
 
 /// Restarts the app without the environments' GPU drivers when that is
@@ -116,20 +170,34 @@ pub fn stay_off_reserved_gpu() {
     if marker.as_deref() == Some(joined.as_str()) {
         return;
     }
-    let globs = drivers_to_skip(&addresses);
-    if marker.is_none() && globs.is_none() {
+    let how = stay_off(&addresses);
+    if marker.is_none() && how == StayOff::Nothing {
         return;
     }
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let mut command = Command::new(exe);
+    let mut command = match &how {
+        StayOff::Nodes(nodes) if Path::new(BUBBLEWRAP).exists() => {
+            let mut command = Command::new(BUBBLEWRAP);
+            command.args(bubblewrap_args(nodes)).arg(&exe);
+            command
+        }
+        StayOff::Nodes(_) => {
+            eprintln!(
+                "the desktop GPU needs the same driver as a GPU environments get, and \
+                 {BUBBLEWRAP} is missing to hide that GPU from the app"
+            );
+            Command::new(&exe)
+        }
+        _ => Command::new(&exe),
+    };
     command
         .args(std::env::args_os().skip(1))
         .env(MARKER, &joined);
-    match globs {
-        Some(globs) => command.env(VARIABLE, globs),
-        None => command.env_remove(VARIABLE),
+    match how {
+        StayOff::Drivers(globs) => command.env(VARIABLE, globs),
+        _ => command.env_remove(VARIABLE),
     };
     let error = command.exec();
     eprintln!("restarting for the environments' GPUs {joined}: {error}");
@@ -138,6 +206,27 @@ pub fn stay_off_reserved_gpu() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bubblewrap_keeps_only_the_given_nodes() {
+        assert_eq!(
+            bubblewrap_args(&["card1".into(), "renderD128".into()]),
+            [
+                "--dev-bind",
+                "/",
+                "/",
+                "--tmpfs",
+                "/dev/dri",
+                "--dev-bind",
+                "/dev/dri/card1",
+                "/dev/dri/card1",
+                "--dev-bind",
+                "/dev/dri/renderD128",
+                "/dev/dri/renderD128",
+                "--"
+            ]
+        );
+    }
 
     #[test]
     fn each_vendor_maps_to_its_driver_manifests() {

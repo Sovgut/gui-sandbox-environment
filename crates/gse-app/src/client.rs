@@ -137,6 +137,17 @@ pub fn antivirus() -> Result<Antivirus> {
     found.context("no antivirus in the reply")
 }
 
+/// The machine as the service reads it (`gse-service gpu hardware`).
+pub fn hardware() -> Result<String> {
+    let mut found = None;
+    call(&Request::Hardware, |reply| {
+        if let Reply::Hardware { text, .. } = reply {
+            found = Some(text);
+        }
+    })?;
+    found.context("no hardware in the reply")
+}
+
 pub fn environments() -> Result<Vec<Environment>> {
     let mut found = None;
     call(&Request::List, |reply| {

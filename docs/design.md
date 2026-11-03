@@ -26,8 +26,8 @@ machine.
 The service therefore has two GPU switch modes, chosen from the hardware:
 
 - **single**: the passed-through GPU drives the host desktop. Starting an environment
-  stops the display manager, ends the user's graphical sessions, unloads the
-  host driver and binds `vfio-pci`; shutting it down reverses that. Stopping
+  stops the display manager, ends the user's graphical sessions, unloads or
+  unbinds the host driver (see "Host side") and binds `vfio-pci`; shutting it down reverses that. Stopping
   plasmalogin alone does not end a running Plasma session: KWin keeps the GPU,
   and a KWin that is killed instead comes straight back through its wrapper
   and the plasma user units. KWin and plasmashell are units of the user's
@@ -56,20 +56,32 @@ The service therefore has two GPU switch modes, chosen from the hardware:
 
 ### Secondary mode prerequisites
 
-KWin opens every GPU, including one with no monitor, and so does kmscon. On
-the development PC the passed-through GPU is kept away from both:
+KWin opens every GPU, including one with no monitor, and so does kmscon.
+When exactly one GPU drives the monitor and another drives none, the
+install's `desktop` step (`crates/gse-service/src/desktop.rs`) keeps both
+on the desktop GPU, from the next login:
 
-- `KWIN_DRM_DEVICES=/dev/dri/desktop-card` in a drop-in for
-  `plasma-kwin_wayland.service`. `/dev/dri/desktop-card` is a udev symlink to
-  the desktop GPU by PCI address (`scripts/dev/61-desktop-card.rules`): `cardN`
-  numbers follow probe order, and by-path names contain `:`, KWin's list
-  separator.
-- A Vulkan loader settings file in `/etc/vulkan/loader_settings.d/`
-  (`scripts/dev/vk_loader_settings.json`) that gives `/usr/bin/kwin_wayland`
-  only the desktop GPU's driver. `kwin_wayland` has `cap_sys_nice`, so the
-  loader ignores `VK_*` variables in it; without the file NVK opens the other
-  GPU's primary and render nodes inside KWin.
-- `gpus=primary` in `/etc/kmscon/kmscon.conf`.
+- `KWIN_DRM_DEVICES=/dev/dri/gse-desktop-card` in a drop-in for every user's
+  `plasma-kwin_wayland.service`
+  (`/etc/systemd/user/plasma-kwin_wayland.service.d/gse-desktop-gpu.conf`).
+  `/dev/dri/gse-desktop-card` is a udev symlink to the desktop GPU's card
+  node by PCI address (`/etc/udev/rules.d/61-gse-desktop-card.rules`):
+  `cardN` numbers follow probe order, and by-path names contain `:`, KWin's
+  list separator.
+- A Vulkan loader settings file,
+  `/etc/vulkan/loader_settings.d/vk_loader_settings.json`, that gives
+  `/usr/bin/kwin_wayland` only the desktop GPU's Vulkan driver.
+  `kwin_wayland` has `cap_sys_nice`, so the loader ignores `VK_*` variables
+  in it; without the file NVK opens the other GPU's primary and render nodes
+  inside KWin. The loader reads only that file name, so one that gse did
+  not write stays, with a warning; and when both GPUs need the same Vulkan
+  driver, there is no file to write.
+- `gpus=primary` added to `/etc/kmscon/kmscon.conf` when the desktop GPU is
+  the boot GPU and the config sets no `gpus`.
+
+Uninstall removes what the step wrote. The development PC carries the same
+settings by hand (`scripts/dev/61-desktop-card.rules`,
+`scripts/dev/vk_loader_settings.json`).
 
 While an environment holds the GPU, host games started with PRIME offload to it fall
 back silently to the desktop GPU (Mesa ignores a `DRI_PRIME` that matches no
@@ -86,14 +98,145 @@ therefore tolerates exactly KWin with nothing but a render node open, and any
 other holder (an editor or browser rendering on the GPU, a game) makes the
 switch fail with its name until it is closed.
 
-### Guest GPU driver
+With the proprietary driver in the guest, the 3070 runs at PCIe 4.0 x16
+with Vulkan.
 
-RPM Fusion `akmod-nvidia` builds the NVIDIA open kernel module for the guest
-kernel; with it the guest sees the 3070 at PCIe 4.0 x16 with Vulkan.
+## Hardware support
 
-Other GPUs (AMD, Intel, older NVIDIA), Intel CPUs, a choice of guest driver
-and a hardware profile that decides what the base image carries are designed
-in `docs/hardware.md` and not implemented yet.
+gse has run on the RTX 3070 and a Ryzen CPU. Every other GPU and CPU goes
+the same way, decided from what the service reads of the machine, and was
+designed before it could be tried: the first runs on such hardware are for
+finding bugs, not missing parts.
+
+### Hardware profile
+
+`crates/gse-host/src/hardware.rs` reads the CPU (`/proc/cpuinfo`, the
+topology of each logical CPU, and on hybrid Intel CPUs
+`/sys/devices/cpu_core/cpus` and `cpu_atom/cpus`) and every GPU (sysfs, as
+`pci.rs` reads it, with `reset_method`) through a `Root`, so every test runs
+it on a fake tree. Hardware decisions are made from it.
+`gse-service gpu hardware` prints it, `Request::Hardware` answers it, and
+diagnostics carry it as `hardware.txt`.
+
+- **Families** (`crates/gse-host/src/families.rs`) come from the PCI vendor
+  and device ID. NVIDIA hands out device IDs in ascending blocks per
+  architecture: from `1e00` (Turing) on the card runs on NVIDIA's open
+  kernel module, from `1340` (Maxwell) to `1dff` (Volta) only on the legacy
+  proprietary branch, and below that on no current NVIDIA driver. AMD and
+  Intel IDs follow no order, so their discrete chips are listed by ID block;
+  an AMD ID missing there is an unknown card, an Intel one an integrated GPU.
+- **Companions** of a GPU are the functions in its slot and every endpoint
+  behind the card's own PCIe switch: the bridge two levels above the GPU,
+  when it has the GPU's vendor and is no root port (a root port's parent is
+  the host bridge, which has no address). The Arc A380's HDMI audio sits
+  behind such a switch, in another slot and its own IOMMU group. A
+  companion goes to the sandbox with the GPU.
+- **Support levels**: each GPU and the CPU is Tested, Expected or
+  Unsupported, with a reason the app shows under the Graphics card row
+  (Unsupported in red, Expected in amber) and in its menu:
+
+  | Hardware | Level | Reason |
+  | :--- | :--- | :--- |
+  | RTX 3070 | Tested | |
+  | Other NVIDIA Turing and newer | Expected | |
+  | NVIDIA Maxwell to Volta | Expected | the legacy driver in the sandbox |
+  | NVIDIA Kepler and older | Unsupported | no current proprietary driver; nouveau runs them at their lowest clocks |
+  | AMD RDNA 2 and newer | Expected | |
+  | AMD GCN 3 to RDNA 1 | Expected | they often fail to reset, unless `vendor-reset` gives them a `device_specific` reset method |
+  | AMD GCN 1 and 2 | Unsupported | `radeon`, no reset |
+  | Intel Arc | Expected | Resizable BAR in the firmware for full speed |
+  | Intel DG1 | Unsupported | the drivers take it only when forced |
+  | Any integrated GPU | Unsupported | it cannot be handed over whole |
+  | A GPU whose IOMMU group holds another endpoint | Unsupported | the group would take that device from the host |
+  | A GPU with no reset method | Expected | a crashed sandbox may leave it stuck |
+  | AMD CPU | Tested | |
+  | Intel CPU | Expected | |
+
+  An unsupported GPU stays selectable; a new machine's settings never pick
+  one, nor an integrated GPU.
+
+### Host side
+
+`crates/gse-host/src/drivers.rs` says per host driver what the hand-over
+needs. Only `nvidia` unloads modules (and stops `nvidia-powerd` and
+`nvidia-persistenced` in single mode), since it cannot let go of one device
+while it keeps others; `nouveau`, `amdgpu`, `i915` and `xe` unbind per
+device. Its control nodes count as holders besides the DRM nodes:
+`/dev/nvidia*` for `nvidia`, `/dev/kfd` (ROCm) for `amdgpu`.
+
+### Guest drivers
+
+- **Packs.** The base image carries the guest driver packs the GPUs in the
+  settings need, new sandboxes' and each sandbox's own
+  (`gse_host::hardware::packs`): `mesa` always (Mesa's OpenGL, Vulkan with
+  RADV, ANV and NVK, VA-API, and the AMD, Intel and NVIDIA GPU firmware),
+  `nvidia` for a Turing or newer card on the proprietary driver
+  (`akmod-nvidia` and its CUDA libraries, the open module), `nvidia-legacy`
+  for Maxwell to Volta on it (the RPM Fusion 580 branch with its closed
+  module), and `intel-media` (`intel-media-driver`) for an Intel GPU. The
+  two NVIDIA packs ship a module of one name, so settings that need both are
+  refused when the base image builds. The service writes the list to the
+  seed as `drivers`; `provision.sh` installs each pack, builds NVIDIA's
+  module with akmods for the newest installed kernel, and fails the build
+  when a pack leaves its module or Vulkan driver missing.
+- **Current base image.** The base image keeps its packs in
+  `/var/lib/gse/base.drivers` and a fingerprint of its provisioning script
+  and those packs in `base.fingerprint`. It is current while the script is
+  this service's and it holds every pack the settings need; a pack beyond
+  those does no harm, so choosing a driver the image has needs no build.
+- **The choice.** A sandbox's settings name the driver it runs the GPU with
+  (`gpu_driver`, absent for the default), among the GPU's own: Proprietary
+  (default) or Open (nouveau with NVK) for NVIDIA Maxwell and newer, only
+  nouveau for older NVIDIA cards, `i915` (default) or `xe` for Arc
+  Alchemist, `xe` for Battlemage, `amdgpu` for AMD. The app shows "Driver in
+  the sandbox" under the Graphics card row when there is a choice; the
+  service refuses a driver the GPU cannot run. The host driver plays no
+  part: the development PC runs the 3070 on nouveau, its sandbox on
+  NVIDIA's driver.
+- **At boot.** The image blacklists every GPU module and leaves them out of
+  the initramfs, so udev loads none. The service passes the choice as the
+  `fw_cfg` item `opt/gse/gpu-driver` (`xe:<device ID>` for `xe` on
+  Alchemist, which it takes only when told), and `gse-gpu-driver.service`
+  loads that module before greetd starts; nouveau is loaded with
+  `modeset=1`, since NVIDIA's packages set it to 0. When the item is absent
+  or the GPU ends up without a driver, the vendor's default loads instead.
+  The driver in use goes to the serial console (`console.log`) as
+  `GSE-GPU: <driver>`, or `GSE-GPU: none`.
+
+### CPU
+
+QEMU's `-cpu` is the host's, with `topoext=on` on AMD, without which an AMD
+guest sees no threads per core. The guest gets two threads per core only
+when the host's cores it runs on have two. On a hybrid Intel CPU the sandbox
+runs on the performance cores only: the service binds the thread that
+starts QEMU to them (`sched_setaffinity`), QEMU inherits it, and the CPU
+count is capped at theirs. Setup's warnings name the vendor's firmware
+switches (SVM and AMD-Vi, or VT-x and VT-d), and on Intel without IOMMU
+groups the kernel argument `intel_iommu=on`.
+
+### Desktop GPU of the same vendor
+
+The app draws with Vulkan, and the Vulkan loader opens every GPU whose
+driver it loads; a GPU the app holds cannot go to a sandbox. The app
+therefore restarts itself with `VK_LOADER_DRIVERS_DISABLE` set to the Vulkan
+drivers of the vendors of the GPUs sandboxes get (`crates/gse-app/src/gpu.rs`).
+When the desktop's GPU has the same vendor (an
+Intel iGPU beside an Arc card, an AMD APU beside a Radeon), the app restarts
+under `/usr/bin/bwrap` instead, with a `/dev/dri` that holds only the other
+GPUs' nodes. Checked on the development PC: Vulkan inside sees the A380 and
+llvmpipe, and no 3070.
+
+### Machines not at hand
+
+`crates/gse-host/src/machines.rs` builds machines gse has not run on from
+public data (an RX 6800 alone on a hybrid Intel CPU, an RX 580, an Arc A770
+beside an Intel iGPU, a Radeon beside an AMD APU, a GTX 1080, a GPU sharing
+its group with a USB controller) and checks the profile, support levels,
+packs and hand-over plans of each. `scripts/target/capture-machine.sh`
+copies what gse reads of a real machine into a tarball laid out like `/proc`
+and `/sys`, without disk UUIDs, host names or user names; the ignored test
+`machines::a_captured_machine` prints what gse makes of one unpacked at
+`GSE_MACHINE`.
 
 ## Isolation model
 
@@ -252,8 +395,9 @@ look into an environment without the app.
   bytes received and in all, while it downloads.
   A verified image stays in `/var/lib/gse/cache` and serves the next build
   while it still matches.
-- `akmod-nvidia` from RPM Fusion, built for the newest installed kernel since
-  the build VM runs an older one; the build fails if the module is missing.
+- The GPU driver packs the settings need (see "Guest drivers"), modules
+  built for the newest installed kernel since the build VM runs an older
+  one; the build fails if a pack's driver is missing.
 - Budgie on labwc (Wayland) with Xwayland for games: one panel at the
   bottom with the menu, the open windows, the tray and the clock
   (`/usr/share/budgie-desktop/layouts/gse.layout`), Papirus icons, a dark
@@ -279,8 +423,9 @@ look into an environment without the app.
   few bytes, since the guest reads an item from its start for every page.
   `gse-guest-update.service` puts a copy that matches in place before the
   agent, the journal stream and the desktop start, so a new gse brings its guest side
-  without a rebuilt image. Only a change to the provisioning script makes a
-  base image out of date. Programs of `guest` show their windows on the
+  without a rebuilt image. Only a change to the provisioning script, or a
+  driver pack the settings need and the image lacks, makes a base image out
+  of date. Programs of `guest` show their windows on the
   desktop of `sandbox` through it:
   - `desktop`, autostarted as `sandbox`, opens a Wayland socket for `guest`
     through the compositor's security-context protocol. labwc withholds every
@@ -410,8 +555,9 @@ voice activation does.
   script and the AppImages. Building does not require switching away from the
   host desktop.
 - The generated script installs the packages and Flatpaks, the Flatpak NVIDIA
-  GL extension matching the image's driver package (Flatpak would otherwise
-  pick it by the loaded module, which the build VM lacks), and extracts each
+  GL extension matching the image's driver package when the image has
+  NVIDIA's driver (Flatpak would otherwise pick it by the loaded module,
+  which the build VM lacks), and extracts each
   AppImage into `/opt/gse/apps/<name>` so the guest needs no FUSE. It
   then writes a menu entry for every application into `sandbox`'s
   `~/.local/share/applications`, overriding the package's own entry: `guest`
@@ -425,7 +571,7 @@ voice activation does.
   and the next start begins from the preset's image again.
 - A golden image ages; the app offers a rebuild with updates and reminds when an
   image is older than about two weeks.
-- The base layer of every preset (NVIDIA driver, session, users, SELinux, audio
+- The base layer of every preset (GPU drivers, session, users, SELinux, audio
   split, network config) is fixed and not editable in the UI.
 
 ### Epic Games Launcher
@@ -888,8 +1034,9 @@ the guest writes them and a hostile one could fill the disk. The host keeps
 what the guest's journal says and never parses it.
 
 "Save diagnostics" (About and updates, and a stopped first start) puts all
-of it, the settings and what the computer is (system, kernel, packages,
-GPUs and drivers, IOMMU, the service's journal) into one zip archive in the
+of it, the settings, what the computer is (system, kernel, packages,
+GPUs and drivers, IOMMU, the service's journal) and the service's hardware
+profile (`hardware.txt`) into one zip archive in the
 received files folder. `gse --diagnostics`, or the AppImage with that flag,
 makes the same archive from a terminal when the window does not open.
 
@@ -928,6 +1075,14 @@ makes the same archive from a terminal when the window does not open.
 
 ## Open questions
 
+- What only hardware gse has not run on can tell: whether `amdgpu` and
+  `xe` release a boot GPU cleanly in single mode, and how long they take to
+  come back; whether RDNA 3 and 4 cards come back to the host after a
+  sandbox without a reboot; whether an Arc card in the guest gets its full
+  BAR when the host has Resizable BAR; whether the legacy NVIDIA pack's
+  package names (`akmod-nvidia-580xx`, `xorg-x11-drv-nvidia-580xx-cuda`)
+  and its `MODULE_VARIANT=kernel` in `/etc/nvidia/kernel.conf` are right for
+  the guest's Fedora release.
 - How setup gets QEMU, OVMF and passt onto Bazzite: inside the
   AppImage, as layered packages (which need a reboot), or a container.
 

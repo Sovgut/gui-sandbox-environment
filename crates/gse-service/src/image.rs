@@ -85,6 +85,9 @@ pub struct BuildBaseArgs {
     /// next to this program.
     #[arg(long)]
     guest_bin: Option<PathBuf>,
+    /// The guest driver packs to install (see `guest/base/provision.sh`).
+    #[arg(long, value_delimiter = ',', default_value = "mesa,nvidia")]
+    drivers: Vec<String>,
 }
 
 #[derive(clap::Args)]
@@ -106,10 +109,12 @@ pub fn build_base(args: &BuildBaseArgs, stop: &AtomicBool, dry_run: bool) -> Res
         .map(|p| fs::read_to_string(p).with_context(|| format!("key {}", p.display())))
         .transpose()?;
     let guest = guest_program(args.guest_bin.as_deref())?;
+    let packs: Vec<&str> = args.drivers.iter().map(String::as_str).collect();
     build_base_image(
         &args.from,
         &args.out,
         guest,
+        &packs,
         key.as_deref(),
         &Job::invoked(stop),
         dry_run,
@@ -163,15 +168,17 @@ pub fn working_tree_dev_key() -> Option<String> {
     fs::read_to_string(key).ok()
 }
 
-/// What makes a base image what it is: its provisioning script, as a
-/// short hex digest. A base image built from another lacks what this
-/// service puts into images. The guest program is not part of it: every
-/// start hands over the current one.
-pub fn base_fingerprint() -> String {
+/// What makes a base image what it is: its provisioning script and the
+/// guest driver packs it installed, as a short hex digest. A base image
+/// built from another script lacks what this service puts into images, and
+/// one with other packs lacks a driver the settings need. The guest program
+/// is not part of it: every start hands over the current one.
+pub fn base_fingerprint(packs: &[&str]) -> String {
     use sha2::{Digest as _, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(b"gse base image 2\n");
     hasher.update(seed::BASE_PROVISION.as_bytes());
+    hasher.update(format!("drivers {}\n", packs.join(" ")).as_bytes());
     hasher
         .finalize()
         .iter()
@@ -184,22 +191,29 @@ pub fn base_fingerprint() -> String {
 }
 
 /// Builds the base image `out` from the Fedora Cloud image `from`, with
-/// `guest` as the guest-side program. With `dev_ssh_key`, the image keeps
-/// SSH and a `dev` account with that key.
+/// `guest` as the guest-side program and the guest driver `packs`, which
+/// travel on the seed as `drivers`, one a line. With `dev_ssh_key`, the
+/// image keeps SSH and a `dev` account with that key.
 pub fn build_base_image(
     from: &Path,
     out: &Path,
     guest: Vec<u8>,
+    packs: &[&str],
     dev_ssh_key: Option<&str>,
     job: &Job<'_>,
     dry_run: bool,
 ) -> Result<()> {
     let user_data = seed::cloud_config(seed::BASE_PROVISION, dev_ssh_key);
+    let mut drivers = packs.join("\n");
+    drivers.push('\n');
     build(
         from,
         out,
         &user_data,
-        &[(GUEST_BIN.to_owned(), guest)],
+        &[
+            (GUEST_BIN.to_owned(), guest),
+            ("drivers".to_owned(), drivers.into_bytes()),
+        ],
         job,
         dry_run,
     )
@@ -272,6 +286,7 @@ fn build_spec(
         firmware_vars: work.join("OVMF_VARS.qcow2"),
         memory_mib: 6144,
         cpus: 8,
+        cpu: crate::vm::host_cpu(),
         passthrough: Vec::new(),
         network: Network::Passt { socket },
         vnc_display: None,
@@ -288,6 +303,7 @@ fn build_spec(
         direct_io: crate::nocow::is_set(overlay),
         guest_program: None,
         image_build: true,
+        gpu_driver: None,
     }
 }
 

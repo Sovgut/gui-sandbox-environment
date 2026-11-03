@@ -4,7 +4,7 @@
 //! edits that sandbox's own. A change is saved as soon as it is made.
 
 use gpui::{Context, Div, FontWeight, Hsla, IntoElement, SharedString, div, prelude::*, px};
-use gse_protocol::{Gpu, Request, ScreenMode, Settings, SwitchMode};
+use gse_protocol::{Gpu, Request, ScreenMode, Settings, SupportLevel, SwitchMode};
 
 use crate::client::{self, Unanswered};
 use crate::text_input::TextInput;
@@ -36,6 +36,41 @@ pub fn explain(error: &anyhow::Error) -> SharedString {
             .into()
     } else {
         format!("{error:#}").into()
+    }
+}
+
+/// The line under the chosen graphics card: how it changes hands, and how
+/// well gse knows it to work when it has not been tested, in its color.
+fn gpu_line(gpu: &Gpu) -> (String, Hsla) {
+    let mode = match gpu.mode {
+        SwitchMode::Single => "Takes the monitor while it runs",
+        SwitchMode::Secondary => "Your desktop stays up while it runs",
+    };
+    match (gpu.support.level, &gpu.support.reason) {
+        (SupportLevel::Unsupported, reason) => (
+            format!(
+                "Not supported: {}",
+                reason.as_deref().unwrap_or("gse cannot run it")
+            ),
+            Theme::danger(),
+        ),
+        (SupportLevel::Expected, Some(reason)) => (
+            format!("{mode}. Not tested yet: {reason}"),
+            Theme::warning_text(),
+        ),
+        _ => (mode.to_owned(), Theme::muted()),
+    }
+}
+
+/// What people call the guest driver `driver`.
+pub(crate) fn driver_title(driver: &str) -> String {
+    match driver {
+        "nvidia" => "NVIDIA (proprietary)".to_owned(),
+        "nouveau" => "Open (nouveau, NVK)".to_owned(),
+        "amdgpu" => "AMDGPU (open)".to_owned(),
+        "i915" => "i915 (open)".to_owned(),
+        "xe" => "Xe (open)".to_owned(),
+        other => other.to_owned(),
     }
 }
 
@@ -571,13 +606,25 @@ impl Home {
             .enabled(self.graphics_open(target) && !gpus.is_empty()),
             gpus.iter()
                 .map(|g| {
+                    let note = if g.support.level == SupportLevel::Unsupported {
+                        Some("not supported")
+                    } else {
+                        g.monitor.then_some("drives the monitor")
+                    };
                     Choice::new(gpu_title(g, gpus), g.address.clone())
                         .current(chosen.is_some_and(|c| c.address == g.address))
-                        .note(g.monitor.then_some("drives the monitor"))
+                        .note(note)
                 })
                 .collect(),
             move |home, address: String, cx| {
-                home.change(target, |d| d.gpu = address, cx);
+                home.change(
+                    target,
+                    |d| {
+                        d.gpu = address;
+                        d.gpu_driver = None;
+                    },
+                    cx,
+                );
             },
             cx,
         )
@@ -594,10 +641,13 @@ impl Home {
         let enabled = self.graphics_open(target);
         let draft = self.draft_of(target);
         let chosen = draft.and_then(|d| gpus.iter().find(|g| g.address == d.gpu));
-        let gpu_hint = chosen.map(|g| match g.mode {
-            SwitchMode::Single => "Takes the monitor while it runs".to_owned(),
-            SwitchMode::Secondary => "Your desktop stays up while it runs".to_owned(),
+        let (gpu_line, line_color) = chosen.map_or((None, Theme::muted()), |g| {
+            let (line, color) = gpu_line(g);
+            (Some(line), color)
         });
+        let driver_row = chosen
+            .filter(|g| g.guest_drivers.len() > 1)
+            .map(|g| self.driver_row(target, g, cx));
         let gpu_menu = self.gpu_menu(target, gpus, chosen, cx);
         let single = chosen.is_some_and(|g| g.mode == SwitchMode::Single);
         let mode = self.draft_mode(target);
@@ -673,13 +723,49 @@ impl Home {
             )
         };
         let rows = rows_of(target);
-        rows.group(
-            Some("Graphics"),
-            vec![
-                rows.row("Graphics card", gpu_hint, gpu_menu),
-                rows.row("Screen size", None, screen),
-                rows.row("Frame rate", None, rate),
-            ],
+        let mut group = vec![rows.tinted_row("Graphics card", gpu_line, line_color, gpu_menu)];
+        group.extend(driver_row);
+        group.push(rows.row("Screen size", None, screen));
+        group.push(rows.row("Frame rate", None, rate));
+        rows.group(Some("Graphics"), group)
+    }
+
+    /// The row choosing the driver the sandbox runs `gpu` with, among the
+    /// ones it can run on; none stored means its default, the first.
+    fn driver_row(&self, target: Target, gpu: &Gpu, cx: &mut Context<Self>) -> Div {
+        let default = gpu.guest_drivers.first().cloned().unwrap_or_default();
+        let current = self
+            .draft_of(target)
+            .and_then(|d| d.gpu_driver.clone())
+            .filter(|d| gpu.guest_drivers.contains(d))
+            .unwrap_or_else(|| default.clone());
+        let menu = self.menu(
+            Picker::new(
+                match target {
+                    Target::Defaults => "defaults-gpu-driver",
+                    Target::Sandbox => "sandbox-gpu-driver",
+                },
+                driver_title(&current),
+            )
+            .enabled(self.graphics_open(target)),
+            gpu.guest_drivers
+                .iter()
+                .map(|d| {
+                    Choice::new(driver_title(d), d.clone())
+                        .current(*d == current)
+                        .note((*d == default).then_some("default"))
+                })
+                .collect(),
+            move |home, driver: String, cx| {
+                let stored = (driver != default).then_some(driver);
+                home.change(target, |d| d.gpu_driver = stored, cx);
+            },
+            cx,
+        );
+        rows_of(target).row(
+            "Driver in the sandbox",
+            Some("Loaded at each start; one the base image lacks has it rebuilt first".to_owned()),
+            menu,
         )
     }
 

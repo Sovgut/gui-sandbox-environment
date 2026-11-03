@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use gse_host::exec::{self, Executor, HostSystem};
+use gse_host::families::{self, Kind};
+use gse_host::hardware;
 use gse_host::pci::{Gpu, PciAddress};
 use gse_host::plan::{self, Handoff, Mode, VFIO_PCI};
 use gse_host::{Root, holders};
@@ -46,6 +48,7 @@ pub fn describe(root: &Root) -> Result<Vec<gse_protocol::Gpu>> {
         .map(|gpu| {
             let display = gpu.display();
             let (vendor, device) = pci_names(&ids, display.vendor, display.device);
+            let family = families::family(display.vendor, display.device);
             gse_protocol::Gpu {
                 address: display.address.to_string(),
                 vendor_id: display.vendor,
@@ -59,23 +62,51 @@ pub fn describe(root: &Root) -> Result<Vec<gse_protocol::Gpu>> {
                     Mode::Single => gse_protocol::SwitchMode::Single,
                     Mode::Secondary => gse_protocol::SwitchMode::Secondary,
                 },
+                family: (family.kind != Kind::Unknown).then(|| family.name.to_owned()),
+                integrated: family.integrated(),
+                support: hardware::gpu_support(root, gpu),
+                guest_drivers: family
+                    .guest_drivers()
+                    .iter()
+                    .map(|d| (*d).to_owned())
+                    .collect(),
             }
         })
         .collect())
 }
 
-/// The GPU a new machine's settings name: an NVIDIA or AMD card that
-/// drives no monitor if there is one, else one that does (the single-GPU
-/// case), else the first GPU.
+/// The GPU a new machine's settings name: a card gse supports that drives
+/// no monitor if there is one, else one that does (the single-GPU case),
+/// else the first GPU.
 pub fn default_gpu(root: &Root) -> Option<String> {
     let gpus = Gpu::discover(root).ok()?;
-    let discrete = |gpu: &&Gpu| matches!(gpu.display().vendor, 0x10de | 0x1002);
+    let discrete = |gpu: &&Gpu| {
+        let display = gpu.display();
+        !families::family(display.vendor, display.device).integrated()
+            && hardware::gpu_support(root, gpu).level != gse_protocol::SupportLevel::Unsupported
+    };
     gpus.iter()
         .filter(discrete)
         .find(|gpu| !gpu.drives_display())
         .or_else(|| gpus.iter().find(discrete))
         .or_else(|| gpus.first())
         .map(|gpu| gpu.display().address.to_string())
+}
+
+/// The `fw_cfg` item `opt/gse/gpu-driver` for a sandbox on `gpu` with the
+/// driver `chosen` (its default when none or not one of its own): the
+/// driver's name, and for `xe` on an Arc Alchemist the device ID it has to
+/// be told to take.
+pub fn guest_driver_item(root: &Root, gpu: PciAddress, chosen: Option<&str>) -> Option<String> {
+    let gpu = Gpu::read(root, gpu).ok()?;
+    let display = gpu.display();
+    let family = families::family(display.vendor, display.device);
+    let driver = hardware::guest_driver(family, chosen)?;
+    Some(if driver == "xe" && family.kind == Kind::IntelAlchemist {
+        format!("xe:{:04x}", display.device)
+    } else {
+        driver.to_owned()
+    })
 }
 
 pub fn list(root: &Root) -> Result<()> {

@@ -6,8 +6,13 @@
 //! out by [`exec::Executor`], which can also only log them (dry run). An environment
 //! VM is described by a [`vm::VmSpec`], which renders to a QEMU command line.
 
+pub mod drivers;
 pub mod exec;
+pub mod families;
+pub mod hardware;
 pub mod holders;
+#[cfg(test)]
+mod machines;
 pub mod net;
 pub mod pci;
 pub mod plan;

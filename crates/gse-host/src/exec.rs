@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use crate::holders::{self, Holder};
 use crate::pci::{Gpu, PciAddress};
-use crate::plan::{DISPLAY_MANAGER, GPU_SERVICES, Plan, Snapshot, Step};
+use crate::plan::{DISPLAY_MANAGER, Plan, Snapshot, Step};
 use crate::session;
 use crate::{Error, Result, Root};
 
@@ -58,12 +58,13 @@ pub fn snapshot(root: &Root, system: &dyn System, gpu: PciAddress) -> Result<Sna
         graphical_sessions.extend(session::parse_graphical_session(&id, &properties));
     }
     let sound_cards = crate::pci::movable_sound_cards(root, &gpu);
+    let services = crate::drivers::host_driver(gpu.display().driver.as_deref()).services;
     Ok(Snapshot {
         sound_cards,
         gpu,
         display_manager_active: active(DISPLAY_MANAGER),
         graphical_sessions,
-        gpu_services: GPU_SERVICES
+        gpu_services: services
             .iter()
             .filter(|u| active(u))
             .map(|u| (*u).to_owned())

@@ -118,6 +118,9 @@ enum Step {
     Programs,
     /// The unit, the polkit action, the sysusers entry and the settings.
     Files,
+    /// The files that keep the host desktop off the GPUs sandboxes get
+    /// (see [`crate::desktop`]).
+    Desktop,
     /// The network account.
     Account,
     /// The service, enabled and started on the new program.
@@ -131,6 +134,7 @@ impl Step {
             Self::Check => "check",
             Self::Programs => "programs",
             Self::Files => "files",
+            Self::Desktop => "desktop",
             Self::Account => "account",
             Self::Service => "service",
         }
@@ -183,7 +187,8 @@ fn run_step(step: Step, work: impl FnOnce(&mut dyn FnMut(String)) -> Result<()>)
 /// `install`. On stdout each step prints `step <id>` as it begins,
 /// `warning <id> <text>` for each thing it found that does not stop it, and
 /// `done <id>` or `failed <id> <reason>` as it ends. The steps are, in
-/// order, `check`, `programs`, `files`, `account` and `service`; a failed
+/// order, `packages`, `check`, `programs`, `files`, `desktop`, `account` and
+/// `service`; a failed
 /// step ends the install. Logs go to stderr.
 pub fn install(dry_run: bool) -> Result<()> {
     run_step(Step::Packages, |warning| install_packages(warning, dry_run))?;
@@ -193,6 +198,9 @@ pub fn install(dry_run: bool) -> Result<()> {
     })?;
     run_step(Step::Programs, |warning| install_programs(warning, dry_run))?;
     run_step(Step::Files, |warning| install_files(warning, dry_run))?;
+    run_step(Step::Desktop, |warning| {
+        crate::desktop::install(warning, dry_run)
+    })?;
     run_step(Step::Account, |_| create_account(dry_run))?;
     run_step(Step::Service, |_| start_service(dry_run))?;
     info!("gse is installed");
@@ -258,19 +266,42 @@ fn tools_missing() -> bool {
 /// and runs without it, so what is missing is a warning for the user to act
 /// on.
 fn check(warning: &mut dyn FnMut(String)) {
+    let cpu = gse_host::hardware::Cpu::read(&gse_host::Root::system()).ok();
+    let (virtualization, iommu) = cpu
+        .as_ref()
+        .map_or(("AMD SVM or Intel VT-x", "AMD-Vi or Intel VT-d"), |cpu| {
+            cpu.firmware_terms()
+        });
     if !Path::new("/dev/kvm").exists() {
-        warning(
-            "/dev/kvm is missing: turn on virtualization (AMD SVM or Intel VT-x) \
-             in the firmware settings"
-                .into(),
-        );
+        warning(format!(
+            "/dev/kvm is missing: turn on virtualization ({virtualization}) in the firmware \
+             settings"
+        ));
     }
     if fs::read_dir("/sys/kernel/iommu_groups").map_or(0, Iterator::count) == 0 {
-        warning(
-            "there are no IOMMU groups, so no GPU can be handed to an environment: \
-             turn on the IOMMU (AMD-Vi or Intel VT-d) in the firmware settings"
-                .into(),
-        );
+        let intel = cpu
+            .as_ref()
+            .is_some_and(|cpu| cpu.vendor == gse_host::hardware::CpuVendor::Intel);
+        warning(if intel {
+            format!(
+                "there are no IOMMU groups, so no GPU can be handed to an environment: turn \
+                 on {iommu} in the firmware settings, and if it is on already, add the kernel \
+                 argument intel_iommu=on"
+            )
+        } else {
+            format!(
+                "there are no IOMMU groups, so no GPU can be handed to an environment: turn \
+                 on {iommu} in the firmware settings"
+            )
+        });
+    }
+    if let Some(support) = cpu.map(|cpu| cpu.support())
+        && support.level == gse_protocol::SupportLevel::Unsupported
+    {
+        warning(format!(
+            "this CPU is not supported: {}",
+            support.reason.unwrap_or_default()
+        ));
     }
     if !vfio_pci_available() {
         warning(
@@ -653,7 +684,7 @@ fn hello() -> Result<(u32, String)> {
 }
 
 /// Runs `program` with `args`; a failure is logged, since removing goes on.
-fn run(program: &str, args: &[&str], dry_run: bool) {
+pub(crate) fn run(program: &str, args: &[&str], dry_run: bool) {
     info!("{program} {}", args.join(" "));
     if dry_run {
         return;
@@ -749,6 +780,7 @@ pub fn uninstall(dry_run: bool) {
     for file in FILES {
         remove(Path::new(file), dry_run);
     }
+    crate::desktop::uninstall(dry_run);
     info!("gse is removed");
 }
 

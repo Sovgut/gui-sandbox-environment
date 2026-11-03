@@ -16,9 +16,6 @@ pub const DISPLAY_MANAGER: &str = "display-manager.service";
 pub const GRAPHICAL_SESSION: &str = "graphical-session.target";
 pub const VFIO_PCI: &str = "vfio-pci";
 
-/// Services that keep the NVIDIA driver busy without holding a device node.
-pub const GPU_SERVICES: [&str; 2] = ["nvidia-powerd.service", "nvidia-persistenced.service"];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// The GPU drives the host desktop, which has to stop while an environment runs.
@@ -53,7 +50,8 @@ pub struct Snapshot {
     pub gpu: Gpu,
     pub display_manager_active: bool,
     pub graphical_sessions: Vec<Session>,
-    /// Running units from [`GPU_SERVICES`].
+    /// Running units of the host driver's
+    /// [`crate::drivers::HostDriver::services`].
     pub gpu_services: Vec<String>,
     /// Sound cards that go with the GPU in single mode (see
     /// [`crate::pci::movable_sound_cards`]).
@@ -240,24 +238,20 @@ pub struct Plan {
     pub steps: Vec<Step>,
 }
 
-/// Modules to remove before an NVIDIA card can leave its driver, in the order
-/// `modprobe -r` accepts them. Other drivers are simply unbound.
 fn unload_modules(driver: Option<&str>) -> Vec<String> {
-    match driver {
-        Some("nvidia") => ["nvidia_drm", "nvidia_modeset", "nvidia_uvm", "nvidia"]
-            .map(String::from)
-            .to_vec(),
-        _ => Vec::new(),
-    }
+    crate::drivers::host_driver(driver)
+        .unload
+        .iter()
+        .map(|m| (*m).to_owned())
+        .collect()
 }
 
 fn load_modules(driver: Option<&str>) -> Vec<String> {
-    match driver {
-        Some("nvidia") => ["nvidia", "nvidia_modeset", "nvidia_drm", "nvidia_uvm"]
-            .map(String::from)
-            .to_vec(),
-        _ => Vec::new(),
-    }
+    crate::drivers::host_driver(driver)
+        .load
+        .iter()
+        .map(|m| (*m).to_owned())
+        .collect()
 }
 
 /// The plan that hands the GPU to `vfio-pci`, and what to restore afterwards.

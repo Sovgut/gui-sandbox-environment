@@ -422,6 +422,10 @@ impl Home {
                     "system" => (Step::System, None),
                     "launchers" => (Step::Launchers, None),
                     "files" => (Step::Service, Some("Writing the service's settings")),
+                    "desktop" => (
+                        Step::Service,
+                        Some("Keeping the desktop on its own graphics card"),
+                    ),
                     "account" => (
                         Step::Service,
                         Some("Creating the service's network account"),

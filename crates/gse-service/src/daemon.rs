@@ -37,17 +37,36 @@ use crate::{antivirus, checks, fedora, gpu, image, mailbox, net, nocow, presets,
 
 /// The polkit action every client needs.
 pub const ACTION: &str = "io.github.sovgut.gse.manage";
-/// The fingerprint a base image built by this service has; none when its
-/// guest program, which every build needs, is missing.
-fn guest_fingerprint() -> Option<&'static str> {
-    static FINGERPRINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    FINGERPRINT
-        .get_or_init(|| {
-            image::guest_program(None)
-                .ok()
-                .map(|_| image::base_fingerprint())
+/// Whether this service has the guest program every base image build needs.
+fn has_guest_program() -> bool {
+    static HAS_GUEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS_GUEST.get_or_init(|| image::guest_program(None).is_ok())
+}
+
+/// The guest driver packs the base image needs for the GPUs the settings
+/// name, new environments' and each environment's own, with the drivers
+/// chosen for them (see `gse_host::hardware::packs`).
+fn base_packs(root: &Root, config: &Config, store: &Store) -> Result<Vec<&'static str>> {
+    let defaults = config.settings();
+    let mut named = vec![(defaults.gpu.clone(), defaults.gpu_driver.clone())];
+    named.extend(store.environments().into_iter().map(|(name, _)| {
+        let settings = store.settings(&name, &defaults);
+        (settings.gpu, settings.gpu_driver)
+    }));
+    let gpus: Vec<(gse_host::families::Family, Option<String>)> = named
+        .into_iter()
+        .filter_map(|(gpu, driver)| {
+            let gpu = gse_host::pci::Gpu::read(root, gpu.parse().ok()?).ok()?;
+            let display = gpu.display();
+            Some((
+                gse_host::families::family(display.vendor, display.device),
+                driver,
+            ))
         })
-        .as_deref()
+        .collect();
+    let chosen: Vec<(gse_host::families::Family, Option<&str>)> =
+        gpus.iter().map(|(f, d)| (*f, d.as_deref())).collect();
+    gse_host::hardware::packs(&chosen).map_err(anyhow::Error::msg)
 }
 
 /// How a start's journal line begins; the time a sandbox last played is
@@ -77,6 +96,9 @@ pub struct Config {
     pub memory_mib: u32,
     #[serde(default = "default_cpus")]
     pub cpus: u16,
+    /// The driver a new environment runs the GPU with; none for its default.
+    #[serde(default)]
+    pub gpu_driver: Option<String>,
     /// The Fedora release base images are built from; without it, the one
     /// the base provisioning script is made for ([`fedora::RELEASE`]).
     #[serde(default)]
@@ -172,6 +194,11 @@ impl Config {
                 format!("\n# The Fedora release base images are built from.\nfedora_release = {release}\n")
             })
             .unwrap_or_default();
+        let driver = self
+            .gpu_driver
+            .as_ref()
+            .map(|driver| format!("gpu_driver = \"{}\"\n", driver.escape_default()))
+            .unwrap_or_default();
         let dev = self
             .dev_ssh_port
             .map(|port| format!("\n# Development only.\ndev_ssh_port = {port}\n"))
@@ -183,6 +210,7 @@ impl Config {
              # own copy. The GPU is named as `gse-service gpu list` shows it,\n\
              # and the screen mode applies when the screen is shown in a window.\n\
              gpu = \"{}\"\n\
+             {driver}\
              screen_mode = \"{}\"\n\
              internet = {}\n\
              \n\
@@ -208,6 +236,7 @@ impl Config {
             gpu: self.gpu.to_string(),
             screen_mode: self.screen_mode.clone(),
             internet: self.internet,
+            gpu_driver: self.gpu_driver.clone(),
         }
     }
 }
@@ -233,16 +262,23 @@ fn replace_file(path: &Path, text: &str) -> Result<()> {
     })
 }
 
-/// Checks `settings` against the machine: the GPU must be one of `gpus` and
-/// a frame of the screen mode must fit a slot of the screen memory.
-fn validate(settings: &Settings, gpus: &[gse_protocol::Gpu]) -> Result<(PciAddress, ScreenMode)> {
+/// `settings` as checked against the machine: the GPU must be one of
+/// `gpus`, its driver one it can run on (none for its default), and a frame
+/// of the screen mode must fit a slot of the screen memory.
+fn validate(settings: &Settings, gpus: &[gse_protocol::Gpu]) -> Result<Settings> {
     let address: PciAddress = settings
         .gpu
         .parse()
         .with_context(|| format!("'{}' is not a PCI address", settings.gpu))?;
-    if !gpus.iter().any(|g| g.address == address.to_string()) {
+    let Some(gpu) = gpus.iter().find(|g| g.address == address.to_string()) else {
         bail!("{address} is not a GPU of this machine");
-    }
+    };
+    let gpu_driver = match settings.gpu_driver.as_deref() {
+        None => None,
+        Some(driver) if gpu.guest_drivers.first().map(String::as_str) == Some(driver) => None,
+        Some(driver) if gpu.guest_drivers.iter().any(|d| d == driver) => Some(driver.to_owned()),
+        Some(driver) => bail!("a sandbox cannot run {address} with {driver}"),
+    };
     let mode: ScreenMode = settings.screen_mode.parse().map_err(anyhow::Error::msg)?;
     let frame = u64::from(mode.width) * u64::from(mode.height) * 4;
     if frame > gse_screen::SLOT_SIZE as u64 {
@@ -252,7 +288,12 @@ fn validate(settings: &Settings, gpus: &[gse_protocol::Gpu]) -> Result<(PciAddre
             mode.height
         );
     }
-    Ok((address, mode))
+    Ok(Settings {
+        gpu: address.to_string(),
+        screen_mode: mode.to_string(),
+        internet: settings.internet,
+        gpu_driver,
+    })
 }
 
 /// Where images and environments live: `base.qcow2`, the base image presets
@@ -587,16 +628,26 @@ impl Store {
     }
 
     /// Puts the built base image in place, with the fingerprint of what it
-    /// was built from beside it. Images built on the old one stand on their
-    /// own and keep working; [`Store::stale_images`] names them.
-    fn replace_base(&self, built: &Path, fingerprint: &str) -> Result<()> {
+    /// was built from and the driver `packs` it holds beside it. Images
+    /// built on the old one stand on their own and keep working;
+    /// [`Store::stale_images`] names them.
+    fn replace_base(&self, built: &Path, packs: &[&str]) -> Result<()> {
         fs::rename(built, self.base()).context("putting the base image in place")?;
-        fs::write(self.base_fingerprint_path(), format!("{fingerprint}\n"))
-            .context("writing the base image's fingerprint")
+        fs::write(self.base_drivers_path(), format!("{}\n", packs.join(" ")))
+            .context("writing the base image's drivers")?;
+        fs::write(
+            self.base_fingerprint_path(),
+            format!("{}\n", image::base_fingerprint(packs)),
+        )
+        .context("writing the base image's fingerprint")
     }
 
     fn base_fingerprint_path(&self) -> PathBuf {
         self.root.join("base.fingerprint")
+    }
+
+    fn base_drivers_path(&self) -> PathBuf {
+        self.root.join("base.drivers")
     }
 
     /// The record of the base image the image `image` was built on.
@@ -695,24 +746,26 @@ impl Store {
             .collect()
     }
 
-    /// The base image: when it was built, and whether it was built from
-    /// `fingerprint`.
-    fn base_image(&self, fingerprint: Option<&str>) -> Option<BaseImage> {
+    /// The base image: when it was built, and whether it is current: built
+    /// by this service's provisioning script, with every driver pack of
+    /// `needed`. A pack it holds beyond those does no harm, so choosing a
+    /// driver the image already has needs no build. Without `needed` (no
+    /// guest program to build with) it is taken as it is.
+    fn base_image(&self, needed: Option<&[&str]>) -> Option<BaseImage> {
         let built = fs::metadata(self.base())
             .and_then(|m| m.modified())
             .ok()?
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let recorded = fs::read_to_string(self.base_fingerprint_path()).ok();
+        let drivers = fs::read_to_string(self.base_drivers_path()).unwrap_or_default();
+        let held: Vec<&str> = drivers.split_whitespace().collect();
         Some(BaseImage {
             built,
-            current: match (recorded, fingerprint) {
-                (Some(recorded), Some(fingerprint)) => recorded.trim() == fingerprint,
-                // Without the guest program to compare with, the base image
-                // is taken as it is.
-                (_, None) => true,
-                (None, Some(_)) => false,
-            },
+            current: needed.is_none_or(|needed| {
+                recorded.is_some_and(|r| r.trim() == image::base_fingerprint(&held))
+                    && needed.iter().all(|pack| held.contains(pack))
+            }),
         })
     }
 }
@@ -1007,6 +1060,11 @@ impl Service {
                 cpus: shared.config.cpus,
                 internet: settings.internet,
                 screen_mode: settings.screen_mode.clone(),
+                gpu_driver: gpu::guest_driver_item(
+                    &shared.root,
+                    gpu,
+                    settings.gpu_driver.as_deref(),
+                ),
                 owner: vm::Owner::from_uid(owner)?,
                 dev_ssh_port: shared.config.dev_ssh_port,
                 dev_vnc: None,
@@ -1303,15 +1361,22 @@ impl Service {
     fn start_base_build(&self, peer: Peer, report: Sender<BuildUpdate>) -> Result<()> {
         let guest = image::guest_program(None)?;
         let owner = vm::Owner::from_uid(peer.uid)?;
-        let (store, release, dev) = {
+        let (store, release, dev, packs) = {
             let shared = self.lock();
             let dev = shared.config.dev_ssh_port.is_some();
-            (shared.store.clone(), shared.config.fedora_release(), dev)
+            let packs = base_packs(&shared.root, &shared.config, &shared.store)?;
+            (
+                shared.store.clone(),
+                shared.config.fedora_release(),
+                dev,
+                packs,
+            )
         };
         let dev_key = dev.then(image::working_tree_dev_key).flatten();
         let stop = self.claim_build(BASE_IMAGE)?;
         info!(
-            "building the base image from Fedora {release} for {}",
+            "building the base image from Fedora {release} with the drivers {} for {}",
+            packs.join(", "),
             owner.name
         );
 
@@ -1339,13 +1404,19 @@ impl Service {
                 let job = image::Job::new(&stop, Some(owner.name), Some(steps));
                 let out = store.builds_dir().join(format!("{BASE_IMAGE}.qcow2"));
                 fs::remove_file(&out).ok();
-                let fingerprint = image::base_fingerprint();
-                let built =
-                    image::build_base_image(&from, &out, guest, dev_key.as_deref(), &job, false);
+                let built = image::build_base_image(
+                    &from,
+                    &out,
+                    guest,
+                    &packs,
+                    dev_key.as_deref(),
+                    &job,
+                    false,
+                );
                 console = job.console.get().cloned();
                 drop(job);
                 forwarder.join().ok();
-                built.and_then(|()| store.replace_base(&out, &fingerprint))
+                built.and_then(|()| store.replace_base(&out, &packs))
             });
             service.finish_build(BASE_IMAGE, outcome, console, &report);
         });
@@ -1676,12 +1747,7 @@ impl Service {
     /// environment follows at once.
     fn set_environment_settings(&self, name: &str, settings: &Settings) -> Result<()> {
         let root = self.lock().root.clone();
-        let (address, mode) = validate(settings, &gpu::describe(&root)?)?;
-        let settings = Settings {
-            gpu: address.to_string(),
-            screen_mode: mode.to_string(),
-            internet: settings.internet,
-        };
+        let settings = validate(settings, &gpu::describe(&root)?)?;
         let mut shared = self.lock();
         let before = shared.store.settings(name, &shared.config.settings());
         shared.store.image_of(name)?;
@@ -1695,7 +1761,10 @@ impl Service {
             _ => false,
         };
         drop(shared);
-        if before.gpu != settings.gpu || before.screen_mode != settings.screen_mode {
+        if before.gpu != settings.gpu
+            || before.screen_mode != settings.screen_mode
+            || before.gpu_driver != settings.gpu_driver
+        {
             self.log(
                 name,
                 format!(
@@ -1729,7 +1798,11 @@ impl Service {
                     steps: b.steps.clone(),
                     started: Some(b.started),
                 });
-                let base = shared.store.base_image(guest_fingerprint());
+                let packs = base_packs(&shared.root, &shared.config, &shared.store)
+                    .unwrap_or_else(|_| vec!["mesa"]);
+                let base = shared
+                    .store
+                    .base_image(has_guest_program().then_some(packs.as_slice()));
                 let stale = shared.store.stale_images();
                 let failed = shared
                     .store
@@ -1926,6 +1999,22 @@ impl Service {
                     },
                 )?;
             }
+            Request::Hardware => {
+                let root = self.lock().root.clone();
+                let cpu = gse_host::hardware::Cpu::read(&root)
+                    .map_or_else(|_| gse_protocol::Support::default(), |cpu| cpu.support());
+                let mut text = gse_host::hardware::describe(&root);
+                let shared = self.lock();
+                let drivers = match base_packs(&shared.root, &shared.config, &shared.store) {
+                    Ok(packs) => packs.join(" "),
+                    Err(e) => format!("unknown: {e:#}"),
+                };
+                text.push_str("base image needs the drivers ");
+                text.push_str(&drivers);
+                text.push('\n');
+                drop(shared);
+                send(out, &Reply::Hardware { text, cpu })?;
+            }
         }
         send(out, &Reply::Done)?;
         Ok(())
@@ -1934,18 +2023,22 @@ impl Service {
     /// Replaces the settings new environments start with.
     fn set_defaults(&self, settings: &Settings) -> Result<()> {
         let root = self.lock().root.clone();
-        let (address, mode) = validate(settings, &gpu::describe(&root)?)?;
+        let settings = validate(settings, &gpu::describe(&root)?)?;
         let mut shared = self.lock();
         let config = Config {
-            gpu: address,
-            screen_mode: mode.to_string(),
+            gpu: settings.gpu.parse()?,
+            screen_mode: settings.screen_mode.clone(),
             internet: settings.internet,
+            gpu_driver: settings.gpu_driver.clone(),
             ..shared.config.clone()
         };
         if config != shared.config {
             config.save(Path::new(CONFIG))?;
             info!(
-                "settings of new environments: GPU {address}, screen {mode}, internet {}",
+                "settings of new environments: GPU {} ({}), screen {}, internet {}",
+                settings.gpu,
+                settings.gpu_driver.as_deref().unwrap_or("default driver"),
+                settings.screen_mode,
                 on_off(settings.internet)
             );
             shared.config = config;
@@ -2332,6 +2425,7 @@ mod tests {
             internet: false,
             memory_mib: 4096,
             cpus: 2,
+            gpu_driver: Some("nouveau".into()),
             fedora_release: Some(44),
             dev_ssh_port: Some(2222),
         };
@@ -2373,15 +2467,34 @@ mod tests {
             monitor: false,
             monitor_mode: None,
             mode: gse_protocol::SwitchMode::Secondary,
+            family: None,
+            integrated: false,
+            support: gse_protocol::Support::default(),
+            guest_drivers: vec!["nvidia".into(), "nouveau".into()],
         }];
         let settings = |gpu: &str, screen_mode: &str| Settings {
             gpu: gpu.into(),
             screen_mode: screen_mode.into(),
             internet: true,
+            gpu_driver: None,
         };
-        let (address, mode) = validate(&settings("0e:00.0", "3840x2160@120"), &gpus).unwrap();
-        assert_eq!(address.to_string(), "0000:0e:00.0");
-        assert_eq!(mode.to_string(), "3840x2160@120");
+        let checked = validate(&settings("0e:00.0", "3840x2160@120"), &gpus).unwrap();
+        assert_eq!(checked.gpu, "0000:0e:00.0");
+        assert_eq!(checked.screen_mode, "3840x2160@120");
+        let with = |driver: &str| Settings {
+            gpu_driver: Some(driver.into()),
+            ..settings("0e:00.0", "1920x1080@60")
+        };
+        assert_eq!(
+            validate(&with("nouveau"), &gpus)
+                .unwrap()
+                .gpu_driver
+                .as_deref(),
+            Some("nouveau")
+        );
+        // The default driver is stored as none, so it follows the default.
+        assert_eq!(validate(&with("nvidia"), &gpus).unwrap().gpu_driver, None);
+        assert!(validate(&with("amdgpu"), &gpus).is_err());
         assert!(validate(&settings("0000:07:00.0", "1920x1080@60"), &gpus).is_err());
         assert!(validate(&settings("nonsense", "1920x1080@60"), &gpus).is_err());
         assert!(validate(&settings("0000:0e:00.0", "1920x1080@300"), &gpus).is_err());
@@ -2473,6 +2586,7 @@ mod tests {
             gpu: "0000:0e:00.0".into(),
             screen_mode: "2560x1440@60".into(),
             internet: true,
+            gpu_driver: None,
         }
     }
 
@@ -2499,6 +2613,7 @@ mod tests {
             gpu: "0000:07:00.0".into(),
             screen_mode: "1920x1080@144".into(),
             internet: false,
+            gpu_driver: None,
         };
         store.set_settings("a", &own).unwrap();
         assert_eq!(store.settings("a", &defaults()), own);
@@ -2573,13 +2688,24 @@ mod tests {
         fs::write(store.base(), "old").unwrap();
         let built = store.builds_dir().join("base.qcow2");
         fs::write(&built, "new").unwrap();
-        store.replace_base(&built, "abc").unwrap();
+        store.replace_base(&built, &["mesa", "nvidia"]).unwrap();
         assert_eq!(fs::read_to_string(store.base()).unwrap(), "new");
         assert!(!built.exists());
-        assert!(store.replace_base(&built, "abc").is_err());
+        assert!(store.replace_base(&built, &["mesa"]).is_err());
         assert_eq!(fs::read_to_string(store.base()).unwrap(), "new");
-        assert!(store.base_image(Some("abc")).unwrap().current);
-        assert!(!store.base_image(Some("other")).unwrap().current);
+        // It holds what the settings need, or more.
+        assert!(store.base_image(Some(&["mesa", "nvidia"])).unwrap().current);
+        assert!(store.base_image(Some(&["mesa"])).unwrap().current);
+        assert!(
+            !store
+                .base_image(Some(&["mesa", "intel-media"]))
+                .unwrap()
+                .current
+        );
+        // One built by another provisioning script is out of date.
+        fs::write(store.base_fingerprint_path(), "other\n").unwrap();
+        assert!(!store.base_image(Some(&["mesa"])).unwrap().current);
+        assert!(store.base_image(None).unwrap().current);
     }
 
     /// A service over a store in `dir` that runs nothing.

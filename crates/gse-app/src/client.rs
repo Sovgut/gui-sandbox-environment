@@ -85,6 +85,37 @@ pub struct Antivirus {
     pub error: Option<String>,
 }
 
+/// Where the sandboxes are kept, how many bytes they take and how many are
+/// free beside them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Storage {
+    pub path: std::path::PathBuf,
+    pub used: u64,
+    pub free: u64,
+}
+
+pub fn storage() -> Result<Storage> {
+    let mut found = None;
+    call(&Request::Storage, |reply| {
+        if let Reply::Storage { path, used, free } = reply {
+            found = Some(Storage { path, used, free });
+        }
+    })?;
+    found.context("no storage in the reply")
+}
+
+/// Moves the sandboxes to the disk of `to`, telling `progress` the bytes
+/// moved and in all.
+pub fn move_storage(to: &std::path::Path, mut progress: impl FnMut(u64, u64)) -> Result<()> {
+    call(
+        &Request::MoveStorage { to: to.to_owned() },
+        |reply| match reply {
+            Reply::Moving { done, total } => progress(done, total),
+            reply => eprintln!("unexpected reply: {reply:?}"),
+        },
+    )
+}
+
 pub fn antivirus() -> Result<Antivirus> {
     let mut found = None;
     call(&Request::Antivirus, |reply| {

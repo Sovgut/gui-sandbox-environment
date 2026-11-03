@@ -721,6 +721,12 @@ fn stop_environment(dry_run: bool) {
 pub fn uninstall(dry_run: bool) {
     stop_environment(dry_run);
     run("systemctl", &["disable", "--now", UNIT_NAME], dry_run);
+    // Data kept on another disk goes with the link to it.
+    if let Some(real) = crate::storage::real_data()
+        && real != Path::new(crate::storage::DATA)
+    {
+        remove(&real, dry_run);
+    }
     remove(Path::new(&format!("{UNIT}.d")), dry_run);
     remove(Path::new(UNIT), dry_run);
     run("systemctl", &["daemon-reload"], dry_run);

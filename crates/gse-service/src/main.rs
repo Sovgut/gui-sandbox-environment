@@ -19,6 +19,7 @@ mod net;
 mod nocow;
 mod presets;
 mod setup;
+mod storage;
 mod vm;
 
 use std::fs;

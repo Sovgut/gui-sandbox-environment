@@ -24,6 +24,7 @@ mod screen;
 mod settings;
 mod setup;
 mod shell;
+mod storage;
 mod text_input;
 mod transfer;
 mod ui;
@@ -356,6 +357,11 @@ struct Home {
     /// The app an update started: it updates the service as soon as it
     /// finds it older.
     finish_update: bool,
+    /// Where the sandboxes are kept, as the service last said; the folder
+    /// chosen to move them to, waiting for a yes; the move under way.
+    storage: Option<client::Storage>,
+    storage_target: Option<std::path::PathBuf>,
+    moving_storage: Option<transfer::Flow>,
     app_config: config::AppConfig,
     update: update::State,
     /// The update banner was put off with Later until the app starts again.
@@ -470,6 +476,9 @@ impl Home {
             flows: BTreeMap::new(),
             antivirus: None,
             finish_update: std::env::var_os(update::FINISH_UPDATE).is_some(),
+            storage: None,
+            storage_target: None,
+            moving_storage: None,
             app_config,
             update: update::State::Idle,
             update_later: false,
@@ -639,7 +648,7 @@ impl Home {
     fn reload(cx: &mut Context<Self>) {
         Self::reload_presets(cx);
         cx.spawn(async move |this, cx| {
-            let (loaded, settings, service, antivirus) = cx
+            let (loaded, settings, service, antivirus, storage) = cx
                 .background_executor()
                 .spawn(async {
                     let loaded = client::environments().and_then(|e| Ok((e, client::images()?)));
@@ -648,12 +657,16 @@ impl Home {
                         client::settings(),
                         client::hello(),
                         client::antivirus(),
+                        client::storage(),
                     )
                 })
                 .await;
             this.update(cx, |home, cx| {
                 if let Ok(antivirus) = antivirus {
                     home.antivirus = Some(antivirus);
+                }
+                if let Ok(storage) = storage {
+                    home.storage = Some(storage);
                 }
                 match &service {
                     Ok(found) if *found != home.service => {

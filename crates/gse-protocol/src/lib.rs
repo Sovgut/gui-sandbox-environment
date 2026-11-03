@@ -33,7 +33,7 @@ pub const SOCKET: &str = "/run/gse/service.sock";
 /// The protocol's version: a client and a service speak to each other only
 /// when theirs match ([`Request::Hello`]). It changes with every change to
 /// the messages.
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 
 /// The name a build of the base image goes by wherever a preset's name
 /// would stand: in [`Event::Build`], [`Event::BuildFinished`] and
@@ -155,6 +155,16 @@ pub enum Request {
     Restart,
     /// What the antivirus is: [`Reply::Antivirus`].
     Antivirus,
+    /// Where the sandboxes are kept: [`Reply::Storage`].
+    Storage,
+    /// Move everything the service keeps to the folder `gse` in `to`, or
+    /// back to the system disk for `/var/lib`, while nothing runs or
+    /// builds; [`Reply::Moving`] says how far it got.
+    MoveStorage {
+        to: PathBuf,
+    },
+    /// Stop a [`Request::MoveStorage`] under way; what it copied goes.
+    CancelMove,
     /// The presets and the image build in progress, if any.
     Presets,
     /// Create or replace the preset of the same name.
@@ -210,6 +220,18 @@ pub enum Reply {
     Settings {
         settings: Settings,
         gpus: Vec<Gpu>,
+    },
+    /// Where the sandboxes are kept, how many bytes they take and how many
+    /// are free beside them.
+    Storage {
+        path: PathBuf,
+        used: u64,
+        free: u64,
+    },
+    /// How far a [`Request::MoveStorage`] got: `done` of `total` bytes.
+    Moving {
+        done: u64,
+        total: u64,
     },
     /// The antivirus every file taken out passes: its engine's version,
     /// when its signatures were written and when it last updated, in

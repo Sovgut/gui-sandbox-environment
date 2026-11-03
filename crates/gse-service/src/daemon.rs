@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::agent::Agent;
-use crate::{antivirus, checks, fedora, gpu, image, mailbox, net, nocow, presets, vm};
+use crate::{antivirus, checks, fedora, gpu, image, mailbox, net, nocow, presets, storage, vm};
 
 /// The polkit action every client needs.
 pub const ACTION: &str = "io.github.sovgut.gse.manage";
@@ -771,6 +771,9 @@ struct Shared {
     /// The sends in under way, by environment, each with the flag that
     /// stops it.
     sends: HashMap<String, Arc<AtomicBool>>,
+    /// A move of the data to another disk under way, with the flag that
+    /// stops it; nothing starts or builds meanwhile.
+    moving: Option<Arc<AtomicBool>>,
 }
 
 /// A send in under way; it leaves the service's list when it ends.
@@ -800,6 +803,66 @@ impl Service {
         self.lock()
             .watchers
             .retain(|w| w.send(event.clone()).is_ok());
+    }
+
+    /// Where the data is kept and moving it.
+    fn handle_storage(&self, request: Request, out: &mut UnixStream) -> Result<()> {
+        match request {
+            Request::Storage => {
+                let usage = storage::usage()?;
+                send(
+                    out,
+                    &Reply::Storage {
+                        path: usage.path,
+                        used: usage.used,
+                        free: usage.free,
+                    },
+                )?;
+            }
+            Request::MoveStorage { to } => self.move_storage(&to, out)?,
+            Request::CancelMove => {
+                let shared = self.lock();
+                let stop = shared.moving.as_ref().context("nothing is being moved")?;
+                stop.store(true, Ordering::SeqCst);
+                info!("stopping the move of the sandboxes");
+            }
+            _ => unreachable!("not a storage request"),
+        }
+        Ok(())
+    }
+
+    /// Moves the data to the disk of `to` while nothing runs or builds,
+    /// telling the client on `out` how far it got.
+    fn move_storage(&self, to: &Path, out: &mut UnixStream) -> Result<()> {
+        let destination = storage::check(to)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let mut shared = self.lock();
+            if let Some(current) = &shared.current {
+                bail!("'{}' is running; stop it first", current.name);
+            }
+            if let Some(build) = &shared.build {
+                bail!("the image '{}' is building; wait for it", build.preset);
+            }
+            if shared.moving.is_some() {
+                bail!("the sandboxes are being moved already");
+            }
+            shared.moving = Some(Arc::clone(&stop));
+        }
+        mailbox::yield_to_others();
+        let mut last: Option<Instant> = None;
+        let moved = storage::move_to(
+            &destination,
+            &mut |done, total| {
+                if done >= total || last.is_none_or(|at| at.elapsed() >= SENDING_EVERY) {
+                    last = Some(Instant::now());
+                    send(out, &Reply::Moving { done, total }).ok();
+                }
+            },
+            &stop,
+        );
+        self.lock().moving = None;
+        moved
     }
 
     /// Notes a send in to `name`, which [`Request::CancelTransfer`] can
@@ -919,6 +982,9 @@ impl Service {
     ) -> Result<()> {
         let (launch, stop, root) = {
             let mut shared = self.lock();
+            if shared.moving.is_some() {
+                bail!("the sandboxes are being moved to another disk");
+            }
             if let Some(current) = &shared.current {
                 bail!("'{}' is running", current.name);
             }
@@ -1114,6 +1180,9 @@ impl Service {
     fn claim_build(&self, name: &str) -> Result<Arc<AtomicBool>> {
         let stop = Arc::new(AtomicBool::new(false));
         let mut shared = self.lock();
+        if shared.moving.is_some() {
+            bail!("the sandboxes are being moved to another disk");
+        }
         if let Some(current) = &shared.current {
             bail!("'{}' is running; images build once it stops", current.name);
         }
@@ -1757,6 +1826,7 @@ impl Service {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // one arm per request, most a line
     fn handle(&self, request: Request, peer: Peer, out: &mut UnixStream) -> Result<()> {
         match request {
             Request::Hello => send(
@@ -1841,6 +1911,9 @@ impl Service {
                 send(out, &Reply::Settings { settings, gpus })?;
             }
             Request::SetSettings { settings } => self.set_defaults(&settings)?,
+            Request::Storage | Request::MoveStorage { .. } | Request::CancelMove => {
+                self.handle_storage(request, out)?;
+            }
             Request::Antivirus => {
                 let state = antivirus::Antivirus::new(antivirus::ROOT).state();
                 send(
@@ -2209,6 +2282,7 @@ pub fn serve(root: Root) -> Result<()> {
         watchers: Vec::new(),
         agent: Arc::default(),
         sends: HashMap::new(),
+        moving: None,
     })));
     for stream in listener.incoming() {
         let stream = match stream {
@@ -2521,6 +2595,7 @@ mod tests {
             watchers: Vec::new(),
             agent: Arc::default(),
             sends: HashMap::new(),
+            moving: None,
         })))
     }
 

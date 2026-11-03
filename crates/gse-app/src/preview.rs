@@ -117,6 +117,11 @@ impl Home {
         self.tour = None;
         self.setup = None;
         self.toasts.clear();
+        self.storage = Some(client::Storage {
+            path: "/var/lib/gse".into(),
+            used: 61_000_000_000,
+            free: 412_000_000_000,
+        });
         self.antivirus = Some(client::Antivirus {
             engine: Some("1.5.4".into()),
             database: Some(data::at(6, 12)),

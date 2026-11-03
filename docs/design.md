@@ -739,8 +739,8 @@ one. One window:
   internet applies at once. Reset and Delete sit in a danger zone below,
   each asking a second time, and wait until the sandbox stops.
 - **Settings** replace the sidebar with their own menu:
-  - General: the look (system, light or dark), the received files folder
-    and the welcome tour, kept per user in `~/.config/gse/app.toml`, and
+  - General: the look (system, light or dark), the received files folder,
+    where the sandboxes are kept (see "Storage") and the welcome tour, kept per user in `~/.config/gse/app.toml`, and
     "Remove everything", which asks in a dialog that says what goes and how
     much it takes, offers to keep the taken files, and waits for the word
     `remove`.
@@ -797,6 +797,23 @@ one. One window:
   their settings, each stage, settings and internet changes, stops and
   why, resets and new images. Lines from the guest agent will be marked
   as the guest's, since malware can write them.
+
+### Storage
+
+Everything the service keeps (the base image, the sets' images, the
+sandboxes with their /home, the download cache, the antivirus) is reached
+as `/var/lib/gse` (`crates/gse-service/src/storage.rs`). Settings, General
+moves it to another disk: the user picks a folder, the service checks that
+it is on ext4, btrfs, xfs or f2fs (NTFS, exFAT and FAT keep no Linux owners,
+modes or SELinux labels and run disk images slowly), that every folder above
+it is root's alone (a folder a user can change would let any program of
+that user swap the images), and that the data and 20 GB more fit. While no
+sandbox runs or builds, it copies everything to `gse` in that folder with
+its owners, modes and times, paced like a send and with progress and
+Cancel (`MoveStorage`, `Moving`, `CancelMove`), then makes `/var/lib/gse` a
+link to it, writes a drop-in with `RequiresMountsFor=` so the service waits
+for that disk at boot, and removes the old copy. Moving to `/var/lib` brings
+it back. "Remove everything" removes the data on the other disk too.
 
 ### Previews
 

@@ -792,6 +792,39 @@ pub const STATES: &[State] = &[
         settings(home, AppTab::General);
         home.app_config.look = crate::config::Look::System;
     }),
+    state(
+        "storage-confirm",
+        "settings: moving the sandboxes, asked",
+        |home, _| {
+            settings(home, AppTab::General);
+            home.storage_target = Some("/mnt/games".into());
+        },
+    ),
+    state(
+        "storage-moving",
+        "settings: the sandboxes moving to another disk",
+        |home, _| {
+            settings(home, AppTab::General);
+            home.moving_storage = Some(crate::transfer::Flow::at(
+                "Moving the sandboxes",
+                24_000_000_000,
+                61_000_000_000,
+                300,
+            ));
+        },
+    ),
+    state(
+        "storage-away",
+        "settings: the sandboxes on another disk",
+        |home, _| {
+            settings(home, AppTab::General);
+            home.storage = Some(crate::client::Storage {
+                path: "/mnt/games/gse".into(),
+                used: 61_000_000_000,
+                free: 840_000_000_000,
+            });
+        },
+    ),
     // Settings: Sets of apps.
     state(
         "sets",

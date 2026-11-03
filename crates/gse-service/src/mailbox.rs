@@ -131,7 +131,7 @@ const PACE: u64 = 32 << 20;
 /// [`PACE`] it waits until what it wrote is on disk. A bulk copy into the
 /// page cache otherwise leaves gigabytes for the kernel to flush at once,
 /// and on btrfs every program that touches the disk waits for that flush.
-fn paced_copy(from: &mut impl io::Read, to: &mut File) -> io::Result<u64> {
+pub(crate) fn paced_copy(from: &mut impl io::Read, to: &mut File) -> io::Result<u64> {
     let mut buffer = vec![0; 1 << 20];
     let mut written = 0_u64;
     let mut paced = 0_u64;

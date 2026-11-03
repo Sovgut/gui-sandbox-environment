@@ -58,11 +58,11 @@ pub(crate) struct Flow {
     pub(crate) done: u64,
     pub(crate) total: u64,
     since: std::time::Instant,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Flow {
-    fn new(doing: &'static str, total: u64) -> Self {
+    pub(crate) fn new(doing: &'static str, total: u64) -> Self {
         Self {
             doing,
             done: 0,
@@ -82,13 +82,13 @@ impl Flow {
         flow
     }
 
-    fn stopped(&self) -> bool {
+    pub(crate) fn stopped(&self) -> bool {
         self.stop.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// `412 MB of 1.2 GB · about 2 minutes left`; the time once there is
     /// a pace to tell it by.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         let mut text = format!(
             "{}: {} of {}",
             self.doing,
@@ -106,7 +106,7 @@ impl Flow {
     }
 
     /// How much of it is done, from 0 to 1.
-    fn share(&self) -> f32 {
+    pub(crate) fn share(&self) -> f32 {
         if self.total == 0 {
             return 0.;
         }
@@ -268,7 +268,7 @@ fn outcome(color: Hsla, text: String) -> Div {
 }
 
 /// A bar `share` full, from 0 to 1.
-fn bar(share: f32) -> Div {
+pub(crate) fn bar(share: f32) -> Div {
     div().h(px(6.)).rounded(px(3.)).bg(Theme::track()).child(
         div()
             .h_full()
@@ -1029,9 +1029,8 @@ impl Home {
             .child(self.send_section(name, inbox, (busy, up), cx).px_6().py_5())
     }
 
-    /// App settings, General: the look, where taken files go, the tour,
-    /// and removing GSE.
-    pub(crate) fn general_view(&self, cx: &mut Context<Self>) -> Div {
+    /// The look's choice: system, light or dark.
+    fn look_choice(&self, cx: &mut Context<Self>) -> Div {
         let look = self.app_config.look;
         let choice =
             |id: &'static str, label: &'static str, value: Look, cx: &mut Context<Self>| {
@@ -1043,10 +1042,16 @@ impl Home {
                     cx.listener(move |home, _, window, cx| home.set_look(value, window, cx)),
                 )
             };
-        let looks = ui::segments()
+        ui::segments()
             .child(choice("look-system", "System", Look::System, cx))
             .child(choice("look-light", "Light", Look::Light, cx))
-            .child(choice("look-dark", "Dark", Look::Dark, cx));
+            .child(choice("look-dark", "Dark", Look::Dark, cx))
+    }
+
+    /// App settings, General: the look, where taken files go, where the
+    /// sandboxes are kept, the tour, and removing GSE.
+    pub(crate) fn general_view(&self, cx: &mut Context<Self>) -> Div {
+        let looks = self.look_choice(cx);
         let folder = shown_path(&self.app_config.received);
         let rows = Rows::Headlines.group(
             None,
@@ -1069,6 +1074,7 @@ impl Home {
                     .size(Size::Toolbar)
                     .fill(Theme::selected()),
                 ),
+                self.storage_row(cx),
                 Rows::Headlines.row(
                     "Show the welcome tour again",
                     Some("From the first step, any time.".to_owned()),

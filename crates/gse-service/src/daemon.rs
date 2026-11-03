@@ -1362,10 +1362,15 @@ impl Service {
             };
             if !mailbox::waiting(&dir).is_empty() {
                 match service.with_agent(&name, |agent| mailbox::deliver(&dir, agent)) {
-                    Ok(count) => service.log(
-                        &name,
-                        format!("{count} file(s) that waited put into the Inbox"),
-                    ),
+                    Ok(delivered) => {
+                        service.log(
+                            &name,
+                            format!("{} file(s) that waited put into the Inbox", delivered.files),
+                        );
+                        for (path, why) in delivered.stayed {
+                            service.log(&name, format!("{path} still waits for the Inbox: {why}"));
+                        }
+                    }
                     Err(e) => warn!("{name}: delivering the waiting files: {e:#}"),
                 }
             }

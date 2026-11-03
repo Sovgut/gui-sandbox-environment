@@ -176,6 +176,15 @@ impl Agent {
         {
             self.abandon_upload();
         }
+        // A host that moved on to something else sends no more of the
+        // batch: it ends short, so the desktop stops waiting for it.
+        if !matches!(
+            body,
+            Call::Put { .. } | Call::Chunk { .. } | Call::PutEnd { .. }
+        ) && let Some(mut batch) = self.incoming.take()
+        {
+            batch.end();
+        }
         Ok(Some(match body {
             Call::Hello => Answer::Hello {
                 version: agent::VERSION,
@@ -217,8 +226,12 @@ impl Agent {
                 self.get(id, &path)?;
                 return Ok(None);
             }
+            // An empty batch only ends the one before, which the check
+            // above did.
             Call::Incoming { files, bytes } => {
-                self.incoming = Some(crate::incoming::Batch::new(files, bytes));
+                if files > 0 {
+                    self.incoming = Some(crate::incoming::Batch::new(files, bytes));
+                }
                 Answer::Done
             }
         }))

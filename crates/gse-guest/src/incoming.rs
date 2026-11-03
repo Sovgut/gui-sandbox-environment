@@ -149,6 +149,13 @@ impl Batch {
         self.write(false);
     }
 
+    /// The batch ends short of its files: the host moved on without the
+    /// rest.
+    pub fn end(&mut self) {
+        self.status.finished = true;
+        self.write(true);
+    }
+
     /// A file arrived whole; returns whether it was the last.
     pub fn arrived(&mut self) -> bool {
         self.status.arrived += 1;
@@ -202,7 +209,7 @@ pub fn watch() {
             }
             if !told {
                 told = true;
-                notify_arrived(status.files);
+                notify_arrived(status.arrived, status.files);
             }
             continue;
         }
@@ -247,11 +254,23 @@ fn open_window() -> Option<Child> {
         .ok()
 }
 
-fn notify_arrived(files: u32) {
-    let title = if files == 1 {
-        "1 file arrived in the Inbox".to_owned()
+fn notify_arrived(arrived: u32, files: u32) {
+    let (title, body) = if arrived < files {
+        (
+            format!("{arrived} of {files} files arrived in the Inbox"),
+            "The rest still wait on the host for the next start; the sandbox's Activity on the \
+             host says why.",
+        )
+    } else if files == 1 {
+        (
+            "1 file arrived in the Inbox".to_owned(),
+            "Open the Inbox on the desktop to use it.",
+        )
     } else {
-        format!("{files} files arrived in the Inbox")
+        (
+            format!("{files} files arrived in the Inbox"),
+            "Open the Inbox on the desktop to use them.",
+        )
     };
     Command::new("gdbus")
         .args([
@@ -267,7 +286,7 @@ fn notify_arrived(files: u32) {
             "0",
             "folder",
             &title,
-            "Open the Inbox on the desktop to use them.",
+            body,
             "[]",
             "{}",
             "0",

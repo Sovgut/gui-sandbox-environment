@@ -243,19 +243,44 @@ pub fn waiting(dir: &Path) -> Vec<GuestFile> {
 }
 
 /// Puts the waiting files into the Inbox through `agent`; returns how many.
-pub fn deliver(dir: &Path, agent: &mut Agent) -> Result<usize> {
+pub fn deliver(dir: &Path, agent: &mut Agent) -> Result<Delivered> {
     let files = files_below(&waiting_dir(dir));
-    if !files.is_empty() {
-        agent.announce(files.len(), files.iter().map(|(_, _, size)| size).sum())?;
+    if files.is_empty() {
+        return Ok(Delivered::default());
     }
+    agent.announce(files.len(), files.iter().map(|(_, _, size)| size).sum())?;
+    let mut delivered = Delivered::default();
     for (path, full, size) in &files {
-        let mut file = File::open(full)?;
-        let executable = file.metadata()?.mode() & 0o100 != 0;
-        agent.put(path, &mut file, *size, executable)?;
-        fs::remove_file(full).ok();
+        let put = File::open(full)
+            .map_err(anyhow::Error::from)
+            .and_then(|mut file| {
+                let executable = file.metadata()?.mode() & 0o100 != 0;
+                agent.put(path, &mut file, *size, executable)
+            });
+        match put {
+            Ok(()) => {
+                fs::remove_file(full).ok();
+                delivered.files += 1;
+            }
+            // The others still go in; this one waits for the next start.
+            Err(e) => delivered.stayed.push((path.clone(), format!("{e:#}"))),
+        }
     }
-    fs::remove_dir_all(waiting_dir(dir)).ok();
-    Ok(files.len())
+    if delivered.stayed.is_empty() {
+        fs::remove_dir_all(waiting_dir(dir)).ok();
+    } else {
+        // An empty batch ends the one the guest shows, short of its files.
+        agent.announce(0, 0).ok();
+    }
+    Ok(delivered)
+}
+
+/// What [`deliver`] did: how many files went into the Inbox, and the ones
+/// that stayed waiting, with why.
+#[derive(Debug, Default)]
+pub struct Delivered {
+    pub files: usize,
+    pub stayed: Vec<(String, String)>,
 }
 
 /// The files taken out while the environment ran, which the app has not

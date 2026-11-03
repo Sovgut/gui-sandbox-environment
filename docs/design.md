@@ -433,7 +433,10 @@ version. A preset installs it as an `appimage` entry.
   files wait in its folder (`inbox-waiting/`) and go into the Inbox once it
   is up; the agent then shows them arriving on the guest's desktop (a
   window with a bar, the file and the time left, from `/run/gse/incoming`
-  the agent writes) and a notification once they are in. A send copies at
+  the agent writes) and a notification once they are in. A file that
+  cannot go in stays waiting for the next start while the others go; the
+  window then ends short of it, the notification says how many arrived,
+  and the sandbox's journal says why the rest stayed. A send copies at
   the lowest best-effort I/O priority and nice 10, and waits for every
   32 MiB it wrote to be on disk, so it never leaves gigabytes for the
   kernel to flush at once; on btrfs such a flush stalls every program that

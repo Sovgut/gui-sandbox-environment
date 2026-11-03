@@ -91,6 +91,10 @@ switch fail with its name until it is closed.
 RPM Fusion `akmod-nvidia` builds the NVIDIA open kernel module for the guest
 kernel; with it the guest sees the 3070 at PCIe 4.0 x16 with Vulkan.
 
+Other GPUs (AMD, Intel, older NVIDIA), Intel CPUs, a choice of guest driver
+and a hardware profile that decides what the base image carries are designed
+in `docs/hardware.md` and not implemented yet.
+
 ## Isolation model
 
 - **KVM/QEMU VM with VFIO passthrough of the whole 3070** (GPU and its HDMI
@@ -501,7 +505,7 @@ version. A preset installs it as an `appimage` entry.
   mounts an environment's filesystem.
 - The host treats every byte from the agent as hostile, since malware can
   replace the agent in the overlay. Still to come: receiving in a separate
-  process under bubblewrap and seccomp, ClamAV, per-game allowlists, and
+  process under bubblewrap and seccomp, per-game allowlists, and
   an extractor VM (no network, no GPU, the disk read-only) that empties the
   Outbox of an environment that was stopped in an emergency.
 
@@ -917,15 +921,14 @@ makes the same archive from a terminal when the window does not open.
   updates, "Install and restart") downloads it, checks the signature,
   replaces the AppImage file
   and starts the new one; an update that does not check out is never
-  installed, since the AppImage carries the service that runs as root. A
-  running sandbox keeps running. About and updates in app settings shows
+  installed, since the AppImage carries the service that runs as root.
+  Install is refused while a sandbox runs, since the service it updates
+  runs that sandbox. About and updates in app settings shows
   the version and looks on demand.
-- Still to come: the new AppImage updating the installed service it
-  carries, through the install it runs on first start.
 
 ## Open questions
 
-- How setup gets QEMU, OVMF, passt and ClamAV onto Bazzite: inside the
+- How setup gets QEMU, OVMF and passt onto Bazzite: inside the
   AppImage, as layered packages (which need a reboot), or a container.
 
 - A game library disk that survives reset (per environment, off by default) or full

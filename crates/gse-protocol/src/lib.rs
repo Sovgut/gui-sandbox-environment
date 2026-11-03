@@ -515,10 +515,11 @@ pub mod agent {
     pub const JOURNAL_PORT: &str = "io.github.sovgut.gse.journal";
     /// The agent's version: 2 knows [`Call::Incoming`], 3 takes files up
     /// to [`MAX_SENT_FILE`], 4 knows [`Call::Collecting`],
-    /// [`Call::Outgoing`], [`Call::Collected`] and [`Call::Leaving`]. A host
-    /// speaks to any agent from [`MIN_VERSION`] on, so environments made
-    /// from an older image keep working.
-    pub const VERSION: u32 = 4;
+    /// [`Call::Outgoing`], [`Call::Collected`] and [`Call::Leaving`], 5
+    /// knows [`Call::Import`]. A host speaks to any agent from
+    /// [`MIN_VERSION`] on, so environments made from an older image keep
+    /// working.
+    pub const VERSION: u32 = 5;
     pub const MIN_VERSION: u32 = 1;
     /// Raw bytes per chunk of a file; in base64 a chunk stays well under
     /// [`crate::MAX_LINE`].
@@ -599,18 +600,195 @@ pub mod agent {
         Get {
             path: String,
         },
+        /// Put the files of the carrier disk with the serial `serial` (see
+        /// [`crate::carrier`]) into the Inbox. Answered with
+        /// [`Answer::Importing`] now and then while it copies, and an
+        /// [`Answer::Imported`] at its end. Version 5 on.
+        Import {
+            serial: String,
+        },
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(tag = "answer", rename_all = "kebab-case")]
     pub enum Answer {
-        Hello { version: u32 },
-        Processes { apps: Vec<GuestApp> },
-        Files { files: GuestFiles },
-        Chunk { data: String },
-        GetEnd { size: u64, sha256: String },
+        Hello {
+            version: u32,
+        },
+        Processes {
+            apps: Vec<GuestApp>,
+        },
+        Files {
+            files: GuestFiles,
+        },
+        Chunk {
+            data: String,
+        },
+        GetEnd {
+            size: u64,
+            sha256: String,
+        },
+        /// How many bytes of a [`Call::Import`] are in so far.
+        Importing {
+            done: u64,
+        },
+        /// How many files of a [`Call::Import`] went into the Inbox, and the
+        /// ones that did not, with why.
+        Imported {
+            put: usize,
+            failed: Vec<(String, String)>,
+        },
         Done,
-        Error { message: String },
+        Error {
+            message: String,
+        },
+    }
+}
+
+/// A carrier: files the host hands an environment on a read-only disk of
+/// their own instead of through the agent's port, which is far too slow for
+/// games of tens of gigabytes. A carrier is a plain file on the host and a
+/// virtio disk with the serial [`carrier::SERIAL`] and a number in the guest.
+///
+/// It holds the files back to back, each from a [`carrier::BLOCK`]-aligned
+/// offset, then the [`carrier::Index`] as JSON from an aligned offset, and
+/// ends with one block, the trailer: [`carrier::MAGIC`], a newline, the
+/// index's offset and length in decimal and a newline, padded with zeros.
+pub mod carrier {
+    use serde::{Deserialize, Serialize};
+
+    pub const BLOCK: u64 = 4096;
+    pub const MAGIC: &str = "GSE-CARRIER 1";
+    /// The serial of a carrier disk is this and its number.
+    pub const SERIAL: &str = "gse-inbox-";
+    /// The most carrier disks an environment starts with.
+    pub const MAX_DISKS: usize = 8;
+    /// The longest index a guest reads.
+    pub const MAX_INDEX: u64 = 16 << 20;
+
+    /// A file in a carrier.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Entry {
+        /// Where it goes in the Inbox, as a relative path.
+        pub path: String,
+        pub size: u64,
+        pub executable: bool,
+        /// Where its bytes start.
+        pub offset: u64,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Index {
+        pub files: Vec<Entry>,
+    }
+
+    /// `n` rounded up to a whole [`BLOCK`].
+    #[must_use]
+    pub const fn align(n: u64) -> u64 {
+        n.div_ceil(BLOCK) * BLOCK
+    }
+
+    /// The trailer for an index at `offset`, `len` bytes long.
+    #[must_use]
+    pub fn trailer(offset: u64, len: u64) -> Vec<u8> {
+        let mut block = format!("{MAGIC}\n{offset} {len}\n").into_bytes();
+        block.resize(usize::try_from(BLOCK).unwrap_or(4096), 0);
+        block
+    }
+
+    /// The index's offset and length from a trailer.
+    #[must_use]
+    pub fn parse_trailer(block: &[u8]) -> Option<(u64, u64)> {
+        let text = std::str::from_utf8(block.split(|b| *b == 0).next()?).ok()?;
+        let mut lines = text.lines();
+        if lines.next()? != MAGIC {
+            return None;
+        }
+        let (offset, len) = lines.next()?.split_once(' ')?;
+        Some((offset.parse().ok()?, len.parse().ok()?))
+    }
+
+    impl Index {
+        /// Checks that every file lies whole, aligned and apart from the
+        /// others, before `end` (the index's offset), within the sizes the
+        /// Inbox takes.
+        pub fn check(&self, end: u64) -> Result<(), String> {
+            if self.files.len() > crate::agent::MAX_FILES {
+                return Err(format!("{} files are too many", self.files.len()));
+            }
+            let mut free = 0;
+            for entry in &self.files {
+                if entry.offset % BLOCK != 0 || entry.offset < free {
+                    return Err(format!("{} lies where it cannot", entry.path));
+                }
+                if entry.size > crate::agent::MAX_SENT_FILE {
+                    return Err(format!("{} is too large", entry.path));
+                }
+                free = entry
+                    .offset
+                    .checked_add(entry.size)
+                    .filter(|e| *e <= end)
+                    .ok_or_else(|| format!("{} runs past the files", entry.path))?;
+            }
+            Ok(())
+        }
+
+        /// The bytes of all its files.
+        #[must_use]
+        pub fn bytes(&self) -> u64 {
+            self.files.iter().map(|f| f.size).sum()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_trailer_reads_back_and_rejects_anything_else() {
+            let block = trailer(8192, 77);
+            assert_eq!(block.len(), 4096);
+            assert_eq!(parse_trailer(&block), Some((8192, 77)));
+            assert_eq!(parse_trailer(&[0; 4096]), None);
+            assert_eq!(parse_trailer(b"GSE-CARRIER 2\n1 2\n"), None);
+        }
+
+        #[test]
+        fn files_must_lie_whole_and_apart() {
+            let entry = |offset, size| Entry {
+                path: "a".into(),
+                size,
+                executable: false,
+                offset,
+            };
+            let good = Index {
+                files: vec![entry(0, 5000), entry(8192, 10)],
+            };
+            assert!(good.check(12288).is_ok());
+            assert_eq!(good.bytes(), 5010);
+            assert!(good.check(8195).is_err());
+            assert!(
+                Index {
+                    files: vec![entry(0, 5000), entry(4096, 10)]
+                }
+                .check(1 << 20)
+                .is_err()
+            );
+            assert!(
+                Index {
+                    files: vec![entry(100, 1)]
+                }
+                .check(1 << 20)
+                .is_err()
+            );
+            assert!(
+                Index {
+                    files: vec![entry(u64::MAX - 4095, 4096)]
+                }
+                .check(u64::MAX)
+                .is_err()
+            );
+        }
     }
 }
 

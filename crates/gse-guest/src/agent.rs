@@ -18,12 +18,13 @@ use std::io::{BufReader, Read as _, Write as _};
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use gse_protocol::agent::{self, Answer, Call, Message};
+use gse_protocol::carrier::{self, Entry, Index};
 use gse_protocol::{GuestApp, GuestFile, GuestFiles, GuestProcess, receive, send};
 use rustix::fs::{FileType, Gid, Mode, OFlags, ResolveFlags, Uid};
 use rustix::process::{Pid, PidfdFlags, Signal};
@@ -57,6 +58,12 @@ const MAX_DEPTH: usize = 16;
 /// How many parents up from a program's first process the program that
 /// started it is looked for.
 const MAX_ANCESTRY: usize = 64;
+/// How much of a file arriving in the Inbox is written before it is synced
+/// to disk: the last sync, which the host waits for, stays short, and no
+/// gigabytes pile up in the page cache for the kernel to flush at once.
+const PACE: u64 = 32 << 20;
+/// How often an import tells the host how far it got.
+const PROGRESS_EVERY: Duration = Duration::from_secs(2);
 
 /// The `guest` account.
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +130,8 @@ struct Upload {
     name: String,
     remaining: u64,
     hash: Sha256,
+    /// Bytes written since the last sync.
+    unsynced: u64,
 }
 
 struct Agent {
@@ -184,7 +193,7 @@ impl Agent {
         // batch: it ends short, so the desktop stops waiting for it.
         if !matches!(
             body,
-            Call::Put { .. } | Call::Chunk { .. } | Call::PutEnd { .. }
+            Call::Put { .. } | Call::Chunk { .. } | Call::PutEnd { .. } | Call::Import { .. }
         ) && let Some(mut batch) = self.incoming.take()
         {
             batch.end();
@@ -230,6 +239,7 @@ impl Agent {
                 self.get(id, &path)?;
                 return Ok(None);
             }
+            Call::Import { serial } => self.import(id, &serial)?,
             // An empty batch only ends the one before, which the check
             // above did.
             Call::Incoming { files, bytes } => {
@@ -351,6 +361,7 @@ impl Agent {
             name,
             remaining: size,
             hash: Sha256::new(),
+            unsynced: 0,
         });
         Ok(())
     }
@@ -365,7 +376,15 @@ impl Agent {
         }
         upload.remaining -= len;
         upload.hash.update(&bytes);
-        if let Err(e) = upload.file.write_all(&bytes) {
+        let written = upload.file.write_all(&bytes).and_then(|()| {
+            upload.unsynced += len;
+            if upload.unsynced >= PACE {
+                upload.unsynced = 0;
+                upload.file.sync_data()?;
+            }
+            Ok(())
+        });
+        if let Err(e) = written {
             self.abandon_upload();
             return Err(e.into());
         }
@@ -388,6 +407,102 @@ impl Agent {
             bail!("the file arrived damaged");
         }
         upload.file.sync_all()?;
+        if self
+            .incoming
+            .as_mut()
+            .is_some_and(crate::incoming::Batch::arrived)
+        {
+            self.incoming = None;
+        }
+        Ok(())
+    }
+
+    /// Puts the files of the carrier disk `serial` into the Inbox (see
+    /// `gse_protocol::carrier`), telling the host how far it got every
+    /// [`PROGRESS_EVERY`]. The host wrote the carrier, but a carrier is
+    /// read as carefully as anything else that names paths in the Inbox.
+    fn import(&mut self, id: u64, serial: &str) -> Result<Answer> {
+        use std::os::unix::fs::FileExt as _;
+        let number = serial
+            .strip_prefix(carrier::SERIAL)
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .context("not the serial of a carrier")?;
+        let device = format!("/dev/disk/by-id/virtio-{}{number}", carrier::SERIAL);
+        let disk = File::open(&device).with_context(|| device.clone())?;
+        let size = rustix::fs::seek(&disk, rustix::fs::SeekFrom::End(0))?;
+        let mut block = vec![0; usize::try_from(carrier::BLOCK)?];
+        disk.read_exact_at(
+            &mut block,
+            size.checked_sub(carrier::BLOCK).context("no trailer")?,
+        )?;
+        let (offset, len) = carrier::parse_trailer(&block).context("no carrier on the disk")?;
+        if len > carrier::MAX_INDEX || offset.saturating_add(len) > size {
+            bail!("the carrier's index lies outside it");
+        }
+        let mut index = vec![0; usize::try_from(len)?];
+        disk.read_exact_at(&mut index, offset)?;
+        let index: Index = serde_json::from_slice(&index).context("the carrier's index")?;
+        index.check(offset).map_err(anyhow::Error::msg)?;
+        let mut put = 0;
+        let mut failed = Vec::new();
+        let mut progress = (0, Instant::now());
+        for entry in index.files {
+            match self.import_file(id, &disk, &entry, &mut progress) {
+                Ok(()) => put += 1,
+                Err(e) => failed.push((entry.path, format!("{e:#}"))),
+            }
+        }
+        Ok(Answer::Imported { put, failed })
+    }
+
+    /// Copies one file of a carrier into the Inbox; `progress` holds the
+    /// bytes copied in all and when the host last heard of them.
+    fn import_file(
+        &mut self,
+        id: u64,
+        disk: &File,
+        entry: &Entry,
+        progress: &mut (u64, Instant),
+    ) -> Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        self.start_upload(id, &entry.path, entry.size, entry.executable)?;
+        let upload = self.upload.take().context("no file is arriving")?;
+        let copied = (|| -> Result<()> {
+            let mut buffer = vec![0; 1 << 20];
+            let mut file = &upload.file;
+            let mut copied = 0;
+            let mut unsynced = 0;
+            while copied < entry.size {
+                let part = usize::try_from((entry.size - copied).min(buffer.len() as u64))?;
+                disk.read_exact_at(&mut buffer[..part], entry.offset + copied)?;
+                file.write_all(&buffer[..part])?;
+                copied += part as u64;
+                unsynced += part as u64;
+                if unsynced >= PACE {
+                    unsynced = 0;
+                    file.sync_data()?;
+                }
+                if let Some(batch) = &mut self.incoming {
+                    batch.bytes(part as u64);
+                }
+                progress.0 += part as u64;
+                if progress.1.elapsed() >= PROGRESS_EVERY {
+                    self.answer(id, Answer::Importing { done: progress.0 })?;
+                    progress.1 = Instant::now();
+                }
+            }
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = copied {
+            rustix::fs::unlinkat(
+                &upload.dir,
+                upload.name.as_str(),
+                rustix::fs::AtFlags::empty(),
+            )
+            .ok();
+            return Err(e);
+        }
         if self
             .incoming
             .as_mut()

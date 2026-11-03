@@ -44,6 +44,10 @@ pub struct VmSpec {
     pub home_disk: Option<PathBuf>,
     /// Extra raw disks attached read-only, such as a cloud-init seed.
     pub read_only_disks: Vec<PathBuf>,
+    /// Carriers of files for the Inbox (`gse_protocol::carrier`), attached
+    /// read-only as disks with the serials `gse-inbox-0`, `gse-inbox-1`...
+    /// in this order.
+    pub inbox_disks: Vec<PathBuf>,
     /// This VM's copy of the UEFI variable store.
     pub firmware_vars: PathBuf,
     pub memory_mib: u32,
@@ -207,6 +211,20 @@ impl VmSpec {
                 ),
                 "-device".to_owned(),
                 "virtio-blk-pci,drive=home,serial=gse-home".to_owned(),
+            ]);
+        }
+        for (index, carrier) in self.inbox_disks.iter().enumerate() {
+            args.extend([
+                "-drive".to_owned(),
+                format!(
+                    "if=none,id=inbox{index},file={},format=raw,readonly=on",
+                    carrier.display()
+                ),
+                "-device".to_owned(),
+                format!(
+                    "virtio-blk-pci,drive=inbox{index},serial={}{index}",
+                    gse_protocol::carrier::SERIAL
+                ),
             ]);
         }
         args
@@ -443,6 +461,7 @@ mod tests {
             disk: "/vm/disk.qcow2".into(),
             home_disk: None,
             read_only_disks: vec!["/vm/seed.img".into()],
+            inbox_disks: Vec::new(),
             firmware_vars: "/vm/OVMF_VARS.qcow2".into(),
             memory_mib: 12288,
             cpus: 8,
@@ -653,6 +672,24 @@ mod tests {
                 "qemu-xhci,id=usb",
                 "usb-host,bus=usb.0,id=usb-host0,hostbus=1,hostaddr=5"
             ]
+        );
+    }
+
+    #[test]
+    fn carriers_go_as_read_only_disks_with_numbered_serials() {
+        let mut environment = spec();
+        environment.inbox_disks = vec![
+            "/var/lib/gse/a.carrier".into(),
+            "/var/lib/gse/b.carrier".into(),
+        ];
+        let args = environment.command_line();
+        let drives = after(&args, "-drive");
+        assert!(
+            drives
+                .contains(&"if=none,id=inbox1,file=/var/lib/gse/b.carrier,format=raw,readonly=on")
+        );
+        assert!(
+            after(&args, "-device").contains(&"virtio-blk-pci,drive=inbox0,serial=gse-inbox-0")
         );
     }
 

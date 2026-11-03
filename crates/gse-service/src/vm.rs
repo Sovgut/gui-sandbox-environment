@@ -79,6 +79,8 @@ pub struct Launch {
     pub name: String,
     pub disk: PathBuf,
     pub read_only_disks: Vec<PathBuf>,
+    /// Carriers of files waiting for the Inbox (see `VmSpec::inbox_disks`).
+    pub inbox_disks: Vec<PathBuf>,
     pub gpu: PciAddress,
     pub memory_mib: u32,
     pub cpus: u16,
@@ -169,6 +171,7 @@ pub fn run(root: &Root, args: &RunArgs, stop: &AtomicBool, dry_run: bool) -> Res
             .iter()
             .map(|p| fs::canonicalize(p).with_context(|| format!("disk {}", p.display())))
             .collect::<Result<Vec<_>>>()?,
+        inbox_disks: Vec::new(),
         gpu: args.gpu,
         memory_mib: args.memory_mib,
         cpus: args.cpus,
@@ -237,6 +240,7 @@ pub fn launch_environment(
         disk: launch.disk.clone(),
         home_disk: home.clone(),
         read_only_disks: launch.read_only_disks.clone(),
+        inbox_disks: launch.inbox_disks.clone(),
         firmware_vars: dir.join("OVMF_VARS.qcow2"),
         memory_mib: launch.memory_mib,
         cpus: guest_cpus(launch.cpus, &cpu),

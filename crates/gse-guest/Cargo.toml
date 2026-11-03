@@ -16,6 +16,7 @@ gse-protocol = { path = "../gse-protocol" }
 base64 = "0.22"
 rustix = { version = "1", features = ["fs", "process"] }
 sha2 = "0.10"
+serde_json.workspace = true
 
 [lints]
 workspace = true

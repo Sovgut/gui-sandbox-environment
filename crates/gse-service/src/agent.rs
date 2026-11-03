@@ -19,6 +19,9 @@ use sha2::{Digest as _, Sha256};
 
 /// How long one answer may take.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the answer to a file put into the Inbox may take: the guest
+/// writes it to disk as it arrives, but the last part is synced first.
+const PUT_END_TIMEOUT: Duration = Duration::from_secs(120);
 /// Lines with another call's id skipped before giving up on an answer.
 const MAX_STRAY: usize = 64;
 /// The most processes a listing may hold.
@@ -254,10 +257,41 @@ impl Agent {
                 },
             },
         )?;
-        match self.answer(id)? {
+        // The guest syncs the file before it answers.
+        self.stream.set_read_timeout(Some(PUT_END_TIMEOUT))?;
+        let answer = self.answer(id);
+        self.stream.set_read_timeout(Some(ANSWER_TIMEOUT))?;
+        match answer? {
             Answer::Done if sent == size => Ok(()),
             Answer::Done => bail!("{path} was shorter than its size"),
             _ => bail!("the agent answered something else"),
+        }
+    }
+
+    /// Has the agent put the files of the carrier disk `serial` into the
+    /// Inbox; returns how many went in, and the ones that did not with why.
+    /// Its progress keeps the answer's timeout from running out however
+    /// long the copy takes.
+    pub fn import(&mut self, serial: &str) -> Result<(usize, Vec<(String, String)>)> {
+        if self.version < 5 {
+            bail!("this sandbox's agent cannot read files from a disk");
+        }
+        let id = self.call(Call::Import {
+            serial: serial.to_owned(),
+        })?;
+        loop {
+            match self.answer(id)? {
+                Answer::Importing { .. } => {}
+                Answer::Imported { put, mut failed } => {
+                    failed.truncate(agent::MAX_FILES);
+                    for (path, why) in &mut failed {
+                        path.truncate(4096);
+                        why.truncate(500);
+                    }
+                    return Ok((put, failed));
+                }
+                _ => bail!("the agent answered something else"),
+            }
         }
     }
 

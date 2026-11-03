@@ -22,6 +22,7 @@ fn base(name: &str) -> VmSpec {
         disk: "@DIR@/disk.qcow2".into(),
         home_disk: Some("@DIR@/home.qcow2".into()),
         read_only_disks: Vec::new(),
+        inbox_disks: Vec::new(),
         firmware_vars: "@DIR@/OVMF_VARS.qcow2".into(),
         memory_mib: 2048,
         cpus: 2,

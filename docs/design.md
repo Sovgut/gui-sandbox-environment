@@ -613,8 +613,21 @@ version. A preset installs it as an `appimage` entry.
 - **Files outside a run** (`crates/gse-service/src/mailbox.rs`): on a
   single GPU the app is gone while the environment owns the screen, so the
   service carries files itself. Sent in while the environment is stopped,
-  files wait in its folder (`inbox-waiting/`) and go into the Inbox once it
-  is up; the agent then shows them arriving on the guest's desktop (a
+  files wait in its folder (`inbox-waiting/`) as carriers
+  (`gse_protocol::carrier`), one for each send: the files back to back from
+  4 KiB-aligned offsets, a JSON index and a trailer block that says where
+  the index is. The next start attaches up to 8 carriers as read-only
+  virtio disks (serials `gse-inbox-0`...), which QEMU opens as root before
+  it drops privileges; once the guest is up the service asks the agent to
+  import each (`Import`, agent version 5), and the agent copies the files
+  from the disk into the Inbox, checking the index and each path as it
+  would a put, and tells the host how far it got every 2 s. The agent's
+  port carries only that: its JSON lines move a few megabytes a second,
+  far too slow for games of tens of gigabytes, which the disk moves at
+  the speed of the disks. A carrier that did not fit waits for the start
+  after; files a service before carriers left as plain files below
+  `inbox-waiting/` go through the port. The agent shows the files arriving
+  on the guest's desktop (a
   window with a bar, the file and the time left, from `/run/gse/incoming`
   the agent writes) and a notification once they are in. A file that
   cannot go in stays waiting for the next start while the others go; the
@@ -636,7 +649,11 @@ version. A preset installs it as an `appimage` entry.
 - **The host always initiates**; the agent only answers. The protocol is
   JSON lines (`gse_protocol::agent`): every call carries an id its answers
   repeat, lines are capped, a file travels in base64 chunks of 32 KiB with
-  its size and SHA-256, and listings and files have hard limits. The
+  its size and SHA-256, and listings and files have hard limits. Files sent
+  into a running environment take this way: the agent syncs what it
+  writes every 32 MiB, so the sync before its answer to the file's end
+  stays short, and the host waits up to two minutes for that answer
+  rather than the 20 s it gives any other. The
   host speaks to agents from version 1 on; `Incoming`, which announces the
   files kept for a start, goes only to version 2 and later, so
   environments made from an older image keep working without the window.

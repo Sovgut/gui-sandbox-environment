@@ -783,6 +783,8 @@ struct Current {
     /// waits for its last round.
     collecting: Arc<AtomicBool>,
     screen: ScreenAccess,
+    /// The carriers it started with, each with its disk's serial.
+    inbox_disks: Vec<(PathBuf, String)>,
 }
 
 /// The image build in progress, if any.
@@ -1051,10 +1053,15 @@ impl Service {
                 .parse()
                 .with_context(|| format!("'{}' is not a PCI address", settings.gpu))?;
             let leave = Arc::new(AtomicBool::new(false));
+            let inbox_disks: Vec<PathBuf> = mailbox::carriers(&shared.store.dir(name))
+                .into_iter()
+                .take(gse_protocol::carrier::MAX_DISKS)
+                .collect();
             let launch = vm::Launch {
                 name: name.to_owned(),
                 disk: shared.store.disk(name),
                 read_only_disks: Vec::new(),
+                inbox_disks: inbox_disks.clone(),
                 gpu,
                 memory_mib: shared.config.memory_mib,
                 cpus: shared.config.cpus,
@@ -1084,6 +1091,11 @@ impl Service {
                     memory: launch.screen_memory(),
                     input: launch.input_socket(),
                 },
+                inbox_disks: inbox_disks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, path)| (path, format!("{}{i}", gse_protocol::carrier::SERIAL)))
+                    .collect(),
             });
             (launch, stop, shared.root.clone())
         };
@@ -1544,7 +1556,14 @@ impl Service {
                 return;
             };
             if !mailbox::waiting(&dir).is_empty() {
-                match service.with_agent(&name, |agent| mailbox::deliver(&dir, agent)) {
+                let attached = service
+                    .lock()
+                    .current
+                    .as_ref()
+                    .filter(|c| c.name == name)
+                    .map(|c| c.inbox_disks.clone())
+                    .unwrap_or_default();
+                match service.with_agent(&name, |agent| mailbox::deliver(&dir, agent, &attached)) {
                     Ok(delivered) => {
                         service.log(
                             &name,
@@ -1552,6 +1571,9 @@ impl Service {
                         );
                         for (path, why) in delivered.stayed {
                             service.log(&name, format!("{path} still waits for the Inbox: {why}"));
+                        }
+                        for (path, why) in delivered.failed {
+                            service.log(&name, format!("{path} did not go into the Inbox: {why}"));
                         }
                     }
                     Err(e) => warn!("{name}: delivering the waiting files: {e:#}"),

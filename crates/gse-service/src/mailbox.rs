@@ -3,7 +3,11 @@
 //! nothing can be sent in or taken out then.
 //!
 //! - Sent in while it is stopped, files wait in its folder (`inbox-waiting/`)
-//!   and go into its Inbox once it is up again.
+//!   as carriers (`gse_protocol::carrier`), one for each send. The next start
+//!   attaches up to [`carrier::MAX_DISKS`] of them as read-only disks, and
+//!   once it is up the agent copies their files into the Inbox at the speed
+//!   of the disks; the agent's port carries only the call and its progress.
+//!   A carrier that did not fit waits for the start after.
 //! - While a single-GPU environment runs, the service takes what appears in
 //!   its Outbox every [`COLLECT_EVERY`], past the same checks as a take, into
 //!   a spool (`outbox-taken`): the lines a take sends the client, kept until
@@ -19,6 +23,9 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use gse_protocol::GuestFile;
+use gse_protocol::carrier::{self, Entry, Index};
+
+use tracing::warn;
 
 use crate::agent::Agent;
 
@@ -47,47 +54,145 @@ fn plain(path: &str) -> bool {
 }
 
 /// Keeps `files` (Inbox path, open file, size) for the next start of the
-/// environment in `dir`; returns how many. `copied` hears of each part
-/// copied. When `stop` turns true the copy ends at the next part, the file
-/// under way is removed, and the error is [`Stopped`] with the files kept
-/// whole.
+/// environment in `dir`, in a carrier of their own; returns how many.
+/// `copied` hears of each part copied. When `stop` turns true the copy ends
+/// at the next part, the file under way is left out, and the error is
+/// [`Stopped`] with the files kept whole.
 pub fn queue(
     dir: &Path,
     files: Vec<(String, File, u64)>,
     copied: &mut dyn FnMut(u64),
     stop: &AtomicBool,
 ) -> Result<usize> {
+    if let Some((path, _, _)) = files.iter().find(|(path, _, _)| !plain(path)) {
+        bail!("{path} is no plain path");
+    }
+    if let Some((path, _, _)) = files
+        .iter()
+        .find(|(_, _, size)| *size > gse_protocol::agent::MAX_SENT_FILE)
+    {
+        bail!("{path} is larger than a sandbox takes (64 GiB)");
+    }
     let waiting = waiting_dir(dir);
+    fs::create_dir_all(&waiting)?;
+    fs::set_permissions(&waiting, fs::Permissions::from_mode(0o700)).ok();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut writer = CarrierWriter::create(&waiting.join(format!("{stamp}.{CARRIER}")))?;
     let count = files.len();
     for (done, (path, mut from, _)) in files.into_iter().enumerate() {
-        if !plain(&path) {
-            bail!("{path} is no plain path");
-        }
-        let to = waiting.join(&path);
-        if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let executable = from.metadata()?.mode() & 0o100 != 0
             || path.to_ascii_lowercase().ends_with(".appimage");
-        let mut out = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(if executable { 0o700 } else { 0o600 })
-            .open(&to)
-            .with_context(|| format!("{}", to.display()))?;
         let mut reader = Counted::new(&mut from, &mut *copied).stopping(stop);
-        if let Err(e) = paced_copy(&mut reader, &mut out) {
-            drop(out);
-            fs::remove_file(&to).ok();
+        if let Err(e) = writer.add(&path, executable, &mut reader) {
+            writer.finish()?;
             if is_stopped(&e) {
                 return Err(Stopped { copied: done }.into());
             }
             return Err(e).with_context(|| format!("copying {path}"));
         }
     }
-    fs::set_permissions(&waiting, fs::Permissions::from_mode(0o700)).ok();
+    writer.finish()?;
     Ok(count)
+}
+
+/// The extension of a carrier's file.
+const CARRIER: &str = "carrier";
+
+/// Writes a carrier: each file from the next aligned offset, then, at
+/// [`CarrierWriter::finish`], the index and the trailer.
+struct CarrierWriter {
+    path: PathBuf,
+    file: File,
+    files: Vec<Entry>,
+    end: u64,
+}
+
+impl CarrierWriter {
+    fn create(path: &Path) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("{}", path.display()))?;
+        Ok(Self {
+            path: path.to_owned(),
+            file,
+            files: Vec::new(),
+            end: 0,
+        })
+    }
+
+    /// Copies `from` in as the Inbox file `path`.
+    fn add(&mut self, path: &str, executable: bool, from: &mut impl io::Read) -> io::Result<()> {
+        use std::io::Seek as _;
+        self.file.seek(io::SeekFrom::Start(self.end))?;
+        let size = paced_copy(from, &mut self.file)?;
+        self.files.push(Entry {
+            path: path.to_owned(),
+            size,
+            executable,
+            offset: self.end,
+        });
+        self.end = carrier::align(self.end + size);
+        Ok(())
+    }
+
+    /// Ends the carrier with the files added whole; one without any goes.
+    fn finish(mut self) -> Result<()> {
+        use std::io::Seek as _;
+        if self.files.is_empty() {
+            drop(self.file);
+            fs::remove_file(&self.path).ok();
+            return Ok(());
+        }
+        let index = serde_json::to_vec(&Index { files: self.files })?;
+        let len = index.len() as u64;
+        self.file.seek(io::SeekFrom::Start(self.end))?;
+        self.file.write_all(&index)?;
+        let trailer = carrier::align(self.end + len);
+        self.file.seek(io::SeekFrom::Start(trailer))?;
+        self.file.write_all(&carrier::trailer(self.end, len))?;
+        self.file.set_len(trailer + carrier::BLOCK)?;
+        self.file.sync_all()?;
+        Ok(())
+    }
+}
+
+/// The carriers waiting in `dir`, oldest first.
+pub fn carriers(dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = fs::read_dir(waiting_dir(dir))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == CARRIER) && p.is_file())
+        .collect();
+    found.sort();
+    found
+}
+
+/// What the carrier at `path` holds.
+pub fn carrier_index(path: &Path) -> Result<Index> {
+    use std::os::unix::fs::FileExt as _;
+    let file = File::open(path).with_context(|| format!("{}", path.display()))?;
+    let size = file.metadata()?.len();
+    let mut block = vec![0; usize::try_from(carrier::BLOCK)?];
+    file.read_exact_at(
+        &mut block,
+        size.checked_sub(carrier::BLOCK).context("no trailer")?,
+    )?;
+    let (offset, len) = carrier::parse_trailer(&block).context("no carrier trailer")?;
+    if len > carrier::MAX_INDEX || offset.saturating_add(len) > size {
+        bail!("the carrier's index lies outside it");
+    }
+    let mut index = vec![0; usize::try_from(len)?];
+    file.read_exact_at(&mut index, offset)?;
+    let index: Index = serde_json::from_slice(&index).context("the carrier's index")?;
+    index.check(offset).map_err(anyhow::Error::msg)?;
+    Ok(index)
 }
 
 /// A send that [`Request::CancelTransfer`](gse_protocol::Request) stopped,
@@ -234,22 +339,89 @@ fn files_below(root: &Path) -> Vec<(String, PathBuf, u64)> {
     found
 }
 
-/// The files waiting to go into the Inbox.
-pub fn waiting(dir: &Path) -> Vec<GuestFile> {
+/// Files waiting as plain files below `inbox-waiting/`, which services
+/// before carriers kept there.
+fn loose_files(dir: &Path) -> Vec<(String, PathBuf, u64)> {
+    let carriers = carriers(dir);
     files_below(&waiting_dir(dir))
         .into_iter()
-        .map(|(path, _, size)| GuestFile { path, size })
+        .filter(|(_, full, _)| !carriers.contains(full))
         .collect()
 }
 
-/// Puts the waiting files into the Inbox through `agent`; returns how many.
-pub fn deliver(dir: &Path, agent: &mut Agent) -> Result<Delivered> {
-    let files = files_below(&waiting_dir(dir));
-    if files.is_empty() {
-        return Ok(Delivered::default());
+/// The files waiting to go into the Inbox.
+pub fn waiting(dir: &Path) -> Vec<GuestFile> {
+    let mut files: Vec<GuestFile> = loose_files(dir)
+        .into_iter()
+        .map(|(path, _, size)| GuestFile { path, size })
+        .collect();
+    for carrier in carriers(dir) {
+        if let Ok(index) = carrier_index(&carrier) {
+            files.extend(index.files.into_iter().map(|f| GuestFile {
+                path: f.path,
+                size: f.size,
+            }));
+        }
     }
-    agent.announce(files.len(), files.iter().map(|(_, _, size)| size).sum())?;
+    files
+}
+
+/// Puts the waiting files into the Inbox through `agent`: the carriers in
+/// `attached` (each with the serial of its disk) through their disks, and
+/// loose files through the agent's port. A carrier the environment did not
+/// start with waits for the next start.
+pub fn deliver(dir: &Path, agent: &mut Agent, attached: &[(PathBuf, String)]) -> Result<Delivered> {
+    let files = loose_files(dir);
     let mut delivered = Delivered::default();
+    let mut indexed = Vec::new();
+    for carrier in carriers(dir) {
+        match carrier_index(&carrier) {
+            Ok(index) => indexed.push((carrier, index)),
+            Err(e) => {
+                warn!("{}: {e:#}", carrier.display());
+                fs::remove_file(&carrier).ok();
+                delivered.failed.push((
+                    "a batch of files sent in".to_owned(),
+                    format!("its copy on the host is damaged: {e:#}"),
+                ));
+            }
+        }
+    }
+    let mut ready: Vec<(PathBuf, Index, String)> = Vec::new();
+    for (carrier, index) in indexed {
+        if let Some((_, serial)) = attached.iter().find(|(path, _)| *path == carrier) {
+            ready.push((carrier, index, serial.clone()));
+        } else {
+            for file in &index.files {
+                delivered
+                    .stayed
+                    .push((file.path.clone(), "it waits for the next start".to_owned()));
+            }
+        }
+    }
+    if files.is_empty() && ready.is_empty() {
+        return Ok(delivered);
+    }
+    let count = files.len() + ready.iter().map(|(_, i, _)| i.files.len()).sum::<usize>();
+    let bytes = files.iter().map(|(_, _, size)| size).sum::<u64>()
+        + ready.iter().map(|(_, i, _)| i.bytes()).sum::<u64>();
+    agent.announce(count, bytes)?;
+    for (carrier, index, serial) in &ready {
+        match agent.import(serial) {
+            Ok((put, failed)) => {
+                fs::remove_file(carrier).ok();
+                delivered.files += put;
+                delivered.failed.extend(failed);
+            }
+            Err(e) => {
+                for file in &index.files {
+                    delivered.stayed.push((file.path.clone(), format!("{e:#}")));
+                }
+                // The agent's connection is gone with the error.
+                return Ok(delivered);
+            }
+        }
+    }
     for (path, full, size) in &files {
         let put = File::open(full)
             .map_err(anyhow::Error::from)
@@ -266,8 +438,10 @@ pub fn deliver(dir: &Path, agent: &mut Agent) -> Result<Delivered> {
             Err(e) => delivered.stayed.push((path.clone(), format!("{e:#}"))),
         }
     }
-    if delivered.stayed.is_empty() {
-        fs::remove_dir_all(waiting_dir(dir)).ok();
+    if delivered.stayed.is_empty() && delivered.failed.is_empty() {
+        if carriers(dir).is_empty() {
+            fs::remove_dir_all(waiting_dir(dir)).ok();
+        }
     } else {
         // An empty batch ends the one the guest shows, short of its files.
         agent.announce(0, 0).ok();
@@ -275,12 +449,13 @@ pub fn deliver(dir: &Path, agent: &mut Agent) -> Result<Delivered> {
     Ok(delivered)
 }
 
-/// What [`deliver`] did: how many files went into the Inbox, and the ones
-/// that stayed waiting, with why.
+/// What [`deliver`] did: how many files went into the Inbox, the ones that
+/// stayed waiting and the ones that could not go in, with why.
 #[derive(Debug, Default)]
 pub struct Delivered {
     pub files: usize,
     pub stayed: Vec<(String, String)>,
+    pub failed: Vec<(String, String)>,
 }
 
 /// The files taken out while the environment ran, which the app has not
@@ -536,6 +711,45 @@ mod tests {
         assert_eq!(waiting.len(), 1);
         assert_eq!(waiting[0].path, "one.bin");
         assert_eq!(waiting[0].size, 3 << 20);
+        // The file under way is cut off with the index after the whole one.
+        let carrier = &carriers(dir.path())[0];
+        assert_eq!(
+            fs::metadata(carrier).unwrap().len(),
+            (3 << 20) + 2 * carrier::BLOCK
+        );
+    }
+
+    #[test]
+    fn a_carrier_holds_each_file_from_an_aligned_offset() {
+        use std::os::unix::fs::FileExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::write(&a, "first").unwrap();
+        fs::write(&b, vec![9_u8; 5000]).unwrap();
+        let files = vec![
+            ("Game/a.txt".to_owned(), File::open(&a).unwrap(), 5),
+            ("Game/b.bin".to_owned(), File::open(&b).unwrap(), 5000),
+        ];
+        queue(dir.path(), files, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        let carrier = &carriers(dir.path())[0];
+        let index = carrier_index(carrier).unwrap();
+        assert_eq!(
+            index
+                .files
+                .iter()
+                .map(|f| (f.path.as_str(), f.size, f.offset))
+                .collect::<Vec<_>>(),
+            [("Game/a.txt", 5, 0), ("Game/b.bin", 5000, 4096)]
+        );
+        let file = File::open(carrier).unwrap();
+        let mut bytes = [0_u8; 5];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"first");
+        assert_eq!(fs::metadata(carrier).unwrap().len() % carrier::BLOCK, 0);
+        // Files left as plain files by an older service still count.
+        fs::write(waiting_dir(dir.path()).join("old.sav"), "x").unwrap();
+        assert_eq!(waiting(dir.path()).len(), 3);
     }
 
     #[test]

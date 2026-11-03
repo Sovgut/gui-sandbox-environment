@@ -329,9 +329,12 @@ step() { echo "=== $*" > /dev/ttyS0; }
 /// the current branch's or a legacy one's (`xorg-x11-drv-nvidia-580xx`); an
 /// image without NVIDIA's driver needs none. Installed files keep the label
 /// of the repository objects they link to until relabelled, and `guest`
-/// cannot run them before that.
+/// cannot run them before that. awk reads the whole listing: one that
+/// stopped at the first match would leave rpm writing into a closed pipe,
+/// which `pipefail` makes the build's failure.
 const NVIDIA_FLATPAK_GL: &str = r#"nvidia="$(rpm -qa --qf '%{NAME} %{VERSION}\n' 'xorg-x11-drv-nvidia*' \
-    | awk '$1 ~ /^xorg-x11-drv-nvidia(-[0-9]+xx)?$/ { print $2; exit }' | tr . -)"
+    | awk '$1 ~ /^xorg-x11-drv-nvidia(-[0-9]+xx)?$/ && !found { print $2; found = 1 }' \
+    | tr . -)"
 if [ -n "$nvidia" ]; then
     flatpak install --system -y --noninteractive flathub \
         "org.freedesktop.Platform.GL.nvidia-$nvidia" "org.freedesktop.Platform.GL32.nvidia-$nvidia"

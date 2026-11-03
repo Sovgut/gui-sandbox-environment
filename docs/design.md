@@ -520,8 +520,9 @@ folder must not ride into the next environment or onto the host.
    manager refuses; where no transient unit starts, they run as
    `gse-scan` directly. A take fails, and a spool waits,
    while there is no engine or its signatures are older than a week, so
-   nothing leaves unscanned. About and updates shows the engine, the age of
-   its signatures and Update now (`Antivirus`, `UpdateAntivirus`).
+   nothing leaves unscanned. The updates run in the background with no one
+   asking; About and updates shows the engine and the age of its
+   signatures (`Antivirus`).
 5. To come: a per-game allowlist of paths and formats from the preset.
 
 What passes lands in one zip archive per take, which the app never opens;
@@ -587,7 +588,11 @@ the app shows what passed and what was refused and why.
    - A newer AppImage finds an older installed service through the
      protocol handshake and updates it the same way: install replaces the
      programs and gse's files, keeps the settings, and restarts the
-     service.
+     service. The app's own update does both in one go: it puts the new
+     AppImage in place and starts it with `GSE_FINISH_UPDATE`, and that app
+     updates the service as soon as it finds it older, which brings the
+     guest's side too (every start hands the service's gse-guest over).
+     Neither runs while a sandbox runs: the app asks to stop it first.
    - App settings, General, has "Remove everything": it runs
      `gse-service uninstall` through polkit, which stops any environment,
      the service, and removes its unit, the polkit action, `gse-net`,

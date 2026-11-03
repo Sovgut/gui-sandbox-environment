@@ -33,7 +33,7 @@ pub const SOCKET: &str = "/run/gse/service.sock";
 /// The protocol's version: a client and a service speak to each other only
 /// when theirs match ([`Request::Hello`]). It changes with every change to
 /// the messages.
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 
 /// The name a build of the base image goes by wherever a preset's name
 /// would stand: in [`Event::Build`], [`Event::BuildFinished`] and
@@ -155,9 +155,6 @@ pub enum Request {
     Restart,
     /// What the antivirus is: [`Reply::Antivirus`].
     Antivirus,
-    /// Bring the antivirus's engine and signatures up to date now; answered
-    /// once that is done or failed.
-    UpdateAntivirus,
     /// The presets and the image build in progress, if any.
     Presets,
     /// Create or replace the preset of the same name.

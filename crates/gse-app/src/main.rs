@@ -353,7 +353,9 @@ struct Home {
     /// The service's antivirus as it last said, and whether an update of it
     /// runs now.
     antivirus: Option<client::Antivirus>,
-    antivirus_updating: bool,
+    /// The app an update started: it updates the service as soon as it
+    /// finds it older.
+    finish_update: bool,
     app_config: config::AppConfig,
     update: update::State,
     /// The update banner was put off with Later until the app starts again.
@@ -467,7 +469,7 @@ impl Home {
             last_taken: BTreeMap::new(),
             flows: BTreeMap::new(),
             antivirus: None,
-            antivirus_updating: false,
+            finish_update: std::env::var_os(update::FINISH_UPDATE).is_some(),
             app_config,
             update: update::State::Idle,
             update_later: false,
@@ -663,6 +665,16 @@ impl Home {
                 if let Ok(service) = service {
                     home.service = service;
                     home.restarting &= service != client::Match::Same;
+                    if home.finish_update
+                        && service == client::Match::ServiceOlder
+                        && setup::carries_service()
+                        && !home.restarting
+                    {
+                        home.finish_update = false;
+                        home.update_service(cx);
+                    } else if service == client::Match::Same {
+                        home.finish_update = false;
+                    }
                 }
                 match loaded {
                     Ok((environments, images)) => {
@@ -1515,10 +1527,13 @@ impl Home {
                 })
             }
             client::Match::ServiceOlder if setup::carries_service() => Some(
-                banner(
+                banner(if self.any_running() {
+                    "The background service is older than the app. Stop the running sandbox to \
+                     update it."
+                } else {
                     "The background service is older than the app. Updating it asks for your \
-                     password and stops a running sandbox.",
-                )
+                     password."
+                })
                 .child(
                     button(
                         "update-service",
@@ -1528,7 +1543,7 @@ impl Home {
                             "Update service"
                         },
                         Kind::Warning,
-                        !self.restarting,
+                        !self.restarting && !self.any_running(),
                         cx.listener(|home, _, _, cx| home.update_service(cx)),
                     )
                     .size(Size::Banner),

@@ -202,9 +202,15 @@ pub fn install(release: &Release, appimage: &Path) -> Result<()> {
         .with_context(|| format!("replacing {}", appimage.display()))
 }
 
-/// Starts the AppImage at `appimage`; the running app closes after.
+/// Set for the app an update starts: it brings the service, and with it the
+/// guest's side of gse, to its own version before anything else.
+pub const FINISH_UPDATE: &str = "GSE_FINISH_UPDATE";
+
+/// Starts the AppImage at `appimage`, which then updates the service; the
+/// running app closes after.
 pub fn start(appimage: &Path) -> Result<()> {
     std::process::Command::new(appimage)
+        .env(FINISH_UPDATE, "1")
         .spawn()
         .with_context(|| format!("starting {}", appimage.display()))?;
     Ok(())
@@ -310,6 +316,11 @@ impl crate::Home {
         let (State::Available(release), Some(appimage)) = (&self.update, running_appimage()) else {
             return;
         };
+        // The service's update stops a running sandbox; nothing updates
+        // while one runs.
+        if self.any_running() {
+            return;
+        }
         let release = release.clone();
         tracing::info!("installing {} over {}", release.version, appimage.display());
         self.update = State::Installing(release.clone());
@@ -337,24 +348,31 @@ impl crate::Home {
         use crate::ui::{Kind, Size, Tone, banner, button};
         use gpui::prelude::*;
         let (text, installing) = match &self.update {
+            State::Available(release) if self.any_running() => (
+                format!(
+                    "GSE {} is ready. Stop the running sandbox to install it.",
+                    release.version
+                ),
+                false,
+            ),
             State::Available(release) => (
                 format!(
-                    "GSE {} is ready. The app restarts to install it; running sandboxes keep \
-                     going.",
+                    "GSE {} is ready: the app, its service and gse in the sandboxes update \
+                     together.",
                     release.version
                 ),
                 false,
             ),
             State::Installing(release) => (
                 format!(
-                    "Installing GSE {}. The app restarts when it is in place; running sandboxes \
-                     keep going.",
+                    "Installing GSE {}. The app restarts, then updates its background service.",
                     release.version
                 ),
                 true,
             ),
             _ => return None,
         };
+        let running = self.any_running();
         Some(
             banner(Tone::Accent, crate::icons::Icon::Download, text).child(
                 button(
@@ -365,7 +383,7 @@ impl crate::Home {
                         "Install"
                     },
                     Kind::Primary,
-                    !installing,
+                    !installing && !running,
                     cx.listener(|home, _, _, cx| home.install_update(cx)),
                 )
                 .size(Size::Banner),
@@ -415,11 +433,19 @@ impl crate::Home {
                             .mt(px(2.))
                             .text_size(px(13.))
                             .text_color(Theme::secondary_text())
-                            .child(format!(
-                                "You have {}. Signed by the GSE release key, checked before \
-                                 installing.",
-                                version()
-                            )),
+                            .child(if self.any_running() {
+                                format!(
+                                    "You have {}. Stop the running sandbox to install it: its \
+                                     background service updates with it.",
+                                    version()
+                                )
+                            } else {
+                                format!(
+                                    "You have {}. Signed by the GSE release key, checked before \
+                                     installing; the background service updates with it.",
+                                    version()
+                                )
+                            }),
                     ),
             )
             .child(
@@ -431,7 +457,7 @@ impl crate::Home {
                         "Install and restart"
                     },
                     Kind::Primary,
-                    appimage && !installing,
+                    appimage && !installing && !self.any_running(),
                     cx.listener(|home, _, _, cx| home.install_update(cx)),
                 )
                 .size(crate::ui::Size::Large)
@@ -512,11 +538,12 @@ impl crate::Home {
         )
     }
 
-    /// The row of the service's antivirus: its engine, how old its
-    /// signatures are, and Update now.
-    fn antivirus_row(&self, cx: &mut gpui::Context<Self>) -> gpui::Div {
+    /// The row of the service's antivirus: its engine and how old its
+    /// signatures are. The service keeps both up to date by itself.
+    fn antivirus_row(&self) -> gpui::Div {
         use crate::settings::Rows;
-        use crate::ui::{Kind, Size, button};
+        use crate::ui::Theme;
+        use gpui::{div, prelude::*, px};
 
         let when = |seconds: u64| {
             let at = chrono::DateTime::from_timestamp(i64::try_from(seconds).unwrap_or(0), 0)
@@ -529,67 +556,39 @@ impl crate::Home {
                 None => "at an unknown time".to_owned(),
             }
         };
-        let hint = match &self.antivirus {
-            _ if self.antivirus_updating => "Updating the engine and its signatures...".to_owned(),
-            None => "The service does not say".to_owned(),
+        let (hint, state, color) = match &self.antivirus {
+            None => ("The service does not say".to_owned(), "", Theme::muted()),
             Some(antivirus) => match (&antivirus.engine, antivirus.database, &antivirus.error) {
-                (_, _, Some(error)) => format!("The last update failed: {error}"),
-                (None, _, None) => {
-                    "Not installed yet; the service downloads it within a day of its start"
-                        .to_owned()
-                }
-                (Some(engine), Some(database), None) => {
-                    format!("ClamAV {engine} \u{b7} signatures from {}", when(database))
-                }
-                (Some(engine), None, None) => format!("ClamAV {engine} \u{b7} no signatures yet"),
+                (_, _, Some(error)) => (
+                    format!("The last update failed: {error}"),
+                    "Not updated",
+                    Theme::warning(),
+                ),
+                (None, _, None) => (
+                    "The service downloads it within a day of its start".to_owned(),
+                    "Not installed yet",
+                    Theme::warning(),
+                ),
+                (Some(engine), Some(database), None) => (
+                    format!("ClamAV {engine} \u{b7} signatures from {}", when(database)),
+                    "Up to date",
+                    Theme::good(),
+                ),
+                (Some(engine), None, None) => (
+                    format!("ClamAV {engine} \u{b7} no signatures yet"),
+                    "Not updated",
+                    Theme::warning(),
+                ),
             },
         };
         Rows::Page.row(
             "Antivirus",
             Some(format!(
-                "{hint}. Every file taken out of a sandbox passes it."
+                "{hint}. Every file taken out of a sandbox passes it; it updates by itself \
+                 once a day."
             )),
-            button(
-                "update-antivirus",
-                if self.antivirus_updating {
-                    "Updating..."
-                } else {
-                    "Update now"
-                },
-                Kind::Secondary,
-                !self.antivirus_updating,
-                cx.listener(|home, _, _, cx| home.update_antivirus(cx)),
-            )
-            .size(Size::Small),
+            div().text_size(px(13.)).text_color(color).child(state),
         )
-    }
-
-    /// Has the service bring its antivirus up to date now.
-    fn update_antivirus(&mut self, cx: &mut gpui::Context<Self>) {
-        if self.preview_skips("updating the antivirus", cx) {
-            return;
-        }
-        self.antivirus_updating = true;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let outcome = cx
-                .background_executor()
-                .spawn(async {
-                    crate::client::command(&gse_protocol::Request::UpdateAntivirus)
-                        .and_then(|()| crate::client::antivirus())
-                })
-                .await;
-            this.update(cx, |home, cx| {
-                home.antivirus_updating = false;
-                match outcome {
-                    Ok(antivirus) => home.antivirus = Some(antivirus),
-                    Err(e) => home.say(format!("The antivirus was not updated: {e:#}"), true),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
     }
 
     /// App settings, About and updates: a newer release when there is one,
@@ -645,7 +644,7 @@ impl crate::Home {
                         })),
                 ),
                 self.service_row(),
-                self.antivirus_row(cx),
+                self.antivirus_row(),
                 rows.row(
                     "Diagnostics",
                     Some(

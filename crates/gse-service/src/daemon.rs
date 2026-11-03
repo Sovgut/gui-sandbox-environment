@@ -1783,7 +1783,6 @@ impl Service {
                     },
                 )?;
             }
-            Request::UpdateAntivirus => antivirus::Antivirus::new(antivirus::ROOT).update()?,
         }
         send(out, &Reply::Done)?;
         Ok(())

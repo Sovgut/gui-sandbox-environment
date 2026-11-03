@@ -323,7 +323,7 @@ impl Home {
     /// Installs the service this app carries over an older one; the install
     /// restarts it.
     pub(crate) fn update_service(&mut self, cx: &mut Context<Self>) {
-        if self.preview_skips("updating the service", cx) {
+        if self.preview_skips("updating the service", cx) || self.any_running() {
             return;
         }
         self.restarting = true;

@@ -738,7 +738,10 @@ folder must not ride into the next environment or onto the host.
    manager refuses; where no transient unit starts, they run as
    `gse-scan` directly. freshclam gets the system's bundle of trusted
    certificates through `CURL_CA_BUNDLE`, since the engine looks where the
-   system it was built on keeps it. The last run's output stays readable
+   system it was built on keeps it, and both get the engine's own
+   signature certificates through `CVD_CERTS_DIR`: libclamav checks every
+   database it loads against them, freshclam's test of a new one too, and
+   by itself looks in `/usr/local/etc/certs`. The last run's output stays readable
    in `/var/lib/gse/clamav/runs` for the app's diagnostics. A take fails, and a spool waits,
    while there is no engine or its signatures are older than a week, so
    nothing leaves unscanned. The updates run in the background with no one

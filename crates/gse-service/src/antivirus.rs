@@ -331,6 +331,11 @@ impl Antivirus {
         fs::remove_file(&out).ok();
         fs::remove_file(&err).ok();
         let libraries = engine.join("lib64");
+        // libclamav checks a database's signature against these certificates
+        // whenever it loads one, freshclam's test of a new one included; its
+        // built-in place is /usr/local/etc/certs, which a portable engine
+        // does not fill, and the database then counts as broken.
+        let certs = engine.join("etc/certs");
         let mut unit = Command::new("systemd-run");
         unit.args([
             "--wait",
@@ -353,6 +358,7 @@ impl Antivirus {
             &format!("--property=StandardOutput=truncate:{}", out.display()),
             &format!("--property=StandardError=truncate:{}", err.display()),
             &format!("--setenv=LD_LIBRARY_PATH={}", libraries.display()),
+            &format!("--setenv=CVD_CERTS_DIR={}", certs.display()),
         ]);
         if let Some(bundle) = ca_bundle() {
             unit.arg(format!("--setenv=CURL_CA_BUNDLE={}", bundle.display()));
@@ -392,6 +398,7 @@ impl Antivirus {
                 .args(rest)
                 .env_clear()
                 .env("LD_LIBRARY_PATH", &libraries)
+                .env("CVD_CERTS_DIR", &certs)
                 .envs(ca_bundle().map(|bundle| ("CURL_CA_BUNDLE", bundle)))
                 .env("PATH", "/usr/bin:/bin")
                 .uid(uid)

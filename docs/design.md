@@ -309,7 +309,11 @@ The app shows the running environment according to the switch mode:
   lacks what it gave while the sandbox runs. A keyboard or mouse is never
   offered: on a single GPU it reaches the guest through `input-linux`, and
   the way out is read from it; a gamepad's touchpad, which shows up as a
-  mouse, goes with its gamepad. A drive can go, with a warning that
+  mouse, goes with its gamepad. A device of no kind gse knows (sorted by
+  its interfaces: sound, video, storage, Bluetooth, a gamepad's joystick)
+  never goes: the settings list such devices apart, behind "Show other
+  devices", each with its USB ID, so one that should go can be given its
+  kind. A drive can go, with a warning that
   programs inside can change everything on it. A Bluetooth adapter can go
   too, and the base image then gets BlueZ (the `bluetooth` driver pack).
   Network cards are not offered: a card in the guest would take it past

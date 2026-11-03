@@ -1024,6 +1024,9 @@ pub enum UsbKind {
     /// A keyboard or a mouse: it reaches a single-GPU sandbox through QEMU's
     /// `input-linux`, since the way out is read from it, and is never taken.
     Input,
+    /// A device gse cannot tell the kind of yet. It is never taken: the
+    /// settings list it apart, with its IDs, so one that should go can be
+    /// given its kind.
     Other,
 }
 
@@ -1037,7 +1040,7 @@ impl UsbKind {
     /// Whether a sandbox may take it at all.
     #[must_use]
     pub const fn offered(self) -> bool {
-        !matches!(self, Self::Input)
+        !matches!(self, Self::Input | Self::Other)
     }
 }
 

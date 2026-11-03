@@ -472,6 +472,15 @@ pub const STATES: &[State] = &[
         },
     ),
     state(
+        "sandbox-settings-other-devices",
+        "a sandbox's devices with the unknown ones shown",
+        |home, cx| {
+            one_gpu(home);
+            home.show_other_devices = true;
+            home.open_sandbox_settings(data::DEMO, cx);
+        },
+    ),
+    state(
         "sandbox-settings-menu",
         "a sandbox's settings with the GPU menu open",
         |home, cx| {

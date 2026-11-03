@@ -181,6 +181,10 @@ pub fn host_devices(root: &Root) -> Vec<UsbDevice> {
             .filter(|i| i.starts_with(&format!("{name}:")))
             .filter_map(|i| class(&format!("{USB_DEVICES}/{i}/bInterfaceClass")))
             .collect();
+        // A hub may say so only in its interface.
+        if interfaces.contains(&HUB) {
+            continue;
+        }
         let own: Vec<&Input> = inputs.iter().filter(|i| inside(&i.sysfs, &name)).collect();
         let number = |file: &str| root.read_opt(format!("{dir}/{file}"))?.trim().parse().ok();
         let (Some(bus), Some(address)) = (number("busnum"), number("devnum")) else {
@@ -257,6 +261,7 @@ mod tests {
             "USB PnP Audio Device",
         );
         add_device(&root, "1-1", "09", &["09"], "USB2734");
+        add_device(&root, "1-1.4", "00", &["09"], "Hub Controller");
         add_device(
             &root,
             "1-1.5",

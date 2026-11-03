@@ -362,6 +362,9 @@ struct Home {
     storage: Option<client::Storage>,
     /// The host's devices a sandbox can take, as last listed.
     host_devices: client::HostDevices,
+    /// Whether the sandbox settings list the USB devices gse cannot tell
+    /// the kind of.
+    show_other_devices: bool,
     storage_target: Option<std::path::PathBuf>,
     moving_storage: Option<transfer::Flow>,
     app_config: config::AppConfig,
@@ -480,6 +483,7 @@ impl Home {
             finish_update: std::env::var_os(update::FINISH_UPDATE).is_some(),
             storage: None,
             host_devices: client::HostDevices::default(),
+            show_other_devices: false,
             storage_target: None,
             moving_storage: None,
             app_config,

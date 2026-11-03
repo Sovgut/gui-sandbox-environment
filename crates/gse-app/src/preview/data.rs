@@ -567,8 +567,9 @@ pub fn files() -> GuestFiles {
 
 /// A stopped sandbox's: files waiting for its next start, and what was
 /// taken out of it while it ran on the whole screen.
-/// The host's devices: a USB microphone, a gamepad, a flash drive and the
-/// keyboard, which no sandbox takes, beside the board's sound card.
+/// The host's devices: a USB microphone, a gamepad, a flash drive, the
+/// keyboard, which no sandbox takes, and a monitor's control device of no
+/// known kind, beside the board's sound card.
 pub fn host_devices() -> crate::client::HostDevices {
     use gse_protocol::{HostUsb, UsbId, UsbKind};
     let usb = |vendor, product, label: &str, kind| HostUsb {
@@ -591,6 +592,7 @@ pub fn host_devices() -> crate::client::HostDevices {
             ),
             usb(0x0781, 0x5581, "SanDisk Ultra", UsbKind::Storage),
             usb(0x3434, 0x0860, "Keychron Q6 Max", UsbKind::Input),
+            usb(0x187c, 0x1009, "Hub Controller", UsbKind::Other),
         ],
         board_sound: true,
     }

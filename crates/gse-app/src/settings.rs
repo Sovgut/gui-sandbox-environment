@@ -885,6 +885,7 @@ impl Home {
                 ),
             );
         }
+        list.extend(self.other_devices_rows(rows, cx));
         if list.is_empty() {
             return None;
         }
@@ -899,6 +900,62 @@ impl Home {
             div(),
         ));
         Some(rows.group(Some("Devices"), list))
+    }
+
+    /// The USB devices of no known kind: a line that shows or hides them,
+    /// and, shown, each with its IDs and a switch that stays off.
+    fn other_devices_rows(&self, rows: Rows, cx: &mut Context<Self>) -> Vec<Div> {
+        let mut found = Vec::new();
+        let others: Vec<&gse_protocol::HostUsb> = self
+            .host_devices
+            .usb
+            .iter()
+            .filter(|d| d.kind == UsbKind::Other)
+            .collect();
+        if !others.is_empty() {
+            let shown = self.show_other_devices;
+            found.push(
+                rows.note_row(
+                    format!(
+                        "{} more USB device(s) of a kind gse does not know yet; a sandbox cannot \
+                     take them",
+                        others.len()
+                    ),
+                    Theme::muted(),
+                    button(
+                        "sandbox-usb-others",
+                        if shown { "Hide" } else { "Show other devices" },
+                        Kind::Secondary,
+                        true,
+                        cx.listener(|home, _, _, cx| {
+                            home.show_other_devices = !home.show_other_devices;
+                            cx.notify();
+                        }),
+                    )
+                    .size(Size::Toolbar),
+                ),
+            );
+            if shown {
+                for (i, device) in others.iter().enumerate() {
+                    found.push(
+                        rows.row(
+                            device.label.clone(),
+                            Some(format!(
+                                "USB ID {:04x}:{:04x}: name it when asking for its kind",
+                                device.id.vendor, device.id.product
+                            )),
+                            ui::switch(
+                                SharedString::from(format!("sandbox-usb-other-{i}")),
+                                false,
+                                SwitchSize::Row,
+                            )
+                            .disabled(true),
+                        ),
+                    );
+                }
+            }
+        }
+        found
     }
 
     /// App settings: what new sandboxes start with.

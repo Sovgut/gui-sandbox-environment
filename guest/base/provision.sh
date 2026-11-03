@@ -330,6 +330,22 @@ bound() {
     done
     return 1
 }
+# Without NVIDIA's kernel driver, NVIDIA's Vulkan driver and EGL library
+# stay hidden from every program: Vulkan's loader asks each driver to load,
+# and NVIDIA's opens the X display as it does, which deadlocks Xwayland when
+# its own acceleration (glamor, through zink) starts the loader. The desktop
+# reads the file as it starts, and the user managers, which start after this
+# unit, through environment.d.
+session_env() {
+    file=/run/environment.d/gse-gpu.conf
+    mkdir -p /run/environment.d
+    if [ "$1" = nvidia ]; then
+        rm -f "$file"
+    else
+        printf '%s\n' 'VK_LOADER_DRIVERS_DISABLE=*nvidia*' \
+            '__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json' > "$file"
+    fi
+}
 for driver in $chosen $fallback; do
     module=${driver%%:*}
     # A driver that took the GPU first lets go of it; a module already
@@ -341,12 +357,14 @@ for driver in $chosen $fallback; do
     if load "$driver"; then
         [ -n "$(holder)" ] || echo "$address" > "/sys/bus/pci/drivers/$module/bind" 2>/dev/null
         if bound "$module"; then
+            session_env "$module"
             echo "GSE-GPU: $driver" > /dev/ttyS0
             exit 0
         fi
     fi
 done
 held=$(holder)
+session_env "$held"
 echo "GSE-GPU: none${held:+, $held holds it}" > /dev/ttyS0
 EOF
 chmod 0755 /usr/libexec/gse/gpu-driver
@@ -369,6 +387,11 @@ ExecStart=/usr/libexec/gse/gpu-driver
 WantedBy=multi-user.target
 EOF
 systemctl enable gse-gpu-driver.service
+mkdir -p /etc/systemd/system/user@.service.d
+cat > /etc/systemd/system/user@.service.d/gse-gpu.conf <<'EOF'
+[Unit]
+After=gse-gpu-driver.service
+EOF
 mkdir -p /etc/systemd/system/greetd.service.d
 cat > /etc/systemd/system/greetd.service.d/gse.conf <<'EOF'
 [Unit]
@@ -378,7 +401,13 @@ EOF
 install -d /usr/libexec/gse
 cat > /usr/libexec/gse/session <<'EOF'
 #!/bin/sh
-# Starts the desktop of `sandbox` for the screen the host chose.
+# Starts the desktop of `sandbox` for the screen the host chose, with the
+# environment the GPU's driver asks for (see gse-gpu-driver.service).
+if [ -r /run/environment.d/gse-gpu.conf ]; then
+    set -a
+    . /run/environment.d/gse-gpu.conf
+    set +a
+fi
 if [ -s /run/gse/screen-mode ]; then
     export WLR_BACKENDS=headless,libinput WLR_HEADLESS_OUTPUTS=1
 fi

@@ -208,6 +208,16 @@ device. Its control nodes count as holders besides the DRM nodes:
   the chosen driver, the vendor's default loads instead. The driver in use
   goes to the serial console (`console.log`) as `GSE-GPU: <driver>`, or
   `GSE-GPU: none` with the driver that holds the GPU, if any.
+- **Userspace without NVIDIA's kernel driver.** An image with the `nvidia`
+  pack keeps NVIDIA's Vulkan driver and EGL library on a sandbox that runs
+  another driver. Vulkan's loader asks every driver to load, and NVIDIA's
+  opens the X display as it does: Xwayland, starting its acceleration
+  (glamor through zink, which starts the loader), then waits for itself,
+  and every X program with it. So the unit writes
+  `/run/environment.d/gse-gpu.conf` with `VK_LOADER_DRIVERS_DISABLE=*nvidia*`
+  and Mesa's EGL vendor alone whenever the GPU is not on nvidia; the
+  desktop's session script reads it, and the user managers, ordered after
+  the unit, take it through environment.d.
 
 ### CPU
 

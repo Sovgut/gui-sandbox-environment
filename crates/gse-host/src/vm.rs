@@ -44,6 +44,10 @@ pub struct VmSpec {
     /// guest: on a single-GPU machine the environment owns the monitor and
     /// nothing on the host is left to send input. Both Ctrl keys pressed
     /// together hand them back, which the service takes as the way out.
+    /// Only keyboards carry `grab_all`: QEMU's toggle on a device with it
+    /// lets go of every device without it and skips the others, so the
+    /// mice come back with the keyboard and the next move of the mouse
+    /// tells the service at once.
     pub host_input: Vec<HostInput>,
     /// A file with the host user's keyboard layouts
     /// (`gse_protocol::Keyboard::to_guest_text`), handed over as the `fw_cfg`
@@ -339,9 +343,9 @@ impl VmSpec {
             push(&[
                 "-object",
                 &format!(
-                    "input-linux,id=host-input{index},evdev={},grab_all=on,repeat={},grab-toggle=ctrl-ctrl",
+                    "input-linux,id=host-input{index},evdev={},grab_all={on},repeat={on},grab-toggle=ctrl-ctrl",
                     input.device.display(),
-                    if input.keyboard { "on" } else { "off" }
+                    on = if input.keyboard { "on" } else { "off" }
                 ),
             ]);
         }
@@ -423,7 +427,7 @@ mod tests {
             &"input-linux,id=host-input0,evdev=/dev/input/event2,grab_all=on,repeat=on,grab-toggle=ctrl-ctrl"
         ));
         assert!(objects.contains(
-            &"input-linux,id=host-input1,evdev=/dev/input/event5,grab_all=on,repeat=off,grab-toggle=ctrl-ctrl"
+            &"input-linux,id=host-input1,evdev=/dev/input/event5,grab_all=off,repeat=off,grab-toggle=ctrl-ctrl"
         ));
     }
 

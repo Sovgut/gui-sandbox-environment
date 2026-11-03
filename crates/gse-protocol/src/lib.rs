@@ -484,10 +484,11 @@ pub mod agent {
     /// keeps what arrives, capped, and never parses it.
     pub const JOURNAL_PORT: &str = "io.github.sovgut.gse.journal";
     /// The agent's version: 2 knows [`Call::Incoming`], 3 takes files up
-    /// to [`MAX_SENT_FILE`]. A host speaks to any agent from
-    /// [`MIN_VERSION`] on, so environments made from an older image keep
-    /// working.
-    pub const VERSION: u32 = 3;
+    /// to [`MAX_SENT_FILE`], 4 knows [`Call::Collecting`],
+    /// [`Call::Outgoing`], [`Call::Collected`] and [`Call::Leaving`]. A host
+    /// speaks to any agent from [`MIN_VERSION`] on, so environments made
+    /// from an older image keep working.
+    pub const VERSION: u32 = 4;
     pub const MIN_VERSION: u32 = 1;
     /// Raw bytes per chunk of a file; in base64 a chunk stays well under
     /// [`crate::MAX_LINE`].
@@ -544,6 +545,25 @@ pub mod agent {
             files: u32,
             bytes: u64,
         },
+        /// The host takes the Outbox by itself while this environment runs
+        /// (one GPU: the app is gone), and goes on until it stops. Version 4
+        /// on.
+        Collecting,
+        /// `files` of `bytes` in all leave the Outbox now as [`Call::Get`]s;
+        /// the guest shows them going. Version 4 on.
+        Outgoing {
+            files: u32,
+            bytes: u64,
+        },
+        /// What a round of taking the Outbox did: the files that left for
+        /// the host and the ones that stay, with why. Version 4 on.
+        Collected {
+            taken: Vec<crate::GuestFile>,
+            refused: Vec<(String, String)>,
+        },
+        /// The user asked to leave: the host takes the Outbox once more and
+        /// then stops the environment. Version 4 on.
+        Leaving,
         /// The Outbox file at `path`, answered with [`Answer::Chunk`]s and
         /// an [`Answer::GetEnd`].
         Get {

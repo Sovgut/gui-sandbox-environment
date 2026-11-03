@@ -29,7 +29,7 @@ use rustix::fs::{FileType, Gid, Mode, OFlags, ResolveFlags, Uid};
 use rustix::process::{Pid, PidfdFlags, Signal};
 use sha2::{Digest as _, Sha256};
 
-const GUEST: &str = "guest";
+pub(crate) const GUEST: &str = "guest";
 /// The units of `guest`'s own systemd that run no program a user started.
 /// Units of `guest`'s systemd that the desktop's own services run in, by
 /// name or by the start of it. A listing leaves them out; malware can name
@@ -101,7 +101,9 @@ pub fn serve() -> Result<()> {
         writer: port,
         upload: None,
         incoming: None,
+        outgoing: None,
     };
+    crate::incoming::install_outbox_wait();
     loop {
         if let Err(e) = agent.serve_connection() {
             eprintln!("agent: {e:#}");
@@ -130,6 +132,8 @@ struct Agent {
     upload: Option<Upload>,
     /// The files the host kept for this start, while they arrive.
     incoming: Option<crate::incoming::Batch>,
+    /// The files the host takes out of the Outbox now, while they leave.
+    outgoing: Option<crate::incoming::Batch>,
 }
 
 impl Agent {
@@ -230,8 +234,37 @@ impl Agent {
             // above did.
             Call::Incoming { files, bytes } => {
                 if files > 0 {
-                    self.incoming = Some(crate::incoming::Batch::new(files, bytes));
+                    self.incoming = Some(crate::incoming::Batch::new(
+                        crate::incoming::Kind::In,
+                        files,
+                        bytes,
+                    ));
                 }
+                Answer::Done
+            }
+            Call::Collecting => {
+                crate::incoming::collecting();
+                Answer::Done
+            }
+            Call::Outgoing { files, bytes } => {
+                if files > 0 {
+                    self.outgoing = Some(crate::incoming::Batch::new(
+                        crate::incoming::Kind::Out,
+                        files,
+                        bytes,
+                    ));
+                }
+                Answer::Done
+            }
+            Call::Collected { taken, refused } => {
+                if let Some(mut batch) = self.outgoing.take() {
+                    batch.end();
+                }
+                crate::incoming::collected(&taken, &refused);
+                Answer::Done
+            }
+            Call::Leaving => {
+                crate::incoming::leaving();
                 Answer::Done
             }
         }))
@@ -403,12 +436,18 @@ impl Agent {
         let mut hash = Sha256::new();
         let mut buffer = vec![0; agent::CHUNK];
         let mut sent = 0_u64;
+        if let Some(batch) = &mut self.outgoing {
+            batch.file(path);
+        }
         loop {
             let read = file.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
             sent += read as u64;
+            if let Some(batch) = &mut self.outgoing {
+                batch.bytes(read as u64);
+            }
             if sent > agent::MAX_TAKEN_FILE {
                 bail!("{path} grew past {} bytes", agent::MAX_TAKEN_FILE);
             }
@@ -419,6 +458,13 @@ impl Agent {
                     data: BASE64.encode(&buffer[..read]),
                 },
             )?;
+        }
+        if self
+            .outgoing
+            .as_mut()
+            .is_some_and(crate::incoming::Batch::arrived)
+        {
+            self.outgoing = None;
         }
         self.answer(
             id,

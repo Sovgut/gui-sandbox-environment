@@ -92,6 +92,10 @@ pub struct Launch {
     pub dev_vnc: Option<u16>,
     /// The host user's keyboard layouts, which the guest takes.
     pub keyboard: Option<gse_protocol::Keyboard>,
+    /// Raised when the user asks to leave by the keyboard (one GPU); the
+    /// service then stops the environment once it took the Outbox. Without
+    /// it the keys stop the environment at once.
+    pub leave: Option<std::sync::Arc<AtomicBool>>,
 }
 
 impl Launch {
@@ -171,6 +175,7 @@ pub fn run(root: &Root, args: &RunArgs, stop: &AtomicBool, dry_run: bool) -> Res
         dev_ssh_port: args.dev_ssh_port,
         dev_vnc: args.dev_vnc,
         keyboard: None,
+        leave: None,
     };
     launch_environment(root, &launch, stop, &mut |_| {}, dry_run)
 }
@@ -265,11 +270,8 @@ pub fn launch_environment(
         let mut watch = Watch {
             owner: (!single).then_some(launch.owner.uid),
             progress,
-            exit_keys: host_input
-                .iter()
-                .filter(|i| i.keyboard)
-                .map(|i| i.device.clone())
-                .collect(),
+            exit_keys: host_input.iter().map(|i| i.device.clone()).collect(),
+            leave: launch.leave.as_deref(),
         };
         run_networked(
             &launch.name,
@@ -406,9 +408,11 @@ fn kill_qemu(name: &str, pid: i32) {
 pub struct Watch<'a> {
     pub owner: Option<u32>,
     pub progress: &'a mut dyn FnMut(Stage),
-    /// Host keyboards the VM grabbed; a key from one of them stops it (see
-    /// [`crate::hostinput`]).
+    /// Host keyboards and mice the VM grabbed; an event from one of them
+    /// stops it (see [`crate::hostinput`]).
     pub exit_keys: Vec<PathBuf>,
+    /// See [`Launch::leave`].
+    pub leave: Option<&'a AtomicBool>,
 }
 
 /// The line the guest writes to its serial console once its desktop is up.
@@ -603,10 +607,13 @@ fn run_qemu(spec: &VmSpec, stop: &AtomicBool, watch: &mut Watch<'_>) -> Result<(
     (watch.progress)(Stage::Booting);
 
     let exit_keys = watch.exit_keys.clone();
+    let watch_leave = watch.leave;
     let watching = AtomicBool::new(false);
     let status = std::thread::scope(|scope| -> Result<ExitStatus> {
         if !exit_keys.is_empty() {
-            scope.spawn(|| crate::hostinput::watch_for_exit(&exit_keys, stop, &watching));
+            scope.spawn(|| {
+                crate::hostinput::watch_for_exit(&exit_keys, stop, &watching, watch_leave);
+            });
         }
         let status = wait_for_qemu(spec, &mut child, stop, watch);
         watching.store(true, Ordering::SeqCst);

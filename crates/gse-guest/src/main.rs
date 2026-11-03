@@ -74,6 +74,9 @@ enum Cli {
     Screen,
     /// As root: answer the host on the agent's port.
     Agent,
+    /// As root, when the guest powers off: wait until the host took the
+    /// Outbox.
+    OutboxWait,
 }
 
 fn main() -> Result<()> {
@@ -97,5 +100,9 @@ fn main() -> Result<()> {
         }
         Cli::Screen => screen::serve(),
         Cli::Agent => agent::serve(),
+        Cli::OutboxWait => {
+            incoming::wait_for_outbox();
+            Ok(())
+        }
     }
 }

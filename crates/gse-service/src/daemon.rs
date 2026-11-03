@@ -724,6 +724,11 @@ struct Current {
     internet: bool,
     owner: u32,
     stop: Arc<AtomicBool>,
+    /// Raised when the user asks to leave by the keyboard (one GPU).
+    leave: Arc<AtomicBool>,
+    /// Whether the service takes the Outbox by itself now, so a leave
+    /// waits for its last round.
+    collecting: Arc<AtomicBool>,
     screen: ScreenAccess,
 }
 
@@ -904,6 +909,7 @@ impl Service {
 
     /// Starts `name` for `owner`; progress goes to `progress` and to every
     /// watcher, and a start that fails ends `progress` with the reason.
+    #[allow(clippy::too_many_lines)] // one start, from the checks to the VM's end
     fn start(
         &self,
         name: &str,
@@ -925,6 +931,7 @@ impl Service {
                 .gpu
                 .parse()
                 .with_context(|| format!("'{}' is not a PCI address", settings.gpu))?;
+            let leave = Arc::new(AtomicBool::new(false));
             let launch = vm::Launch {
                 name: name.to_owned(),
                 disk: shared.store.disk(name),
@@ -938,6 +945,7 @@ impl Service {
                 dev_ssh_port: shared.config.dev_ssh_port,
                 dev_vnc: None,
                 keyboard,
+                leave: Some(Arc::clone(&leave)),
             };
             let stop = Arc::new(AtomicBool::new(false));
             shared.current = Some(Current {
@@ -946,6 +954,8 @@ impl Service {
                 internet: settings.internet,
                 owner,
                 stop: Arc::clone(&stop),
+                leave: Arc::clone(&leave),
+                collecting: Arc::new(AtomicBool::new(false)),
                 screen: ScreenAccess {
                     memory: launch.screen_memory(),
                     input: launch.input_socket(),
@@ -953,6 +963,7 @@ impl Service {
             });
             (launch, stop, shared.root.clone())
         };
+        self.stop_on_early_leave(name);
 
         self.log(
             name,
@@ -1350,6 +1361,38 @@ impl Service {
         Ok(shared.store.dir(name))
     }
 
+    /// Stops `name` at once when the user asks to leave before the service
+    /// takes its Outbox by itself (before its desktop is up, or with two
+    /// GPUs), where no last round waits.
+    fn stop_on_early_leave(&self, name: &str) {
+        let service = self.clone();
+        let name = name.to_owned();
+        thread::spawn(move || {
+            loop {
+                let flags = service
+                    .lock()
+                    .current
+                    .as_ref()
+                    .filter(|c| c.name == name)
+                    .map(|c| {
+                        (
+                            Arc::clone(&c.stop),
+                            c.leave.load(Ordering::SeqCst),
+                            c.collecting.load(Ordering::SeqCst),
+                        )
+                    });
+                match flags {
+                    Some((stop, true, false)) => {
+                        stop.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Some((_, false, _)) => thread::sleep(Duration::from_millis(200)),
+                    None | Some((_, true, true)) => return,
+                }
+            }
+        });
+    }
+
     /// Once `name` is up: what waits for its Inbox goes in, and on a single
     /// GPU, where the app is gone while it runs, its Outbox is taken into
     /// the spool every [`mailbox::COLLECT_EVERY`] until it stops.
@@ -1377,8 +1420,25 @@ impl Service {
             if !single {
                 return;
             }
+            let flags = service
+                .lock()
+                .current
+                .as_ref()
+                .filter(|c| c.name == name)
+                .map(|c| {
+                    c.collecting.store(true, Ordering::SeqCst);
+                    (Arc::clone(&c.stop), Arc::clone(&c.leave))
+                });
+            let Some((stop, leave)) = flags else {
+                return;
+            };
+            service.with_agent(&name, Agent::collecting).ok();
             let mut seen = std::collections::HashSet::new();
             while service.is_up(&name) {
+                let leaving = leave.load(Ordering::SeqCst);
+                if leaving {
+                    service.with_agent(&name, Agent::leaving).ok();
+                }
                 match service.with_agent(&name, |agent| mailbox::collect(&dir, agent, &mut seen)) {
                     Ok(0) => {}
                     Ok(count) => service.log(
@@ -1387,7 +1447,17 @@ impl Service {
                     ),
                     Err(e) => warn!("{name}: taking the Outbox: {e:#}"),
                 }
-                thread::sleep(mailbox::COLLECT_EVERY);
+                if leaving {
+                    // The last round is in; the window that says so has
+                    // a moment to show before the screen goes.
+                    thread::sleep(Duration::from_secs(2));
+                    stop.store(true, Ordering::SeqCst);
+                    return;
+                }
+                let next = std::time::Instant::now() + mailbox::COLLECT_EVERY;
+                while std::time::Instant::now() < next && !leave.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(200));
+                }
             }
         });
     }
@@ -1851,28 +1921,28 @@ fn scan(staging: &Path) -> Result<Vec<antivirus::Found>> {
         .context("the files cannot pass the antivirus")
 }
 
+/// Files kept in the Outbox, each with why.
+pub type Refusals = Vec<(String, String)>;
+
 /// Copies `files` of the Outbox through `agent` onto `out`, file by file,
-/// with the outbound checks; returns the files that passed and how many
-/// were refused.
+/// with the outbound checks; returns the files that passed and the ones
+/// refused.
 pub fn take_files(
     agent: &mut Agent,
     out: &mut dyn std::io::Write,
     files: &[gse_protocol::GuestFile],
-) -> Result<(Vec<gse_protocol::GuestFile>, usize)> {
-    let (mut passed, mut refused, mut total) = (Vec::new(), 0, 0_u64);
+) -> Result<(Vec<gse_protocol::GuestFile>, Refusals)> {
+    let (mut passed, mut refused, mut total) = (Vec::new(), Vec::new(), 0_u64);
     for file in files {
-        if passed.len() + refused >= checks::MAX_TAKE_FILES {
-            refused += 1;
-            refuse(
-                out,
-                &file.path,
-                format!("a take holds at most {} files", checks::MAX_TAKE_FILES),
-            )?;
+        if passed.len() + refused.len() >= checks::MAX_TAKE_FILES {
+            let reason = format!("a take holds at most {} files", checks::MAX_TAKE_FILES);
+            refuse(out, &file.path, reason.clone())?;
+            refused.push((file.path.clone(), reason));
             continue;
         }
         if let Some(reason) = checks::by_name(&file.path) {
-            refused += 1;
-            refuse(out, &file.path, reason)?;
+            refuse(out, &file.path, reason.clone())?;
+            refused.push((file.path.clone(), reason));
             continue;
         }
         let room = checks::MAX_TAKE.saturating_sub(total);
@@ -1890,18 +1960,18 @@ pub fn take_files(
                 total += size;
             }
             (Ok(_), Some(reason)) => {
-                refused += 1;
-                refuse(out, &file.path, reason)?;
+                refuse(out, &file.path, reason.clone())?;
+                refused.push((file.path.clone(), reason));
             }
             // The client drops a file refused after it began.
             (Err(e), _) => {
-                refused += 1;
                 let reason = if started {
                     format!("it broke off: {e:#}")
                 } else {
                     format!("{e:#}")
                 };
-                refuse(out, &file.path, reason)?;
+                refuse(out, &file.path, reason.clone())?;
+                refused.push((file.path.clone(), reason));
             }
         }
     }

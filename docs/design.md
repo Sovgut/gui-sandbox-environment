@@ -102,12 +102,17 @@ kernel; with it the guest sees the 3070 at PCIe 4.0 x16 with Vulkan.
   takes roughly 20-40 seconds. With a second GPU the environment is shown in a window
   instead (see "Environment screen").
 - **Emergency exit**: both Ctrl keys pressed together. On a single-GPU machine
-  QEMU grabs the host's keyboards and mice (`input-linux`, `grab_all`), so
-  nothing on the host sees them, and this pair makes it let them go. The
-  service reads the keyboards as well and gets nothing while they are
-  grabbed, so the first key it sees means the user asked to leave: it kills
-  the VM at once. The guest never sees the devices, so it can neither fake
-  the exit nor block it.
+  QEMU grabs the host's keyboards and mice (`input-linux`), so nothing on
+  the host sees them, and this pair makes it let them go once the keys are
+  lifted. Only the keyboards carry `grab_all`: QEMU's toggle on such a
+  device lets go of every device without it and skips the others, so the
+  mice come back with the keyboard. QEMU says nothing when it lets go, so
+  the service reads every device as well and gets nothing while they are
+  grabbed: the first key, button or motion it sees means the user asked to
+  leave. The guest then shows that the screen goes dark, the service takes
+  the Outbox once more and stops the VM; before the desktop is up, or
+  after two minutes at most, it stops it at once. The guest never sees the
+  devices, so it can neither fake the exit nor block it.
 - A suspended VM cannot be resumed after the GPU is reclaimed: consumer GeForce
   cards do not support saving VM state with a passed-through device.
 - The environment VM has no emulated display and no network of its own by
@@ -450,9 +455,14 @@ version. A preset installs it as an `appimage` entry.
   kernel to flush at once; on btrfs such a flush stalls every program that
   touches the disk. `CancelTransfer` stops a send at its next part: whole
   files stay, the one under way goes. While a single-GPU environment runs, the service takes what is new
-  in its Outbox every 20 s, past the same checks as a take, into a spool of
+  in its Outbox every 5 s, past the same checks as a take, into a spool of
   the lines a take sends (`outbox-taken`); the app's Files panel lists and
-  takes it after the run like a live Outbox.
+  takes it after the run like a live Outbox. The guest shows each round
+  (agent version 4): a window with a bar while files leave, then a
+  notification of what left for the host and what stays, with why. A
+  power-off from the guest's own menu waits up to a minute until the host
+  took or turned down every file of the Outbox: the agent puts a unit in
+  /run whose stop waits, so no image has to be rebuilt for it.
 - **The host always initiates**; the agent only answers. The protocol is
   JSON lines (`gse_protocol::agent`): every call carries an id its answers
   repeat, lines are capped, a file travels in base64 chunks of 32 KiB with

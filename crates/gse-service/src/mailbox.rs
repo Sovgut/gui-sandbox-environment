@@ -23,7 +23,7 @@ use gse_protocol::GuestFile;
 use crate::agent::Agent;
 
 /// How often a single-GPU environment's Outbox is looked at.
-pub const COLLECT_EVERY: Duration = Duration::from_secs(20);
+pub const COLLECT_EVERY: Duration = Duration::from_secs(5);
 
 fn waiting_dir(dir: &Path) -> PathBuf {
     dir.join("inbox-waiting")
@@ -316,7 +316,8 @@ pub fn collect(dir: &Path, agent: &mut Agent, seen: &mut HashSet<(String, u64)>)
         .create(true)
         .mode(0o600)
         .open(spool(dir))?;
-    let (passed, _) = crate::daemon::take_files(agent, &mut spool, &new)?;
+    agent.outgoing(new.len(), new.iter().map(|f| f.size).sum())?;
+    let (passed, refused) = crate::daemon::take_files(agent, &mut spool, &new)?;
     let mut index = fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -328,7 +329,9 @@ pub fn collect(dir: &Path, agent: &mut Agent, seen: &mut HashSet<(String, u64)>)
     for file in new {
         seen.insert((file.path, file.size));
     }
-    Ok(passed.len())
+    let count = passed.len();
+    agent.collected(passed, refused)?;
+    Ok(count)
 }
 
 /// Takes the whole Outbox through `agent` into the spool, past the checks
@@ -349,7 +352,7 @@ pub fn spool_outbox(dir: &Path, agent: &mut Agent) -> Result<(usize, usize)> {
     for file in &passed {
         writeln!(index, "{} {}", file.size, file.path)?;
     }
-    Ok((passed.len(), refused))
+    Ok((passed.len(), refused.len()))
 }
 
 /// What a spool holds, in order.

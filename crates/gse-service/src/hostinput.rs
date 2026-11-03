@@ -2,11 +2,15 @@
 //! owns the monitor there and the host session is gone, so QEMU grabs these
 //! devices and gives them to the guest (see `VmSpec::host_input`).
 //!
-//! The way back is both Ctrl keys pressed together: QEMU then lets every
-//! device go. The service reads the keyboards too, and a grabbed device
-//! delivers nothing to any other reader, so the first key event the service
-//! sees means the user asked to leave, and it stops the environment. The
-//! guest never sees the devices, so it can neither fake this nor block it.
+//! The way back is both Ctrl keys pressed together: QEMU then lets the
+//! keyboard and the mice go (see `VmSpec::host_input`). The service reads
+//! every device too, and a grabbed device delivers nothing to any other
+//! reader, so the first key, button or motion the service sees means the
+//! user asked to leave, and it stops the environment. QEMU lets go only
+//! once the keys are lifted and says nothing then, so a mouse that moves
+//! is what tells the service at once; a keyboard alone waits for its next
+//! key. The guest never sees the devices, so it can neither fake this nor
+//! block it.
 
 use std::fs::{self, File};
 use std::io::Read as _;
@@ -21,8 +25,11 @@ use tracing::{info, warn};
 const DEVICES: &str = "/proc/bus/input/devices";
 /// `KEY_A`: a device that has it is a keyboard, not a power or media button.
 const KEY_A: usize = 30;
-/// `EV_KEY`, the type of a key or button event.
+/// `EV_KEY`, `EV_REL` and `EV_ABS`: a key or button, a relative motion
+/// (a mouse) and an absolute one (a tablet).
 const EV_KEY: u16 = 1;
+const EV_REL: u16 = 2;
+const EV_ABS: u16 = 3;
 /// The size of a `struct input_event` on 64-bit Linux.
 const EVENT_SIZE: usize = 24;
 /// How long QEMU may take to grab the devices once it started; what the
@@ -74,10 +81,21 @@ fn has_bit(bitmap: &str, bit: usize) -> bool {
     u64::from_str_radix(word, 16).is_ok_and(|w| w & (1 << (bit % 64)) != 0)
 }
 
-/// Watches `keyboards` until `done`, and sets `stop` once one of them
-/// delivers a key: QEMU let go of them, so the user pressed both Ctrl keys.
-pub fn watch_for_exit(keyboards: &[PathBuf], stop: &AtomicBool, done: &AtomicBool) {
-    let mut files: Vec<File> = keyboards
+/// How long the service may take the Outbox once the user asked to leave
+/// before the environment stops anyway.
+const LEAVE_WITHIN: Duration = Duration::from_secs(120);
+
+/// Watches `devices` until `done`. Once one of them delivers a key, a
+/// button or a motion (QEMU let go of them, so the user pressed both Ctrl
+/// keys) it raises `leave`, and sets `stop` itself when the service has not
+/// within [`LEAVE_WITHIN`]; without `leave` it sets `stop` at once.
+pub fn watch_for_exit(
+    devices: &[PathBuf],
+    stop: &AtomicBool,
+    done: &AtomicBool,
+    leave: Option<&AtomicBool>,
+) {
+    let mut files: Vec<File> = devices
         .iter()
         .filter_map(|path| match File::open(path) {
             Ok(file) => Some(file),
@@ -88,7 +106,7 @@ pub fn watch_for_exit(keyboards: &[PathBuf], stop: &AtomicBool, done: &AtomicBoo
         })
         .collect();
     if files.is_empty() {
-        warn!("no keyboard to watch: only the guest's own shutdown ends this environment");
+        warn!("no input device to watch: only the guest's own shutdown ends this environment");
         return;
     }
     let started = Instant::now();
@@ -119,9 +137,24 @@ pub fn watch_for_exit(keyboards: &[PathBuf], stop: &AtomicBool, done: &AtomicBoo
                 .as_chunks::<EVENT_SIZE>()
                 .0
                 .iter()
-                .any(|event| u16::from_ne_bytes([event[16], event[17]]) == EV_KEY);
+                .any(|event| {
+                    matches!(
+                        u16::from_ne_bytes([event[16], event[17]]),
+                        EV_KEY | EV_REL | EV_ABS
+                    )
+                });
             if key && settled {
-                info!("the keyboard came back to the host: stopping the environment");
+                info!("the keyboard and mice came back to the host: leaving the environment");
+                if let Some(leave) = leave {
+                    leave.store(true, Ordering::SeqCst);
+                    let asked = Instant::now();
+                    while !stop.load(Ordering::SeqCst)
+                        && !done.load(Ordering::SeqCst)
+                        && asked.elapsed() < LEAVE_WITHIN
+                    {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
                 stop.store(true, Ordering::SeqCst);
                 return;
             }

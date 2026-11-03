@@ -114,6 +114,41 @@ impl Agent {
         })
     }
 
+    /// Calls `body` on an agent of version 4 on; an older one goes without.
+    fn tell(&mut self, body: Call) -> Result<()> {
+        if self.version < 4 {
+            return Ok(());
+        }
+        self.done(body)
+    }
+
+    /// The host takes the Outbox by itself while this environment runs.
+    pub fn collecting(&mut self) -> Result<()> {
+        self.tell(Call::Collecting)
+    }
+
+    /// `files` of `bytes` in all leave the Outbox now.
+    pub fn outgoing(&mut self, files: usize, bytes: u64) -> Result<()> {
+        self.tell(Call::Outgoing {
+            files: u32::try_from(files).unwrap_or(u32::MAX),
+            bytes,
+        })
+    }
+
+    /// What a round of taking the Outbox did.
+    pub fn collected(
+        &mut self,
+        taken: Vec<gse_protocol::GuestFile>,
+        refused: Vec<(String, String)>,
+    ) -> Result<()> {
+        self.tell(Call::Collected { taken, refused })
+    }
+
+    /// The user asked to leave.
+    pub fn leaving(&mut self) -> Result<()> {
+        self.tell(Call::Leaving)
+    }
+
     fn done(&mut self, body: Call) -> Result<()> {
         match self.ask(body)? {
             Answer::Done => Ok(()),

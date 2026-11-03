@@ -360,6 +360,7 @@ fn build(
         owner: None,
         progress: &mut |_| {},
         exit_keys: Vec::new(),
+        leave: None,
     };
     let outcome = vm::run_networked("build", true, None, job.stop, &mut watch, spec_for);
     done.store(true, Ordering::SeqCst);

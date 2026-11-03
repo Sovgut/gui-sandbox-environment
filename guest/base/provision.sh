@@ -339,6 +339,9 @@ Before=greetd.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# Each driver gets 10 s to take the GPU; the desktop starts whatever came of
+# it.
+TimeoutStartSec=60
 ExecStartPre=-/usr/sbin/modprobe qemu_fw_cfg
 ExecStart=/usr/libexec/gse/gpu-driver
 

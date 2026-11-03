@@ -525,14 +525,14 @@ fn fetch(http: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>> {
 
 /// Checks that `signature` is the Talos key's signature of `data`.
 fn verify(data: &[u8], signature: &[u8]) -> Result<()> {
-    use pgp::composed::{Deserializable as _, SignedPublicKey, StandaloneSignature};
+    use pgp::composed::{Deserializable as _, SignedPublicKey, DetachedSignature};
     let (key, _) = SignedPublicKey::from_string(TALOS_KEY).context("reading the Talos key")?;
     // Talos publishes the signature armored; a binary one reads too.
     let signature = if signature.starts_with(b"-----BEGIN") {
         let text = std::str::from_utf8(signature).context("the signature is not text")?;
-        StandaloneSignature::from_string(text).map(|(signature, _)| signature)
+        DetachedSignature::from_string(text).map(|(signature, _)| signature)
     } else {
-        StandaloneSignature::from_bytes(signature)
+        DetachedSignature::from_bytes(signature)
     }
     .context("reading the signature")?;
     signature

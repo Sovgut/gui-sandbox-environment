@@ -225,6 +225,7 @@ pub fn launch_environment(
     });
     let home = Some(dir.join("home.qcow2")).filter(|home| home.exists());
     let direct_io = nocow::is_set(&launch.disk) && home.as_deref().is_none_or(nocow::is_set);
+    let guest_program = guest_program_disk(dir, dry_run);
     let spec_for = |socket: PathBuf| VmSpec {
         name: launch.name.clone(),
         disk: launch.disk.clone(),
@@ -251,9 +252,7 @@ pub fn launch_environment(
         journal_log: Some(journal.clone()),
         run_as: Some(launch.owner.name.clone()),
         direct_io,
-        guest_program: crate::image::guest_program_path(None)
-            .ok()
-            .filter(|p| p.is_file()),
+        guest_program: guest_program.clone(),
         image_build: false,
     };
 
@@ -624,4 +623,34 @@ fn run_qemu(spec: &VmSpec, stop: &AtomicBool, watch: &mut Watch<'_>) -> Result<(
         bail!("QEMU exited with {status}");
     }
     Ok(())
+}
+
+/// The disk that hands the service's `gse-guest` to a start, written into
+/// the environment's folder `dir`: the program from its first byte, padded
+/// to whole sectors. None without a program, which only a broken install
+/// lacks; the environment then keeps the one its image has.
+fn guest_program_disk(dir: &Path, dry_run: bool) -> Option<gse_host::vm::GuestProgram> {
+    use sha2::{Digest as _, Sha256};
+    let program = crate::image::guest_program(None)
+        .inspect_err(|e| warn!("no gse-guest to hand over: {e:#}"))
+        .ok()?;
+    let image = dir.join("guest-program.img");
+    let mut padded = program.clone();
+    padded.resize(program.len().div_ceil(512) * 512, 0);
+    if !dry_run && let Err(e) = fs::write(&image, &padded) {
+        warn!("writing {}: {e}", image.display());
+        return None;
+    }
+    let sha256 = Sha256::digest(&program)
+        .iter()
+        .fold(String::new(), |mut hex, b| {
+            use std::fmt::Write as _;
+            write!(hex, "{b:02x}").ok();
+            hex
+        });
+    Some(gse_host::vm::GuestProgram {
+        image,
+        size: program.len() as u64,
+        sha256,
+    })
 }

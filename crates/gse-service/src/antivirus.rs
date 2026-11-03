@@ -264,7 +264,7 @@ impl Antivirus {
             ],
         )?;
         if ran.code != Some(0) {
-            bail!("freshclam failed: {}", last_line(&ran.stdout, &ran.stderr));
+            bail!("freshclam failed: {}", problems(&ran.stdout, &ran.stderr));
         }
         Ok(())
     }
@@ -471,6 +471,33 @@ fn found(output: &str) -> Vec<Found> {
         .collect()
 }
 
+/// What freshclam said went wrong: its error and warning lines, which name
+/// the cause before its closing "Update failed"; the last line without them.
+fn problems(stdout: &[u8], stderr: &[u8]) -> String {
+    let text = [stdout, stderr]
+        .into_iter()
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut lines: Vec<&str> = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if (line.starts_with("ERROR") || line.starts_with("WARNING")) && !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    if lines.is_empty() {
+        return last_line(stdout, stderr);
+    }
+    lines
+        .iter()
+        .rev()
+        .take(4)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
 /// The last line a program printed, for an error.
 fn last_line(stdout: &[u8], stderr: &[u8]) -> String {
     let text = [stderr, stdout]
@@ -556,6 +583,19 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn freshclam_says_why_it_failed() {
+        let out = b"ClamAV update process started\nWARNING: Can't download daily.cvd from \
+                    https://database.clamav.net/daily.cvd\nERROR: Received error code 403 or \
+                    429\nERROR: Update failed.\n";
+        assert_eq!(
+            problems(out, b""),
+            "WARNING: Can't download daily.cvd from https://database.clamav.net/daily.cvd / \
+             ERROR: Received error code 403 or 429 / ERROR: Update failed."
+        );
+        assert_eq!(problems(b"something odd\n", b""), "something odd");
     }
 
     #[test]

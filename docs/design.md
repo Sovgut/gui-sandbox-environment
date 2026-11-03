@@ -264,9 +264,12 @@ look into an environment without the app.
     access to `sandbox`'s files through either Unix permissions or SELinux
     labels.
 - `gse-guest` (`crates/gse-guest`) is gse's program inside the guest. Every
-  start hands the host's copy over as the `fw_cfg` item `opt/gse/guest`,
-  and `gse-guest-update.service` puts it in place before the agent, the
-  journal stream and the desktop start, so a new gse brings its guest side
+  start hands the host's copy over on a read-only disk of its own (serial
+  `gse-guest`), with its size and SHA-256 as the `fw_cfg` items
+  `opt/gse/guest-size` and `opt/gse/guest-sha256`; `fw_cfg` suits only a
+  few bytes, since the guest reads an item from its start for every page.
+  `gse-guest-update.service` puts a copy that matches in place before the
+  agent, the journal stream and the desktop start, so a new gse brings its guest side
   without a rebuilt image. Only a change to the provisioning script makes a
   base image out of date. Programs of `guest` show their windows on the
   desktop of `sandbox` through it:

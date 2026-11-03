@@ -75,14 +75,27 @@ pub struct VmSpec {
     /// with checksums can store a block whose checksum no longer matches
     /// when the guest changes the buffer while it is written.
     pub direct_io: bool,
-    /// The `gse-guest` program the environment runs, handed over as the
-    /// `fw_cfg` item `opt/gse/guest` and put in place at boot, so the
-    /// guest's side of gse follows the host's without a rebuilt image.
-    pub guest_program: Option<PathBuf>,
+    /// The `gse-guest` program the environment runs, put in place at boot
+    /// so the guest's side of gse follows the host's without a rebuilt
+    /// image. It travels on a read-only disk (serial `gse-guest`); its size
+    /// and SHA-256 as the `fw_cfg` items `opt/gse/guest-size` and
+    /// `opt/gse/guest-sha256`. `fw_cfg` itself suits a few bytes only: the
+    /// guest reads it from the start for every page, so megabytes take
+    /// minutes.
+    pub guest_program: Option<GuestProgram>,
     /// An image build: the guest learns it through the `fw_cfg` item
     /// `opt/gse/build` and starts no desktop, which a VM without a GPU could
     /// only start and lose in a loop.
     pub image_build: bool,
+}
+
+/// The `gse-guest` program a start hands over: a disk image that holds it
+/// from its first byte, its length and its SHA-256 in hex.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestProgram {
+    pub image: PathBuf,
+    pub size: u64,
+    pub sha256: String,
 }
 
 /// An evdev device of the host that the VM takes over.
@@ -228,8 +241,17 @@ impl VmSpec {
         }
         if let Some(guest) = &self.guest_program {
             push(&[
+                "-drive",
+                &format!(
+                    "if=none,id=gseguest,file={},format=raw,readonly=on",
+                    guest.image.display()
+                ),
+                "-device",
+                "virtio-blk-pci,drive=gseguest,serial=gse-guest",
                 "-fw_cfg",
-                &format!("name=opt/gse/guest,file={}", guest.display()),
+                &format!("name=opt/gse/guest-size,string={}", guest.size),
+                "-fw_cfg",
+                &format!("name=opt/gse/guest-sha256,string={}", guest.sha256),
             ]);
         }
         // Appended to, so the service can start a log over that grew too
@@ -427,18 +449,24 @@ mod tests {
     }
 
     #[test]
-    fn the_guest_program_goes_over_fw_cfg() {
+    fn the_guest_program_goes_on_a_disk_of_its_own() {
         let mut spec = spec();
+        assert!(!spec.command_line().iter().any(|a| a.contains("gse-guest")));
+        spec.guest_program = Some(GuestProgram {
+            image: "/var/lib/gse/environments/x/guest-program.img".into(),
+            size: 2_700_000,
+            sha256: "ab12".into(),
+        });
+        let args = spec.command_line();
+        assert!(after(&args, "-drive").contains(
+            &"if=none,id=gseguest,file=/var/lib/gse/environments/x/guest-program.img,format=raw,readonly=on"
+        ));
         assert!(
-            !after(&spec.command_line(), "-fw_cfg")
-                .iter()
-                .any(|i| i.contains("opt/gse/guest"))
+            after(&args, "-device").contains(&"virtio-blk-pci,drive=gseguest,serial=gse-guest")
         );
-        spec.guest_program = Some("/usr/local/libexec/gse/gse-guest".into());
-        assert!(
-            after(&spec.command_line(), "-fw_cfg")
-                .contains(&"name=opt/gse/guest,file=/usr/local/libexec/gse/gse-guest")
-        );
+        let items = after(&args, "-fw_cfg");
+        assert!(items.contains(&"name=opt/gse/guest-size,string=2700000"));
+        assert!(items.contains(&"name=opt/gse/guest-sha256,string=ab12"));
     }
 
     #[test]

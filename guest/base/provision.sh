@@ -318,20 +318,44 @@ After=
 EOF
 done
 
-# The host hands over its current gse-guest at every start (fw_cfg
-# opt/gse/guest): it takes the place of the one this image was built with
-# before anything of gse runs, so gse's side in the guest follows the host
-# without a rebuilt image. An image build gets none and keeps its own.
+# The host hands over its current gse-guest at every start, on a read-only
+# disk of its own (serial gse-guest) with its size and SHA-256 as fw_cfg
+# items: it takes the place of the one this image was built with before
+# anything of gse runs, so gse's side in the guest follows the host without
+# a rebuilt image. A copy that does not match is dropped, and the image's
+# stays. An image build gets none and keeps its own.
+cat > /usr/libexec/gse/guest-update <<'EOF'
+#!/bin/sh
+items=/sys/firmware/qemu_fw_cfg/by_name/opt/gse
+[ -r "$items/guest-size/raw" ] && [ -r "$items/guest-sha256/raw" ] || exit 0
+size=$(cat "$items/guest-size/raw")
+sum=$(cat "$items/guest-sha256/raw")
+disk=/dev/disk/by-id/virtio-gse-guest
+for _ in $(seq 100); do [ -e "$disk" ] && break; sleep 0.1; done
+[ -e "$disk" ] || { echo "no gse-guest disk"; exit 0; }
+new=/usr/libexec/gse/gse-guest.new
+head -c "$size" "$disk" > "$new"
+if ! echo "$sum  $new" | sha256sum -c --status; then
+    echo "the gse-guest the host handed over does not match; keeping the image's"
+    rm -f "$new"
+    exit 0
+fi
+chmod 0755 "$new"
+mv -f "$new" /usr/libexec/gse/gse-guest
+restorecon /usr/libexec/gse/gse-guest
+EOF
+chmod 0755 /usr/libexec/gse/guest-update
 cat > /etc/systemd/system/gse-guest-update.service <<'EOF'
 [Unit]
 Description=Take the host's gse-guest
-After=systemd-modules-load.service
+After=systemd-modules-load.service systemd-udevd.service
 Before=gse-agent.service gse-journal.service gse-screen-mode.service greetd.service
 
 [Service]
 Type=oneshot
+TimeoutStartSec=30
 ExecStartPre=-/usr/sbin/modprobe qemu_fw_cfg
-ExecStart=/bin/sh -c 'f=/sys/firmware/qemu_fw_cfg/by_name/opt/gse/guest/raw; [ -r "$f" ] || exit 0; install -m 0755 "$f" /usr/libexec/gse/gse-guest.new && mv -f /usr/libexec/gse/gse-guest.new /usr/libexec/gse/gse-guest && restorecon /usr/libexec/gse/gse-guest'
+ExecStart=/usr/libexec/gse/guest-update
 
 [Install]
 WantedBy=multi-user.target

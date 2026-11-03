@@ -1,6 +1,7 @@
 //! Everything worth sending when something goes wrong, in one zip archive:
-//! the logs of the app, its install, the service, image builds and every
-//! sandbox, the settings, and what the computer is. It reads only files a
+//! the logs of the app, its install, the service, image builds, the
+//! antivirus's last run and every sandbox, the settings, and what the
+//! computer is. It reads only files a
 //! user may read and runs only commands a user may run, so it works without
 //! the service and without the window: `gse --diagnostics` makes the same
 //! archive from a terminal.
@@ -126,6 +127,13 @@ fn write(archive: &Path) -> Result<()> {
     for path in files_in(Path::new(SERVICE_LOGS)) {
         let name = path.strip_prefix(SERVICE_LOGS).unwrap_or(&path);
         add(&mut zip, format!("service/{}", name.display()), &path)?;
+    }
+    for file in ["stdout", "stderr"] {
+        add(
+            &mut zip,
+            format!("service/antivirus/{file}"),
+            &Path::new("/var/lib/gse/clamav/runs").join(file),
+        )?;
     }
     for sandbox in folders_in(Path::new(ENVIRONMENTS)) {
         let name = sandbox.file_name().unwrap_or_default().to_string_lossy();

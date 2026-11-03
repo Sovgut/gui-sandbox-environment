@@ -322,9 +322,11 @@ impl Antivirus {
         network: bool,
         args: &[std::ffi::OsString],
     ) -> Result<Ran> {
+        // Readable by all: the app's diagnostics carry the last run's
+        // output, which holds nothing but the antivirus's own messages.
         let runs = self.root.join("runs");
         fs::create_dir_all(&runs)?;
-        fs::set_permissions(&runs, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&runs, fs::Permissions::from_mode(0o755))?;
         let (out, err) = (runs.join("stdout"), runs.join("stderr"));
         fs::remove_file(&out).ok();
         fs::remove_file(&err).ok();
@@ -352,6 +354,9 @@ impl Antivirus {
             &format!("--property=StandardError=truncate:{}", err.display()),
             &format!("--setenv=LD_LIBRARY_PATH={}", libraries.display()),
         ]);
+        if let Some(bundle) = ca_bundle() {
+            unit.arg(format!("--setenv=CURL_CA_BUNDLE={}", bundle.display()));
+        }
         if !network {
             unit.arg("--property=PrivateNetwork=yes");
         }
@@ -365,6 +370,9 @@ impl Antivirus {
             .output()
             .context("starting systemd-run")?;
         let manager = String::from_utf8_lossy(&started.stderr);
+        for file in [&out, &err] {
+            fs::set_permissions(file, fs::Permissions::from_mode(0o644)).ok();
+        }
         if !manager.contains("Failed to start transient") {
             return Ok(Ran {
                 code: started.status.code(),
@@ -384,6 +392,7 @@ impl Antivirus {
                 .args(rest)
                 .env_clear()
                 .env("LD_LIBRARY_PATH", &libraries)
+                .envs(ca_bundle().map(|bundle| ("CURL_CA_BUNDLE", bundle)))
                 .env("PATH", "/usr/bin:/bin")
                 .uid(uid)
                 .gid(gid)
@@ -405,6 +414,20 @@ struct Ran {
     code: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+/// The system's bundle of trusted certificates. The engine's freshclam
+/// looks for one where the system it was built on keeps it, which Fedora
+/// does not, and then fails every download with "Connection failed".
+fn ca_bundle() -> Option<PathBuf> {
+    [
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/ssl/cert.pem",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
 }
 
 /// The user and group ids of [`ACCOUNT`].
@@ -525,7 +548,7 @@ fn fetch(http: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>> {
 
 /// Checks that `signature` is the Talos key's signature of `data`.
 fn verify(data: &[u8], signature: &[u8]) -> Result<()> {
-    use pgp::composed::{Deserializable as _, SignedPublicKey, DetachedSignature};
+    use pgp::composed::{Deserializable as _, DetachedSignature, SignedPublicKey};
     let (key, _) = SignedPublicKey::from_string(TALOS_KEY).context("reading the Talos key")?;
     // Talos publishes the signature armored; a binary one reads too.
     let signature = if signature.starts_with(b"-----BEGIN") {

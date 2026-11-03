@@ -521,7 +521,10 @@ folder must not ride into the next environment or onto the host.
    privileges, the scan without network), their output in files the
    manager opens rather than pipes handed over D-Bus, which Bazzite's
    manager refuses; where no transient unit starts, they run as
-   `gse-scan` directly. A take fails, and a spool waits,
+   `gse-scan` directly. freshclam gets the system's bundle of trusted
+   certificates through `CURL_CA_BUNDLE`, since the engine looks where the
+   system it was built on keeps it. The last run's output stays readable
+   in `/var/lib/gse/clamav/runs` for the app's diagnostics. A take fails, and a spool waits,
    while there is no engine or its signatures are older than a week, so
    nothing leaves unscanned. The updates run in the background with no one
    asking; About and updates shows the engine and the age of its

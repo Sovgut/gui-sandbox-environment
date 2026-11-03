@@ -199,10 +199,15 @@ device. Its control nodes count as holders besides the DRM nodes:
   `fw_cfg` item `opt/gse/gpu-driver` (`xe:<device ID>` for `xe` on
   Alchemist, which it takes only when told), and `gse-gpu-driver.service`
   loads that module before greetd starts; nouveau is loaded with
-  `modeset=1`, since NVIDIA's packages set it to 0. When the item is absent
-  or the GPU ends up without a driver, the vendor's default loads instead.
-  The driver in use goes to the serial console (`console.log`) as
-  `GSE-GPU: <driver>`, or `GSE-GPU: none`.
+  `modeset=1`, since NVIDIA's packages set it to 0. That unit alone decides:
+  the image masks `nvidia-powerd.service`, which loads nvidia as it starts
+  (and is for laptops), and `nvidia-fallback.service`, which udev starts for
+  every NVIDIA card and which loads nouveau while nvidia is not loaded. A
+  driver that took the GPU anyway is unbound first, and a loaded module is
+  told to bind it. When the item is absent or the GPU does not end up on
+  the chosen driver, the vendor's default loads instead. The driver in use
+  goes to the serial console (`console.log`) as `GSE-GPU: <driver>`, or
+  `GSE-GPU: none` with the driver that holds the GPU, if any.
 
 ### CPU
 

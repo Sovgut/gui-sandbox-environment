@@ -281,6 +281,11 @@ fi
 dconf update
 EOF
 chmod 0755 /usr/libexec/gse/keyboard
+# This unit alone decides the GPU's driver. NVIDIA's own units would load one
+# first: nvidia-powerd, which is for laptops and fails in a VM anyway, loads
+# nvidia as it starts, and udev starts nvidia-fallback for every NVIDIA card,
+# which loads nouveau whenever nvidia is not loaded yet.
+systemctl mask nvidia-powerd.service nvidia-fallback.service
 # The host names the GPU driver for each start in fw_cfg opt/gse/gpu-driver:
 # a module (`nvidia`, `nouveau`, `amdgpu`, `i915`, `xe`), and for `xe` on a
 # card it does not take by default, `:` and the device ID. When the host
@@ -304,6 +309,7 @@ case "$(cat "$gpu/vendor")" in
     0x8086) fallback=i915 ;;
     *) fallback= ;;
 esac
+address=${gpu##*/}
 load() {
     case "$1" in
         nvidia) modprobe nvidia_drm && modprobe nvidia_uvm ;;
@@ -314,20 +320,34 @@ load() {
         *) false ;;
     esac
 }
+# The kernel driver that holds the GPU now, if any.
+holder() { basename "$(readlink "$gpu/driver" 2>/dev/null)" 2>/dev/null; }
+# Waits up to 10 s for the GPU to be on the driver $1.
 bound() {
-    for i in $(seq 20); do
-        [ -e "$gpu/driver" ] && return 0
+    for _ in $(seq 20); do
+        [ "$(holder)" = "$1" ] && return 0
         sleep 0.5
     done
     return 1
 }
 for driver in $chosen $fallback; do
-    if load "$driver" && bound; then
-        echo "GSE-GPU: $driver" > /dev/ttyS0
-        exit 0
+    module=${driver%%:*}
+    # A driver that took the GPU first lets go of it; a module already
+    # loaded binds only when asked.
+    held=$(holder)
+    if [ -n "$held" ] && [ "$held" != "$module" ]; then
+        timeout 10 sh -c "echo $address > /sys/bus/pci/drivers/$held/unbind" || true
+    fi
+    if load "$driver"; then
+        [ -n "$(holder)" ] || echo "$address" > "/sys/bus/pci/drivers/$module/bind" 2>/dev/null
+        if bound "$module"; then
+            echo "GSE-GPU: $driver" > /dev/ttyS0
+            exit 0
+        fi
     fi
 done
-echo "GSE-GPU: none" > /dev/ttyS0
+held=$(holder)
+echo "GSE-GPU: none${held:+, $held holds it}" > /dev/ttyS0
 EOF
 chmod 0755 /usr/libexec/gse/gpu-driver
 cat > /etc/systemd/system/gse-gpu-driver.service <<'EOF'

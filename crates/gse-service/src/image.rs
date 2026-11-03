@@ -116,20 +116,24 @@ pub fn build_base(args: &BuildBaseArgs, stop: &AtomicBool, dry_run: bool) -> Res
     )
 }
 
-/// The `gse-guest` program a base image gets: the file at `path`, by
-/// default the one next to this program (see [`working_tree_guest`] for a
-/// development build).
-pub fn guest_program(path: Option<&Path>) -> Result<Vec<u8>> {
-    let path = if let Some(path) = path {
-        path.to_owned()
+/// The `gse-guest` program a base image gets and every start hands over:
+/// the file at `path`, by default the one next to this program (see
+/// [`working_tree_guest`] for a development build).
+pub fn guest_program_path(path: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = path {
+        return Ok(path.to_owned());
+    }
+    let beside = std::env::current_exe()?.with_file_name(GUEST_BIN);
+    Ok(if beside.exists() {
+        beside
     } else {
-        let beside = std::env::current_exe()?.with_file_name(GUEST_BIN);
-        if beside.exists() {
-            beside
-        } else {
-            working_tree_guest().unwrap_or(beside)
-        }
-    };
+        working_tree_guest().unwrap_or(beside)
+    })
+}
+
+/// The contents of [`guest_program_path`].
+pub fn guest_program(path: Option<&Path>) -> Result<Vec<u8>> {
+    let path = guest_program_path(path)?;
     fs::read(&path).with_context(|| format!("guest binary {}", path.display()))
 }
 
@@ -159,13 +163,14 @@ pub fn working_tree_dev_key() -> Option<String> {
     fs::read_to_string(key).ok()
 }
 
-/// What makes a base image what it is: the guest program `guest` and the
-/// provisioning script, as a short hex digest. A base image built from
-/// another pair lacks what this service puts into images.
-pub fn base_fingerprint(guest: &[u8]) -> String {
+/// What makes a base image what it is: its provisioning script, as a
+/// short hex digest. A base image built from another lacks what this
+/// service puts into images. The guest program is not part of it: every
+/// start hands over the current one.
+pub fn base_fingerprint() -> String {
     use sha2::{Digest as _, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(guest);
+    hasher.update(b"gse base image 2\n");
     hasher.update(seed::BASE_PROVISION.as_bytes());
     hasher
         .finalize()
@@ -281,6 +286,7 @@ fn build_spec(
         keyboard: None,
         run_as: job.run_as.clone(),
         direct_io: crate::nocow::is_set(overlay),
+        guest_program: None,
         image_build: true,
     }
 }

@@ -162,7 +162,7 @@ impl Agent {
         size: u64,
         executable: bool,
     ) -> Result<()> {
-        let limit = if self.version >= 2 {
+        let limit = if self.version >= 3 {
             agent::MAX_SENT_FILE
         } else {
             agent::MAX_TAKEN_FILE

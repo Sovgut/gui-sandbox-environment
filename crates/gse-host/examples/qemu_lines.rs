@@ -40,6 +40,7 @@ fn base(name: &str) -> VmSpec {
         serial_log: "@DIR@/console.log".into(),
         journal_log: None,
         run_as: Some("nobody".into()),
+        guest_program: None,
         direct_io: false,
         image_build: false,
     }

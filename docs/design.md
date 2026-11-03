@@ -263,8 +263,13 @@ look into an environment without the app.
     confined user (`user_u`): no `sudo`, `su` or SUID transitions, and no
     access to `sandbox`'s files through either Unix permissions or SELinux
     labels.
-- Programs of `guest` show their windows on the desktop of `sandbox` through
-  `gse-guest` (`crates/gse-guest`):
+- `gse-guest` (`crates/gse-guest`) is gse's program inside the guest. Every
+  start hands the host's copy over as the `fw_cfg` item `opt/gse/guest`,
+  and `gse-guest-update.service` puts it in place before the agent, the
+  journal stream and the desktop start, so a new gse brings its guest side
+  without a rebuilt image. Only a change to the provisioning script makes a
+  base image out of date. Programs of `guest` show their windows on the
+  desktop of `sandbox` through it:
   - `desktop`, autostarted as `sandbox`, opens a Wayland socket for `guest`
     through the compositor's security-context protocol. labwc withholds every
     privileged protocol from its clients: no screen capture, no clipboard

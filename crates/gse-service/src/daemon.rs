@@ -37,15 +37,15 @@ use crate::{antivirus, checks, fedora, gpu, image, mailbox, net, nocow, presets,
 
 /// The polkit action every client needs.
 pub const ACTION: &str = "io.github.sovgut.gse.manage";
-/// The fingerprint a base image built by this service has, from its guest
-/// program; none when the program is missing.
+/// The fingerprint a base image built by this service has; none when its
+/// guest program, which every build needs, is missing.
 fn guest_fingerprint() -> Option<&'static str> {
     static FINGERPRINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     FINGERPRINT
         .get_or_init(|| {
             image::guest_program(None)
                 .ok()
-                .map(|guest| image::base_fingerprint(&guest))
+                .map(|_| image::base_fingerprint())
         })
         .as_deref()
 }
@@ -1259,7 +1259,7 @@ impl Service {
                 let job = image::Job::new(&stop, Some(owner.name), Some(steps));
                 let out = store.builds_dir().join(format!("{BASE_IMAGE}.qcow2"));
                 fs::remove_file(&out).ok();
-                let fingerprint = image::base_fingerprint(&guest);
+                let fingerprint = image::base_fingerprint();
                 let built =
                     image::build_base_image(&from, &out, guest, dev_key.as_deref(), &job, false);
                 console = job.console.get().cloned();

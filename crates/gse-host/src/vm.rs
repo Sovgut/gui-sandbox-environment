@@ -75,6 +75,10 @@ pub struct VmSpec {
     /// with checksums can store a block whose checksum no longer matches
     /// when the guest changes the buffer while it is written.
     pub direct_io: bool,
+    /// The `gse-guest` program the environment runs, handed over as the
+    /// `fw_cfg` item `opt/gse/guest` and put in place at boot, so the
+    /// guest's side of gse follows the host's without a rebuilt image.
+    pub guest_program: Option<PathBuf>,
     /// An image build: the guest learns it through the `fw_cfg` item
     /// `opt/gse/build` and starts no desktop, which a VM without a GPU could
     /// only start and lose in a loop.
@@ -222,6 +226,12 @@ impl VmSpec {
                 &format!("name=opt/gse/keyboard,file={}", keyboard.display()),
             ]);
         }
+        if let Some(guest) = &self.guest_program {
+            push(&[
+                "-fw_cfg",
+                &format!("name=opt/gse/guest,file={}", guest.display()),
+            ]);
+        }
         // Appended to, so the service can start a log over that grew too
         // large while QEMU goes on writing.
         push(&[
@@ -366,6 +376,7 @@ mod tests {
             qmp_object: false,
             keyboard: None,
             run_as: Some("sovhut".into()),
+            guest_program: None,
             direct_io: false,
             image_build: false,
         }
@@ -413,6 +424,21 @@ mod tests {
             .filter(|w| w[0] == flag)
             .map(|w| w[1].as_str())
             .collect()
+    }
+
+    #[test]
+    fn the_guest_program_goes_over_fw_cfg() {
+        let mut spec = spec();
+        assert!(
+            !after(&spec.command_line(), "-fw_cfg")
+                .iter()
+                .any(|i| i.contains("opt/gse/guest"))
+        );
+        spec.guest_program = Some("/usr/local/libexec/gse/gse-guest".into());
+        assert!(
+            after(&spec.command_line(), "-fw_cfg")
+                .contains(&"name=opt/gse/guest,file=/usr/local/libexec/gse/gse-guest")
+        );
     }
 
     #[test]

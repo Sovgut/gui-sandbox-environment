@@ -318,6 +318,26 @@ After=
 EOF
 done
 
+# The host hands over its current gse-guest at every start (fw_cfg
+# opt/gse/guest): it takes the place of the one this image was built with
+# before anything of gse runs, so gse's side in the guest follows the host
+# without a rebuilt image. An image build gets none and keeps its own.
+cat > /etc/systemd/system/gse-guest-update.service <<'EOF'
+[Unit]
+Description=Take the host's gse-guest
+After=systemd-modules-load.service
+Before=gse-agent.service gse-journal.service gse-screen-mode.service greetd.service
+
+[Service]
+Type=oneshot
+ExecStartPre=-/usr/sbin/modprobe qemu_fw_cfg
+ExecStart=/bin/sh -c 'f=/sys/firmware/qemu_fw_cfg/by_name/opt/gse/guest/raw; [ -r "$f" ] || exit 0; install -m 0755 "$f" /usr/libexec/gse/gse-guest.new && mv -f /usr/libexec/gse/gse-guest.new /usr/libexec/gse/gse-guest && restorecon /usr/libexec/gse/gse-guest'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable gse-guest-update.service
+
 # The agent answers the host about `guest`'s programs and its Inbox and
 # Outbox, as root, on a virtio-serial port only root opens
 # (crates/gse-guest/src/agent.rs). An image build has no such port; the
@@ -326,6 +346,7 @@ cat > /etc/systemd/system/gse-agent.service <<'EOF'
 [Unit]
 Description=Answers the host about guest's programs and files
 StartLimitIntervalSec=0
+After=gse-guest-update.service
 
 [Service]
 ExecStart=/usr/libexec/gse/gse-guest agent

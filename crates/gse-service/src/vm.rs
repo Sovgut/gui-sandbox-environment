@@ -251,6 +251,9 @@ pub fn launch_environment(
         journal_log: Some(journal.clone()),
         run_as: Some(launch.owner.name.clone()),
         direct_io,
+        guest_program: crate::image::guest_program_path(None)
+            .ok()
+            .filter(|p| p.is_file()),
         image_build: false,
     };
 

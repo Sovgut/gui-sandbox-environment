@@ -486,15 +486,16 @@ pub mod agent {
     /// The port the guest streams its journal to, one way; the host only
     /// keeps what arrives, capped, and never parses it.
     pub const JOURNAL_PORT: &str = "io.github.sovgut.gse.journal";
-    /// The agent's version: 2 knows [`Call::Incoming`]. A host speaks to
-    /// any agent from [`MIN_VERSION`] on, so environments made from an older
-    /// image keep working.
-    pub const VERSION: u32 = 2;
+    /// The agent's version: 2 knows [`Call::Incoming`], 3 takes files up
+    /// to [`MAX_SENT_FILE`]. A host speaks to any agent from
+    /// [`MIN_VERSION`] on, so environments made from an older image keep
+    /// working.
+    pub const VERSION: u32 = 3;
     pub const MIN_VERSION: u32 = 1;
     /// Raw bytes per chunk of a file; in base64 a chunk stays well under
     /// [`crate::MAX_LINE`].
     pub const CHUNK: usize = 32 * 1024;
-    /// The largest file sent into the Inbox. Agents before version 2 take
+    /// The largest file sent into the Inbox. Agents before version 3 take
     /// at most [`MAX_TAKEN_FILE`].
     pub const MAX_SENT_FILE: u64 = 64 << 30;
     /// The largest file taken out of the Outbox.

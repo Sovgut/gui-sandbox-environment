@@ -395,7 +395,7 @@ fn give_back_usb<'a>(root: &Root, name: &str, names: impl Iterator<Item = &'a st
 
 /// Whether the installed QEMU has the device `device`, by its own list of
 /// devices, which is asked once.
-fn qemu_has_device(device: &str) -> bool {
+pub(crate) fn qemu_has_device(device: &str) -> bool {
     static DEVICES: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     DEVICES
         .get_or_init(|| {

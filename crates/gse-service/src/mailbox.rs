@@ -140,6 +140,36 @@ impl CarrierWriter {
         Ok(())
     }
 
+    /// Copies the local file `from` in as the Inbox file `path` within the
+    /// kernel, which may share its blocks instead of copying them.
+    fn add_local(&mut self, path: &str, executable: bool, from: &File) -> io::Result<()> {
+        let size = from.metadata()?.len();
+        let (mut read, mut written) = (0_u64, self.end);
+        while read < size {
+            let part = usize::try_from(size - read)
+                .unwrap_or(usize::MAX)
+                .min(1 << 30);
+            let copied = rustix::fs::copy_file_range(
+                from,
+                Some(&mut read),
+                &self.file,
+                Some(&mut written),
+                part,
+            )?;
+            if copied == 0 {
+                break;
+            }
+        }
+        self.files.push(Entry {
+            path: path.to_owned(),
+            size: read,
+            executable,
+            offset: self.end,
+        });
+        self.end = carrier::align(self.end + read);
+        Ok(())
+    }
+
     /// Ends the carrier with the files added whole; one without any goes.
     fn finish(mut self) -> Result<()> {
         use std::io::Seek as _;
@@ -159,6 +189,41 @@ impl CarrierWriter {
         self.file.sync_all()?;
         Ok(())
     }
+}
+
+/// Packs the files left waiting as plain files below `inbox-waiting/`, by a
+/// service before carriers, into a carrier of their own, so they go in by
+/// disk too; returns how many. The copy goes through `copy_file_range`, which
+/// on btrfs only shares the files' blocks.
+pub fn pack_loose(dir: &Path) -> Result<usize> {
+    let loose = loose_files(dir);
+    if loose.is_empty() {
+        return Ok(0);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut writer = CarrierWriter::create(&waiting_dir(dir).join(format!("{stamp}.{CARRIER}")))?;
+    for (path, full, _) in &loose {
+        let file = File::open(full).with_context(|| format!("{}", full.display()))?;
+        let executable = file.metadata()?.mode() & 0o100 != 0;
+        writer
+            .add_local(path, executable, &file)
+            .with_context(|| format!("packing {path}"))?;
+    }
+    writer.finish()?;
+    let waiting = waiting_dir(dir);
+    for (_, full, _) in &loose {
+        fs::remove_file(full).ok();
+        let mut parent = full.parent();
+        while let Some(folder) = parent.filter(|p| *p != waiting) {
+            if fs::remove_dir(folder).is_err() {
+                break;
+            }
+            parent = folder.parent();
+        }
+    }
+    Ok(loose.len())
 }
 
 /// The carriers waiting in `dir`, oldest first.
@@ -929,6 +994,30 @@ mod tests {
         );
         assert_eq!(remove_taken(dir.path(), &["b.png".into()]).unwrap(), 1);
         assert!(!spool(dir.path()).exists());
+    }
+
+    #[test]
+    fn plain_waiting_files_are_packed_into_a_carrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let waiting = waiting_dir(dir.path());
+        fs::create_dir_all(waiting.join("Game/Data")).unwrap();
+        fs::write(waiting.join("Game/Data/big.bin"), vec![3_u8; 10_000]).unwrap();
+        fs::write(waiting.join("Game/readme.txt"), "hi").unwrap();
+        assert_eq!(pack_loose(dir.path()).unwrap(), 2);
+        assert!(!waiting.join("Game").exists());
+        let index = carrier_index(&carriers(dir.path())[0]).unwrap();
+        assert_eq!(
+            index
+                .files
+                .iter()
+                .map(|f| (f.path.as_str(), f.size, f.offset))
+                .collect::<Vec<_>>(),
+            [
+                ("Game/Data/big.bin", 10_000, 0),
+                ("Game/readme.txt", 2, 12288)
+            ]
+        );
+        assert_eq!(pack_loose(dir.path()).unwrap(), 0);
     }
 
     #[test]

@@ -1053,6 +1053,17 @@ impl Service {
         owner: u32,
         progress: Sender<Result<Stage, String>>,
     ) -> Result<()> {
+        // Files a service before carriers left waiting as plain files go in
+        // by disk as well; on btrfs the copy only shares their blocks.
+        if self.lock().current.is_none()
+            && let Ok(dir) = self.environment_dir(name)
+        {
+            match mailbox::pack_loose(&dir) {
+                Ok(0) => {}
+                Ok(count) => info!("{name}: {count} waiting file(s) packed to go in by disk"),
+                Err(e) => warn!("{name}: packing the waiting files: {e:#}"),
+            }
+        }
         let (launch, stop, root) = {
             let mut shared = self.lock();
             if shared.moving.is_some() {
@@ -1131,6 +1142,22 @@ impl Service {
             ),
         );
         let single = takes_monitor(&root, launch.gpu);
+        let wanted = gse_host::usb::for_guest(&root, &launch.devices, single);
+        if !wanted.is_empty() && !vm::qemu_has_device("usb-host") {
+            self.log(
+                name,
+                format!(
+                    "{} stay with the host: QEMU lacks its USB module. Restart the computer; \
+                     if that does not help, install qemu-device-usb-host \
+                     (rpm-ostree install qemu-device-usb-host) and restart",
+                    wanted
+                        .iter()
+                        .map(|d| d.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+        }
         let service = self.clone();
         thread::spawn(move || {
             let name = launch.name.clone();

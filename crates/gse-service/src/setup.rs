@@ -209,6 +209,64 @@ pub fn install(dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// The [`PACKAGES`] the running system lacks, and of those the ones a
+/// deployment newer than the booted one holds: on an rpm-ostree system a
+/// package layered for the next start, which a restart brings. Neither on
+/// a system without rpm, where the install only names what to install.
+pub fn missing_packages() -> (Vec<String>, Vec<String>) {
+    if !Path::new("/usr/bin/rpm").exists() {
+        return (Vec::new(), Vec::new());
+    }
+    let missing: Vec<String> = PACKAGES
+        .into_iter()
+        .filter(|package| {
+            !Command::new("rpm")
+                .args(["-q", "--quiet", package])
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+        .map(str::to_owned)
+        .collect();
+    if missing.is_empty() || !Path::new(OSTREE_BOOTED).exists() {
+        return (missing, Vec::new());
+    }
+    let staged = Command::new("rpm-ostree")
+        .args(["status", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|out| serde_json::from_slice::<serde_json::Value>(&out.stdout).ok())
+        .map(|status| next_start_packages(&status))
+        .unwrap_or_default();
+    let after_restart = missing
+        .iter()
+        .filter(|p| staged.contains(p))
+        .cloned()
+        .collect();
+    (missing, after_restart)
+}
+
+/// The packages layered on the deployments `rpm-ostree status --json` lists
+/// before the booted one, which are the ones a restart starts.
+fn next_start_packages(status: &serde_json::Value) -> Vec<String> {
+    let mut found = Vec::new();
+    for deployment in status["deployments"].as_array().into_iter().flatten() {
+        if deployment["booted"].as_bool() == Some(true) {
+            break;
+        }
+        for key in ["requested-packages", "packages"] {
+            found.extend(
+                deployment[key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| p.as_str().map(str::to_owned)),
+            );
+        }
+    }
+    found
+}
+
 /// Installs the [`PACKAGES`] the machine lacks: with dnf, or layered live
 /// onto an rpm-ostree image. Elsewhere it only says what to install.
 fn install_packages(warning: &mut dyn FnMut(String), dry_run: bool) -> Result<()> {
@@ -789,6 +847,22 @@ pub fn uninstall(dry_run: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packages_for_the_next_start_come_from_deployments_before_the_booted_one() {
+        let status = serde_json::json!({
+            "deployments": [
+                {"booted": false, "requested-packages": ["qemu-device-usb-host", "qemu-img"]},
+                {"booted": true, "requested-packages": ["qemu-img"]},
+                {"booted": false, "requested-packages": ["old"]}
+            ]
+        });
+        assert_eq!(
+            next_start_packages(&status),
+            ["qemu-device-usb-host", "qemu-img"]
+        );
+        assert_eq!(next_start_packages(&serde_json::json!({})), Vec::<String>::new());
+    }
 
     #[test]
     fn report_lines_stay_on_one_line() {

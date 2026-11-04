@@ -796,7 +796,12 @@ the app shows what passed and what was refused and why.
        `nftables`): with dnf, or layered live
        with `rpm-ostree install --apply-live` on Fedora Atomic systems,
        which ask for a restart when that fails. Elsewhere it names what
-       to install;
+       to install. A package can go missing later, as when an rpm-ostree
+       deployment without it is booted: the service lists the packages the
+       running system lacks, and those a deployment ahead of the booted one
+       holds (`Packages`), and the app shows a banner, Repair, which runs
+       this install again, or, when a restart brings them, a request to
+       restart the computer;
      - checks the machine: `/dev/kvm`, IOMMU groups, `vfio-pci`, QEMU,
        `qemu-img`, passt, nft and the UEFI firmware. What is missing is a
        warning, not a failure; install changes no firmware setting or

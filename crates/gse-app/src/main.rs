@@ -362,6 +362,8 @@ struct Home {
     storage: Option<client::Storage>,
     /// The host's devices a sandbox can take, as last listed.
     host_devices: client::HostDevices,
+    /// The packages sandboxes run on that the host lacks, as last asked.
+    packages: client::Packages,
     /// Whether the sandbox settings list the USB devices gse cannot tell
     /// the kind of.
     show_other_devices: bool,
@@ -409,6 +411,7 @@ struct Home {
 }
 
 impl Home {
+    #[allow(clippy::too_many_lines)] // one line for each part of the app's state
     fn new(cx: &mut Context<Self>) -> Self {
         let preview = preview::state().is_some();
         if !preview {
@@ -483,6 +486,7 @@ impl Home {
             finish_update: std::env::var_os(update::FINISH_UPDATE).is_some(),
             storage: None,
             host_devices: client::HostDevices::default(),
+            packages: client::Packages::default(),
             show_other_devices: false,
             storage_target: None,
             moving_storage: None,
@@ -655,7 +659,7 @@ impl Home {
     fn reload(cx: &mut Context<Self>) {
         Self::reload_presets(cx);
         cx.spawn(async move |this, cx| {
-            let (loaded, settings, service, antivirus, storage, devices) = cx
+            let (loaded, settings, service, antivirus, storage, (devices, packages)) = cx
                 .background_executor()
                 .spawn(async {
                     let loaded = client::environments().and_then(|e| Ok((e, client::images()?)));
@@ -665,13 +669,16 @@ impl Home {
                         client::hello(),
                         client::antivirus(),
                         client::storage(),
-                        client::host_devices(),
+                        (client::host_devices(), client::packages()),
                     )
                 })
                 .await;
             this.update(cx, |home, cx| {
                 if let Ok(devices) = devices {
                     home.host_devices = devices;
+                }
+                if let Ok(packages) = packages {
+                    home.packages = packages;
                 }
                 if let Ok(antivirus) = antivirus {
                     home.antivirus = Some(antivirus);
@@ -1599,6 +1606,66 @@ impl Home {
         }
     }
 
+    /// The banner of packages sandboxes run on that the host lacks: a
+    /// restart when they are installed for its next start, otherwise Repair,
+    /// which runs the install again and so puts them back. A development
+    /// build, which carries no install, only names them.
+    fn packages_notice(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let missing = &self.packages.missing;
+        if missing.is_empty() {
+            return None;
+        }
+        let names = missing.join(", ");
+        if missing
+            .iter()
+            .all(|p| self.packages.after_restart.contains(p))
+        {
+            return Some(ui::banner(
+                Tone::Warning,
+                Icon::Refresh,
+                format!("Restart the computer to finish installing {names}."),
+            ));
+        }
+        if !setup::carries_service() {
+            return Some(ui::banner(
+                Tone::Warning,
+                Icon::Warning,
+                format!("Sandboxes lack part of what they run on: install {names}."),
+            ));
+        }
+        Some(
+            ui::banner(
+                Tone::Warning,
+                Icon::Warning,
+                if self.any_running() {
+                    format!(
+                        "Sandboxes lack part of what they run on ({names}). Stop the running \
+                         sandbox to repair it."
+                    )
+                } else {
+                    format!(
+                        "Sandboxes lack part of what they run on ({names}). Repairing installs \
+                         it and asks for your password."
+                    )
+                },
+            )
+            .child(
+                button(
+                    "repair-packages",
+                    if self.restarting {
+                        "Repairing..."
+                    } else {
+                        "Repair"
+                    },
+                    Kind::Warning,
+                    !self.restarting && !self.any_running(),
+                    cx.listener(|home, _, _, cx| home.update_service(cx)),
+                )
+                .size(Size::Banner),
+            ),
+        )
+    }
+
     /// The banner of a newer release, unless Later put it off; Later sits
     /// beside Install until the install begins.
     fn release_notice(&self, cx: &mut Context<Self>) -> Option<Div> {
@@ -1648,6 +1715,9 @@ impl Home {
         if let Some(service) = self.service_notice(cx) {
             any = true;
             notices = notices.child(service);
+        } else if let Some(packages) = self.packages_notice(cx) {
+            any = true;
+            notices = notices.child(packages);
         }
         if self.connected == Some(true)
             && self.settings.is_ok()

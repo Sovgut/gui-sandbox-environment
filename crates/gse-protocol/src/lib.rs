@@ -33,7 +33,7 @@ pub const SOCKET: &str = "/run/gse/service.sock";
 /// The protocol's version: a client and a service speak to each other only
 /// when theirs match ([`Request::Hello`]). It changes with every change to
 /// the messages.
-pub const VERSION: u32 = 14;
+pub const VERSION: u32 = 15;
 
 /// The name a build of the base image goes by wherever a preset's name
 /// would stand: in [`Event::Build`], [`Event::BuildFinished`] and
@@ -168,6 +168,9 @@ pub enum Request {
     Hardware,
     /// The devices of the host a sandbox can take: [`Reply::HostDevices`].
     HostDevices,
+    /// The packages sandboxes run on that the host lacks:
+    /// [`Reply::Packages`].
+    Packages,
     /// Where the sandboxes are kept: [`Reply::Storage`].
     Storage,
     /// Move everything the service keeps to the folder `gse` in `to`, or
@@ -260,6 +263,12 @@ pub enum Reply {
     Hardware {
         text: String,
         cpu: Support,
+    },
+    /// The packages sandboxes run on that the running system lacks, and of
+    /// those the ones installed for its next start, which a restart brings.
+    Packages {
+        missing: Vec<String>,
+        after_restart: Vec<String>,
     },
     /// The USB devices plugged into the host, and whether it has a sound
     /// card a sandbox can take whole (the board's, behind its 3.5 mm jacks).

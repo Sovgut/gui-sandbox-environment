@@ -627,6 +627,26 @@ pub const STATES: &[State] = &[
         "a service older than the app, which carries a newer one",
         |home, _| home.service = client::Match::ServiceOlder,
     ),
+    state(
+        "packages-missing",
+        "a package sandboxes run on missing, with Repair",
+        |home, _| {
+            home.packages = client::Packages {
+                missing: vec!["qemu-device-usb-host".into()],
+                after_restart: Vec::new(),
+            };
+        },
+    ),
+    state(
+        "packages-restart",
+        "a package installed for the next start of the computer",
+        |home, _| {
+            home.packages = client::Packages {
+                missing: vec!["qemu-device-usb-host".into()],
+                after_restart: vec!["qemu-device-usb-host".into()],
+            };
+        },
+    ),
     flagged(
         "service-restart",
         "a development service older than the app",

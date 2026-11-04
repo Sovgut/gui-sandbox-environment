@@ -1147,9 +1147,8 @@ impl Service {
             self.log(
                 name,
                 format!(
-                    "{} stay with the host: QEMU lacks its USB module. Restart the computer; \
-                     if that does not help, install qemu-device-usb-host \
-                     (rpm-ostree install qemu-device-usb-host) and restart",
+                    "{} stay with the host: QEMU lacks its USB module \
+                     (qemu-device-usb-host); the app's Repair puts it back",
                     wanted
                         .iter()
                         .map(|d| d.label.as_str())
@@ -2084,6 +2083,16 @@ impl Service {
                         database: state.database,
                         checked: state.checked,
                         error: state.error,
+                    },
+                )?;
+            }
+            Request::Packages => {
+                let (missing, after_restart) = crate::setup::missing_packages();
+                send(
+                    out,
+                    &Reply::Packages {
+                        missing,
+                        after_restart,
                     },
                 )?;
             }

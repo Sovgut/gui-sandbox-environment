@@ -112,6 +112,31 @@ pub struct HostDevices {
     pub board_sound: bool,
 }
 
+/// The packages sandboxes run on that the host lacks, and of those the ones
+/// installed for its next start.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Packages {
+    pub missing: Vec<String>,
+    pub after_restart: Vec<String>,
+}
+
+pub fn packages() -> Result<Packages> {
+    let mut found = None;
+    call(&Request::Packages, |reply| {
+        if let Reply::Packages {
+            missing,
+            after_restart,
+        } = reply
+        {
+            found = Some(Packages {
+                missing,
+                after_restart,
+            });
+        }
+    })?;
+    found.context("no packages in the reply")
+}
+
 pub fn host_devices() -> Result<HostDevices> {
     let mut found = None;
     call(&Request::HostDevices, |reply| {

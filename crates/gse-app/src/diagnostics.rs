@@ -34,7 +34,7 @@ const SANDBOX_FILES: [&str; 8] = [
 
 /// What the computer is and how gse stands on it, by the commands that say
 /// so; each runs as the user and may be missing.
-const HOST_COMMANDS: [(&str, &[&str]); 16] = [
+const HOST_COMMANDS: [(&str, &[&str]); 22] = [
     ("uname", &["-a"]),
     ("cat", &["/etc/os-release"]),
     ("cat", &["/proc/cmdline"]),
@@ -72,6 +72,44 @@ const HOST_COMMANDS: [(&str, &[&str]); 16] = [
         ],
     ),
     ("nvidia-smi", &["-L"]),
+    // The PCI controller behind each USB bus: a sandbox that takes a
+    // controller's sibling function can disturb the devices on it.
+    (
+        "sh",
+        &[
+            "-c",
+            "for d in /sys/bus/usb/devices/usb*; do echo \"${d##*/} $(readlink -f \"$d\" | grep -o '0000:[0-9a-f:.]*' | tail -1)\"; done; lsusb -t",
+        ],
+    ),
+    ("cat", &["/proc/asound/cards"]),
+    ("wpctl", &["status"]),
+    ("pactl", &["list", "short", "sinks"]),
+    (
+        "journalctl",
+        &[
+            "-k",
+            "-b",
+            "--no-pager",
+            "-g",
+            "snd|hda|xhci|usb|vfio|audio",
+            "-n",
+            "400",
+        ],
+    ),
+    (
+        "journalctl",
+        &[
+            "--user",
+            "-u",
+            "wireplumber",
+            "-u",
+            "pipewire",
+            "-b",
+            "--no-pager",
+            "-n",
+            "200",
+        ],
+    ),
     ("free", &["-m"]),
     ("df", &["-h", "/var/lib/gse", "/home"]),
     ("systemctl", &["status", "gse", "--no-pager"]),

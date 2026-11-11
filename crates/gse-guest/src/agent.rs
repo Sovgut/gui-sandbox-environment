@@ -471,17 +471,11 @@ impl Agent {
             let mut buffer = vec![0; 1 << 20];
             let mut file = &upload.file;
             let mut copied = 0;
-            let mut unsynced = 0;
             while copied < entry.size {
                 let part = usize::try_from((entry.size - copied).min(buffer.len() as u64))?;
                 disk.read_exact_at(&mut buffer[..part], entry.offset + copied)?;
                 file.write_all(&buffer[..part])?;
                 copied += part as u64;
-                unsynced += part as u64;
-                if unsynced >= PACE {
-                    unsynced = 0;
-                    file.sync_data()?;
-                }
                 if let Some(batch) = &mut self.incoming {
                     batch.bytes(part as u64);
                 }
@@ -491,6 +485,8 @@ impl Agent {
                     progress.1 = Instant::now();
                 }
             }
+            // One sync a file: the kernel writes back as the copy goes, and
+            // a sync every few megabytes costs a slow disk most of its speed.
             file.sync_all()?;
             Ok(())
         })();

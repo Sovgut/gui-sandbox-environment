@@ -581,7 +581,12 @@ voice activation does.
   The service marks `/var/lib/gse/images`, `environments` and `builds`
   no-copy-on-write where the file system has the mark (btrfs), so the
   images and disks made there from then on do not fragment with every
-  write, and runs the disks of a VM past the host's page cache
+  write. A sandbox's disks made before their folder had the mark are made
+  anew without it (`nocow::rewrite`): while nothing runs, builds, moves
+  or is sent, a thread copies one disk at a time beside itself, holes
+  left out, at the lowest I/O priority, and renames the copy over it; any
+  request that changes something stops the copy, which begins again
+  later. The service runs the disks of a VM past the host's page cache
   (`cache=none`) when they carry the mark; direct I/O into a btrfs file with
   checksums can store a block whose checksum no longer matches.
   It tells the app when the build in progress started, and keeps the last
@@ -653,7 +658,8 @@ version. A preset installs it as an `appimage` entry.
   it drops privileges; once the guest is up the service asks the agent to
   import each (`Import`, agent version 5), and the agent copies the files
   from the disk into the Inbox, checking the index and each path as it
-  would a put, and tells the host how far it got every 2 s. The agent's
+  would a put, syncs each file once, at its end, and tells the host how
+  far it got every 2 s. The agent's
   port carries only that: its JSON lines move a few megabytes a second,
   far too slow for games of tens of gigabytes, which the disk moves at
   the speed of the disks. A carrier that did not fit waits for the start

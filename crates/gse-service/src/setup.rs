@@ -861,7 +861,10 @@ mod tests {
             next_start_packages(&status),
             ["qemu-device-usb-host", "qemu-img"]
         );
-        assert_eq!(next_start_packages(&serde_json::json!({})), Vec::<String>::new());
+        assert_eq!(
+            next_start_packages(&serde_json::json!({})),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

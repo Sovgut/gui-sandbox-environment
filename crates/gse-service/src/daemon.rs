@@ -85,6 +85,9 @@ fn base_packs(root: &Root, config: &Config, store: &Store) -> Result<Vec<&'stati
     Ok(packs)
 }
 
+/// How often the service looks for a sandbox disk to make anew (see
+/// [`Service::tend_disks`]), and how long it waits after being stopped.
+const DISK_WORK_EVERY: Duration = Duration::from_secs(120);
 /// How a start's journal line begins; the time a sandbox last played is
 /// read back from it.
 const STARTING: &str = "Starting for";
@@ -847,6 +850,9 @@ struct Shared {
     /// A move of the data to another disk under way, with the flag that
     /// stops it; nothing starts or builds meanwhile.
     moving: Option<Arc<AtomicBool>>,
+    /// A sandbox's disk being made anew without copy-on-write (see
+    /// [`Service::tend_disks`]), with the flag that stops it.
+    disk_work: Option<Arc<AtomicBool>>,
 }
 
 /// A send in under way; it leaves the service's list when it ends.
@@ -1041,6 +1047,89 @@ impl Service {
         self.broadcast(&Event::PresetsChanged);
         self.broadcast(&Event::Changed);
         Ok(())
+    }
+
+    /// Makes the disks of sandboxes that still copy on write anew without
+    /// it, one at a time, while nothing runs, builds or moves: such a disk,
+    /// made before its folder was marked, writes several times slower on
+    /// btrfs. A thread looks for one every [`DISK_WORK_EVERY`]; any request
+    /// that changes something stops the copy under way
+    /// ([`Service::pause_disk_work`]), which then begins again later.
+    fn tend_disks(&self) {
+        let service = self.clone();
+        thread::spawn(move || {
+            let mut skipped = std::collections::HashSet::new();
+            loop {
+                thread::sleep(DISK_WORK_EVERY);
+                let claimed = {
+                    let mut shared = service.lock();
+                    let idle = shared.current.is_none()
+                        && shared.build.is_none()
+                        && shared.moving.is_none()
+                        && shared.sends.is_empty()
+                        && shared.disk_work.is_none();
+                    let next = shared
+                        .store
+                        .environments()
+                        .into_iter()
+                        .flat_map(|(name, _)| {
+                            let dir = shared.store.dir(&name);
+                            [shared.store.disk(&name), dir.join("home.qcow2")]
+                                .map(|disk| (name.clone(), disk))
+                        })
+                        .find(|(_, disk)| {
+                            disk.is_file() && !skipped.contains(disk) && !nocow::is_set(disk)
+                        });
+                    match next.filter(|_| idle) {
+                        Some((name, disk)) => {
+                            let stop = Arc::new(AtomicBool::new(false));
+                            shared.disk_work = Some(Arc::clone(&stop));
+                            Some((name, disk, stop))
+                        }
+                        None => None,
+                    }
+                };
+                let Some((name, disk, stop)) = claimed else {
+                    continue;
+                };
+                info!(
+                    "{name}: making {} anew without copy-on-write",
+                    disk.display()
+                );
+                mailbox::yield_to_others();
+                let outcome = nocow::rewrite(&disk, &stop);
+                service.lock().disk_work = None;
+                match outcome {
+                    Ok(true) => service.log(
+                        &name,
+                        "Its disk was rewritten for faster writes (no copy-on-write on the host)",
+                    ),
+                    // No mark to give, or no room: the same next time, so
+                    // this disk is left alone until the service starts again.
+                    Ok(false) => {
+                        info!("{name}: {} stays as it is", disk.display());
+                        skipped.insert(disk);
+                    }
+                    Err(e) => info!("{name}: {} was not made anew: {e:#}", disk.display()),
+                }
+            }
+        });
+    }
+
+    /// Stops the disk work under way and waits for it to let go of its
+    /// file, before anything that may touch a sandbox's disks.
+    fn pause_disk_work(&self) {
+        let Some(stop) = self.lock().disk_work.clone() else {
+            return;
+        };
+        stop.store(true, Ordering::SeqCst);
+        for _ in 0..600 {
+            if self.lock().disk_work.is_none() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        warn!("the disk work did not stop in time");
     }
 
     /// Starts `name` for `owner`; progress goes to `progress` and to every
@@ -1987,6 +2076,26 @@ impl Service {
 
     #[allow(clippy::too_many_lines)] // one arm per request, most a line
     fn handle(&self, request: Request, peer: Peer, out: &mut UnixStream) -> Result<()> {
+        if !matches!(
+            request,
+            Request::Hello
+                | Request::List
+                | Request::Images
+                | Request::Watch
+                | Request::Settings
+                | Request::Journal { .. }
+                | Request::Processes { .. }
+                | Request::Files { .. }
+                | Request::Antivirus
+                | Request::Hardware
+                | Request::HostDevices
+                | Request::Packages
+                | Request::Storage
+                | Request::Presets
+                | Request::PresetTemplates
+        ) {
+            self.pause_disk_work();
+        }
         match request {
             Request::Hello => send(
                 out,
@@ -2488,7 +2597,9 @@ pub fn serve(root: Root) -> Result<()> {
         agent: Arc::default(),
         sends: HashMap::new(),
         moving: None,
+        disk_work: None,
     })));
+    service.tend_disks();
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -2838,6 +2949,7 @@ mod tests {
             agent: Arc::default(),
             sends: HashMap::new(),
             moving: None,
+            disk_work: None,
         })))
     }
 

@@ -148,7 +148,9 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
         let disk = dir.join("disk.qcow2");
-        let data: Vec<u8> = (0..(40_usize << 20)).map(|i| (i % 251) as u8).collect();
+        let data: Vec<u8> = (0..(40_usize << 20))
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
         fs::write(&disk, &data).unwrap();
         fs::set_permissions(&disk, fs::Permissions::from_mode(0o640)).unwrap();
         assert!(!is_set(&disk));

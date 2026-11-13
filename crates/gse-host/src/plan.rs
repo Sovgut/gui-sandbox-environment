@@ -334,7 +334,15 @@ pub fn attach(snapshot: &Snapshot) -> (Plan, Handoff) {
         mode,
         display_manager_was_active: mode == Mode::Single && snapshot.display_manager_active,
         gpu_services: if mode == Mode::Single {
-            snapshot.gpu_services.clone()
+            // A kmscon console is not started again: logind starts one on
+            // whichever console is switched to, and one started here could
+            // take the console the display manager is about to use.
+            snapshot
+                .gpu_services
+                .iter()
+                .filter(|unit| !unit.starts_with("kmsconvt@"))
+                .cloned()
+                .collect()
         } else {
             Vec::new()
         },

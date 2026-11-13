@@ -827,22 +827,27 @@ impl Home {
         let rows = rows_of(target);
         let mut list = Vec::new();
         if self.host_devices.board_sound {
-            let on = draft.devices.takes_board_sound(single);
+            let resets = self.host_devices.board_sound_resets;
+            let default = single && resets;
+            let on = draft.devices.takes_board_sound(single, resets);
+            let hint = if resets {
+                "Its 3.5 mm jacks: speakers, headphones and a microphone; the host has no sound \
+                 from them meanwhile"
+            } else {
+                "Its 3.5 mm jacks. This card cannot be reset: after a sandbox it may stay silent \
+                 on the host until the computer restarts"
+            };
             list.push(
                 rows.row(
                     "Sound card on the board",
-                    Some(
-                        "Its 3.5 mm jacks: speakers, headphones and a microphone; the host has no \
-                     sound from them meanwhile"
-                            .to_owned(),
-                    ),
+                    Some(hint.to_owned()),
                     ui::switch("sandbox-board-sound", on, SwitchSize::Row)
                         .disabled(!open)
                         .on_change(cx.listener(move |home, on: &bool, _, cx| {
                             let on = *on;
                             home.change(
                                 target,
-                                |d| d.devices.board_sound = (on != single).then_some(on),
+                                |d| d.devices.board_sound = (on != default).then_some(on),
                                 cx,
                             );
                         })),

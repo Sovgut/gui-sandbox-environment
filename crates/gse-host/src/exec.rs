@@ -59,17 +59,46 @@ pub fn snapshot(root: &Root, system: &dyn System, gpu: PciAddress) -> Result<Sna
     }
     let sound_cards = crate::pci::movable_sound_cards(root, &gpu);
     let services = crate::drivers::host_driver(gpu.display().driver.as_deref()).services;
+    let mut gpu_services: Vec<String> = services
+        .iter()
+        .filter(|u| active(u))
+        .map(|u| (*u).to_owned())
+        .collect();
+    gpu_services.extend(console_units(system));
     Ok(Snapshot {
         sound_cards,
         gpu,
         display_manager_active: active(DISPLAY_MANAGER),
         graphical_sessions,
-        gpu_services: services
-            .iter()
-            .filter(|u| active(u))
-            .map(|u| (*u).to_owned())
-            .collect(),
+        gpu_services,
     })
+}
+
+/// The running kmscon consoles (`kmsconvt@tty2.service`): a system that
+/// draws its text consoles with kmscon has one on each console someone
+/// switched to, and each holds every GPU, so the driver cannot be unloaded
+/// under it. They stop with the driver's own services before the GPU
+/// leaves a single-GPU host; logind starts one again on a console that is
+/// switched to.
+fn console_units(system: &dyn System) -> Vec<String> {
+    system
+        .run(
+            "systemctl",
+            &[
+                "list-units",
+                "--type=service",
+                "--state=active",
+                "--plain",
+                "--no-legend",
+                "kmsconvt@*",
+            ],
+        )
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|unit| unit.starts_with("kmsconvt@") && unit.ends_with(".service"))
+        .map(str::to_owned)
+        .collect()
 }
 
 pub struct Executor<'a> {
@@ -356,6 +385,10 @@ mod tests {
                     Ok("2 1000 sovhut seat0 1 user tty2 no -\n".into())
                 }
                 ("loginctl", Some("show-session")) => Ok("Type=wayland\nName=sovhut\n".into()),
+                ("systemctl", Some("list-units")) => Ok(
+                    "kmsconvt@tty2.service loaded active running KMS System Console on tty2\n"
+                        .into(),
+                ),
                 ("systemctl", Some("is-active")) => {
                     if args.contains(&DISPLAY_MANAGER) {
                         Ok(String::new())
@@ -380,7 +413,8 @@ mod tests {
                 user: "sovhut".into()
             }]
         );
-        assert_eq!(snapshot.gpu_services, Vec::<String>::new());
+        // No service of nouveau's, and the kmscon console that runs.
+        assert_eq!(snapshot.gpu_services, ["kmsconvt@tty2.service"]);
     }
 
     #[test]

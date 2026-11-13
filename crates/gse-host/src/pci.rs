@@ -128,6 +128,23 @@ fn address_of(dir: &Path) -> Option<PciAddress> {
     dir.file_name()?.to_str()?.parse().ok()
 }
 
+/// Whether the kernel has a way to reset `function` (`reset_method` names
+/// one). A device without any keeps whatever state a guest left it in.
+#[must_use]
+pub fn can_reset(root: &Root, function: &PciFunction) -> bool {
+    root.read_opt(function.address.sysfs().join("reset_method"))
+        .is_some_and(|methods| !methods.trim().is_empty())
+}
+
+/// Whether `function` has a sound card of ALSA's (`sound/card*`), which a
+/// bound driver whose codec did not answer lacks.
+#[must_use]
+pub fn has_sound_card(root: &Root, function: &PciFunction) -> bool {
+    root.list(function.address.sysfs().join("sound"))
+        .iter()
+        .any(|name| name.starts_with("card"))
+}
+
 /// The upstream port of a PCIe switch on the card itself, which cards such
 /// as Intel's Arc carry: their HDMI audio sits behind it as a device of its
 /// own, in another slot and IOMMU group. It is the bridge two levels above

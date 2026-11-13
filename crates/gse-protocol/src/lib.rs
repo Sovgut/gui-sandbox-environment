@@ -33,7 +33,7 @@ pub const SOCKET: &str = "/run/gse/service.sock";
 /// The protocol's version: a client and a service speak to each other only
 /// when theirs match ([`Request::Hello`]). It changes with every change to
 /// the messages.
-pub const VERSION: u32 = 15;
+pub const VERSION: u32 = 16;
 
 /// The name a build of the base image goes by wherever a preset's name
 /// would stand: in [`Event::Build`], [`Event::BuildFinished`] and
@@ -275,6 +275,11 @@ pub enum Reply {
     HostDevices {
         usb: Vec<HostUsb>,
         board_sound: bool,
+        /// Whether that card can be reset: one that cannot may come back
+        /// from a sandbox with its codec silent until the computer
+        /// restarts, so it goes only when the settings ask for it.
+        #[serde(default)]
+        board_sound_resets: bool,
     },
     Journal {
         entries: Vec<JournalEntry>,
@@ -840,8 +845,9 @@ mod devices_tests {
         assert!(!devices.takes_usb(&mic, UsbKind::Sound, true));
         devices.choose_usb(&mic, UsbKind::Sound, true, true);
         assert!(devices.is_empty());
-        assert!(devices.takes_board_sound(true));
-        assert!(!devices.takes_board_sound(false));
+        assert!(devices.takes_board_sound(true, true));
+        assert!(!devices.takes_board_sound(true, false));
+        assert!(!devices.takes_board_sound(false, true));
     }
 
     #[test]
@@ -1088,11 +1094,11 @@ impl Devices {
         self.board_sound.is_none() && self.usb.is_empty()
     }
 
-    /// Whether the sandbox takes the board's sound card, on a single-GPU
-    /// machine when `single`.
+    /// Whether the sandbox takes the board's sound card: by default on a
+    /// single-GPU machine (`single`) when the card can be reset (`resets`).
     #[must_use]
-    pub fn takes_board_sound(&self, single: bool) -> bool {
-        self.board_sound.unwrap_or(single)
+    pub fn takes_board_sound(&self, single: bool, resets: bool) -> bool {
+        self.board_sound.unwrap_or(single && resets)
     }
 
     /// Whether the sandbox takes the USB device `id` of `kind`.

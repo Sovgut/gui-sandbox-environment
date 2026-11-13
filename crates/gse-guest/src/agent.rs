@@ -62,6 +62,8 @@ const MAX_ANCESTRY: usize = 64;
 /// to disk: the last sync, which the host waits for, stays short, and no
 /// gigabytes pile up in the page cache for the kernel to flush at once.
 const PACE: u64 = 32 << 20;
+/// What the name of a file ends in while an import writes it.
+const PART: &str = ".gse-part";
 /// How often an import tells the host how far it got.
 const PROGRESS_EVERY: Duration = Duration::from_secs(2);
 
@@ -443,31 +445,88 @@ impl Agent {
         disk.read_exact_at(&mut index, offset)?;
         let index: Index = serde_json::from_slice(&index).context("the carrier's index")?;
         index.check(offset).map_err(anyhow::Error::msg)?;
+        // The host hears how far the import got every [`PROGRESS_EVERY`]
+        // from a thread of its own: a write or a sync that a slow disk holds
+        // for a minute must not look like an agent that went away.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let beat = {
+            let (done, over) = (done.clone(), over.clone());
+            let mut port = self.writer.try_clone()?;
+            std::thread::spawn(move || {
+                use std::sync::atomic::Ordering;
+                let mut since = Instant::now();
+                while !over.load(Ordering::SeqCst) {
+                    sleep(Duration::from_millis(100));
+                    if since.elapsed() >= PROGRESS_EVERY {
+                        since = Instant::now();
+                        let body = Answer::Importing {
+                            done: done.load(Ordering::SeqCst),
+                        };
+                        if send(&mut port, &Message { id, body }).is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+        };
         let mut put = 0;
         let mut failed = Vec::new();
-        let mut progress = (0, Instant::now());
         for entry in index.files {
-            match self.import_file(id, &disk, &entry, &mut progress) {
+            match self.import_file(id, &disk, &entry, &done) {
                 Ok(()) => put += 1,
                 Err(e) => failed.push((entry.path, format!("{e:#}"))),
             }
         }
+        over.store(true, std::sync::atomic::Ordering::SeqCst);
+        beat.join().ok();
         Ok(Answer::Imported { put, failed })
     }
 
-    /// Copies one file of a carrier into the Inbox; `progress` holds the
-    /// bytes copied in all and when the host last heard of them.
+    /// Copies one file of a carrier into the Inbox, adding its bytes to
+    /// `done`. It is written under a name ending in [`PART`] and takes its
+    /// own name only once whole, so an import that was cut off leaves
+    /// nothing that looks like the file; a file already there under that
+    /// name with that size came from an earlier import of this carrier and
+    /// is left as it is.
     fn import_file(
         &mut self,
         id: u64,
         disk: &File,
         entry: &Entry,
-        progress: &mut (u64, Instant),
+        done: &std::sync::atomic::AtomicU64,
     ) -> Result<()> {
         use std::os::unix::fs::FileExt as _;
-        self.start_upload(id, &entry.path, entry.size, entry.executable)?;
+        use std::sync::atomic::Ordering;
+        let part = format!("{}{PART}", entry.path);
+        self.start_upload(id, &part, entry.size, entry.executable)?;
         let upload = self.upload.take().context("no file is arriving")?;
+        if let Some(batch) = &mut self.incoming {
+            batch.file(&entry.path);
+        }
+        let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+        let drop_part = || {
+            rustix::fs::unlinkat(
+                &upload.dir,
+                upload.name.as_str(),
+                rustix::fs::AtFlags::empty(),
+            )
+            .ok();
+        };
+        let there = rustix::fs::statat(&upload.dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|stat| {
+                FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+                    && u64::try_from(stat.st_size).is_ok_and(|size| size == entry.size)
+            });
         let copied = (|| -> Result<()> {
+            if there {
+                done.fetch_add(entry.size, Ordering::SeqCst);
+                if let Some(batch) = &mut self.incoming {
+                    batch.bytes(entry.size);
+                }
+                drop_part();
+                return Ok(());
+            }
             let mut buffer = vec![0; 1 << 20];
             let mut file = &upload.file;
             let mut copied = 0;
@@ -476,28 +535,38 @@ impl Agent {
                 disk.read_exact_at(&mut buffer[..part], entry.offset + copied)?;
                 file.write_all(&buffer[..part])?;
                 copied += part as u64;
+                done.fetch_add(part as u64, Ordering::SeqCst);
                 if let Some(batch) = &mut self.incoming {
                     batch.bytes(part as u64);
-                }
-                progress.0 += part as u64;
-                if progress.1.elapsed() >= PROGRESS_EVERY {
-                    self.answer(id, Answer::Importing { done: progress.0 })?;
-                    progress.1 = Instant::now();
                 }
             }
             // One sync a file: the kernel writes back as the copy goes, and
             // a sync every few megabytes costs a slow disk most of its speed.
             file.sync_all()?;
-            Ok(())
+            // Its own name, or a numbered one when another file has it.
+            for n in 0..100 {
+                match rustix::fs::renameat_with(
+                    &upload.dir,
+                    upload.name.as_str(),
+                    &upload.dir,
+                    numbered(name, n),
+                    rustix::fs::RenameFlags::NOREPLACE,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(rustix::io::Errno::EXIST) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            bail!("too many files of that name")
         })();
         if let Err(e) = copied {
-            rustix::fs::unlinkat(
-                &upload.dir,
-                upload.name.as_str(),
-                rustix::fs::AtFlags::empty(),
-            )
-            .ok();
+            drop_part();
             return Err(e);
+        }
+        // A part an import that was cut off left behind.
+        let first = numbered(&format!("{name}{PART}"), 0);
+        if first != upload.name {
+            rustix::fs::unlinkat(&upload.dir, first.as_str(), rustix::fs::AtFlags::empty()).ok();
         }
         if self
             .incoming

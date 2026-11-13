@@ -154,6 +154,54 @@ pub fn holders(root: &Root, gpu: PciAddress) -> Result<()> {
     Ok(())
 }
 
+/// How often a sound card back from a sandbox is bound anew when its
+/// codec did not answer.
+const SOUND_RETRIES: usize = 3;
+
+/// Binds the driver of each sound card in `handoff` anew, up to
+/// [`SOUND_RETRIES`] times, while the card has no ALSA card: a controller
+/// that cannot be reset may come back with its codec silent
+/// ("No response from codec"), and a later probe sometimes finds it.
+fn revive_sound_cards(root: &Root, handoff: &Handoff) {
+    use gse_host::pci::{PciFunction, has_sound_card};
+    for (address, driver) in &handoff.drivers {
+        let Some(driver) = driver.as_deref().filter(|d| d.starts_with("snd_hda")) else {
+            continue;
+        };
+        let card = |root: &Root| {
+            (0..15).any(|_| {
+                let found = PciFunction::read(root, *address)
+                    .is_ok_and(|function| has_sound_card(root, &function));
+                if !found {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                found
+            })
+        };
+        for attempt in 1..=SOUND_RETRIES {
+            if card(root) {
+                break;
+            }
+            tracing::warn!(
+                "{address}: no sound card after it came back; binding {driver} anew ({attempt}/{SOUND_RETRIES})"
+            );
+            root.write(
+                format!("/sys/bus/pci/drivers/{driver}/unbind"),
+                &address.to_string(),
+            )
+            .ok();
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            root.write("/sys/bus/pci/drivers_probe", &address.to_string())
+                .ok();
+        }
+        if !card(root) {
+            error!(
+                "{address}: its sound card did not come back; it needs a restart of the computer"
+            );
+        }
+    }
+}
+
 /// The GPUs this service handed to vfio-pci and has not taken back.
 pub fn handed_over() -> Vec<PciAddress> {
     fs::read_dir(STATE_DIR)
@@ -186,8 +234,15 @@ pub fn attach(
 ) -> Result<(Gpu, Vec<PciAddress>)> {
     let system = HostSystem;
     let mut snapshot = exec::snapshot(root, &system, gpu)?;
-    if !board_sound.unwrap_or(Mode::for_gpu(&snapshot.gpu) == Mode::Single) {
-        snapshot.sound_cards.clear();
+    // By default a card goes in single mode, and only one the kernel can
+    // reset: another may come back with a codec that no longer answers.
+    let single = Mode::for_gpu(&snapshot.gpu) == Mode::Single;
+    match board_sound {
+        Some(true) => {}
+        None if single => snapshot
+            .sound_cards
+            .retain(|card| gse_host::pci::can_reset(root, card)),
+        Some(false) | None => snapshot.sound_cards.clear(),
     }
     let gpu = snapshot.gpu.display().address;
     if snapshot.gpu.display().driver.as_deref() == Some(VFIO_PCI) {
@@ -253,6 +308,7 @@ pub fn detach(root: &Root, gpu: PciAddress, dry_run: bool) -> Result<()> {
     }
     .run(&plan::detach(&handoff))?;
     if !dry_run {
+        revive_sound_cards(root, &handoff);
         fs::remove_file(handoff_path(gpu)).ok();
         let driver = Gpu::read(root, gpu)?.display().driver.clone();
         info!(

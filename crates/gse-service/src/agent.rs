@@ -279,20 +279,26 @@ impl Agent {
         let id = self.call(Call::Import {
             serial: serial.to_owned(),
         })?;
-        loop {
-            match self.answer(id)? {
-                Answer::Importing { .. } => {}
-                Answer::Imported { put, mut failed } => {
+        // The agent reports every two seconds from a thread of its own; a
+        // guest whose disk stalls everything may still miss a few.
+        self.stream.set_read_timeout(Some(PUT_END_TIMEOUT))?;
+        let outcome = loop {
+            match self.answer(id) {
+                Ok(Answer::Importing { .. }) => {}
+                Ok(Answer::Imported { put, mut failed }) => {
                     failed.truncate(agent::MAX_FILES);
                     for (path, why) in &mut failed {
                         path.truncate(4096);
                         why.truncate(500);
                     }
-                    return Ok((put, failed));
+                    break Ok((put, failed));
                 }
-                _ => bail!("the agent answered something else"),
+                Ok(_) => break Err(anyhow::anyhow!("the agent answered something else")),
+                Err(e) => break Err(e),
             }
-        }
+        };
+        self.stream.set_read_timeout(Some(ANSWER_TIMEOUT))?;
+        outcome
     }
 
     /// Copies the Outbox file at `path` into `to`, refusing more than

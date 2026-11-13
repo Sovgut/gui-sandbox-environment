@@ -2210,13 +2210,16 @@ impl Service {
                     let shared = self.lock();
                     (shared.root.clone(), shared.config.gpu)
                 };
-                let board_sound = gse_host::pci::Gpu::read(&root, gpu)
-                    .is_ok_and(|gpu| !gse_host::pci::movable_sound_cards(&root, &gpu).is_empty());
+                let cards = gse_host::pci::Gpu::read(&root, gpu)
+                    .map(|gpu| gse_host::pci::movable_sound_cards(&root, &gpu))
+                    .unwrap_or_default();
                 send(
                     out,
                     &Reply::HostDevices {
                         usb: gse_host::usb::listed(&root),
-                        board_sound,
+                        board_sound: !cards.is_empty(),
+                        board_sound_resets: !cards.is_empty()
+                            && cards.iter().all(|c| gse_host::pci::can_reset(&root, c)),
                     },
                 )?;
             }

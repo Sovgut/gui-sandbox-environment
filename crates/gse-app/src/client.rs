@@ -110,6 +110,9 @@ pub struct HostDevices {
     pub usb: Vec<gse_protocol::HostUsb>,
     /// Whether the board has a sound card a sandbox can take whole.
     pub board_sound: bool,
+    /// Whether that card can be reset; one that cannot stays with the host
+    /// unless the sandbox's settings ask for it.
+    pub board_sound_resets: bool,
 }
 
 /// The packages sandboxes run on that the host lacks, and of those the ones
@@ -140,8 +143,17 @@ pub fn packages() -> Result<Packages> {
 pub fn host_devices() -> Result<HostDevices> {
     let mut found = None;
     call(&Request::HostDevices, |reply| {
-        if let Reply::HostDevices { usb, board_sound } = reply {
-            found = Some(HostDevices { usb, board_sound });
+        if let Reply::HostDevices {
+            usb,
+            board_sound,
+            board_sound_resets,
+        } = reply
+        {
+            found = Some(HostDevices {
+                usb,
+                board_sound,
+                board_sound_resets,
+            });
         }
     })?;
     found.context("no devices in the reply")

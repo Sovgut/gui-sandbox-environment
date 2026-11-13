@@ -40,7 +40,11 @@ The service therefore has two GPU switch modes, chosen from the hardware:
   so the switch then stops the user's whole instance (`user@<uid>.service`)
   as well. The text consoles are unbound from the framebuffer
   first, since with `nvidia-drm.fbdev` they keep `nvidia_drm` in use, and
-  bound again on the way back. Returning the GPU waits for the old sessions
+  bound again on the way back. Where kmscon draws the text consoles
+  (Fedora 45), each console that was switched to runs a
+  `kmsconvt@ttyN.service` that holds every GPU, and `nvidia_drm` cannot be
+  unloaded under it: the running ones stop with the driver's services, and
+  logind starts one again on a console that is switched to. Returning the GPU waits for the old sessions
   to end before the display manager starts, so a new login does not meet a
   session still letting go of the GPU. Measured on the target machine
   (`scripts/target/single-gpu-switch-test.sh`): the desktop is gone and the
@@ -304,7 +308,12 @@ The app shows the running environment according to the switch mode:
     exit above);
   - the GPU's own HDMI sound, and the board's sound card (its speakers and
     microphone jacks) when that card is alone in its IOMMU group but for
-    bridges;
+    bridges and the kernel can reset it. One without a reset method (AMD's
+    Matisse HD audio controller) stays with the host unless the sandbox's
+    settings ask for it: it has come back with a codec that no longer
+    answers ("No response from codec"), silent until a restart. When a
+    card does come back without an ALSA card, the service binds its
+    driver anew up to three times;
   - USB devices with a sound or video interface (a USB microphone or
     headset, a webcam) and gamepads, whole, on an xHCI controller of the
     VM's own (`usb-host`, from `qemu-device-usb-host`;
@@ -659,7 +668,12 @@ version. A preset installs it as an `appimage` entry.
   import each (`Import`, agent version 5), and the agent copies the files
   from the disk into the Inbox, checking the index and each path as it
   would a put, syncs each file once, at its end, and tells the host how
-  far it got every 2 s. The agent's
+  far it got every 2 s from a thread of its own, so a write the guest's
+  disk holds for a minute does not look like an agent that went away. A
+  file is written under a name ending in `.gse-part` and takes its own
+  name once whole; one already there under that name with that size is
+  left as it is, so an import that was cut off goes on where it stopped
+  at the next start and makes no second copies. The agent's
   port carries only that: its JSON lines move a few megabytes a second,
   far too slow for games of tens of gigabytes, which the disk moves at
   the speed of the disks. A carrier that did not fit waits for the start

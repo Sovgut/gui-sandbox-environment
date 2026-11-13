@@ -595,6 +595,7 @@ pub fn host_devices() -> crate::client::HostDevices {
             usb(0x187c, 0x1009, "Hub Controller", UsbKind::Other),
         ],
         board_sound: true,
+        board_sound_resets: true,
     }
 }
 

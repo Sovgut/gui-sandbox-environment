@@ -437,8 +437,31 @@ pub fn describe(root: &Root) -> String {
             support.reason.unwrap_or_default()
         );
     }
+    describe_sound(root, &mut out);
     describe_usb(root, &mut out);
     out
+}
+
+/// The sound cards a single-GPU sandbox could take with the first GPU, and
+/// whether the kernel can reset each.
+fn describe_sound(root: &Root, out: &mut String) {
+    if let Some(gpu) = Gpu::discover(root).unwrap_or_default().first() {
+        for card in pci::movable_sound_cards(root, gpu) {
+            let _ = writeln!(
+                out,
+                "sound card {} {:04x}:{:04x} driver {} reset {}",
+                card.address,
+                card.vendor,
+                card.device,
+                card.driver.as_deref().unwrap_or("-"),
+                if pci::can_reset(root, &card) {
+                    "yes"
+                } else {
+                    "none"
+                }
+            );
+        }
+    }
 }
 
 /// The USB devices of the host, each with its kind and whether a

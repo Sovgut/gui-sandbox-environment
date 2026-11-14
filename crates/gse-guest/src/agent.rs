@@ -113,6 +113,7 @@ pub fn serve() -> Result<()> {
         outgoing: None,
     };
     crate::incoming::install_outbox_wait();
+    hide_udmabuf();
     loop {
         if let Err(e) = agent.serve_connection() {
             eprintln!("agent: {e:#}");
@@ -120,6 +121,20 @@ pub fn serve() -> Result<()> {
         // The port reads as ended while the host is not connected.
         agent.abandon_upload();
         sleep(Duration::from_millis(100));
+    }
+}
+
+/// Removes `/dev/udmabuf`. Flatpak hands that node to every app that asks
+/// for the GPU alone (`--device=dri`, as Ark does) whenever it exists, and
+/// the guest's policy keeps `sandbox` and `guest` from so much as looking
+/// at it, so bubblewrap fails ("Can't get type of source /dev/udmabuf") and
+/// the app never starts. Nothing in the guest uses the node: it serves
+/// cameras' software processing and virtual GPUs.
+fn hide_udmabuf() {
+    match fs::remove_file("/dev/udmabuf") {
+        Ok(()) => eprintln!("agent: removed /dev/udmabuf, which Flatpak apps cannot be given"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("agent: removing /dev/udmabuf: {e}"),
     }
 }
 

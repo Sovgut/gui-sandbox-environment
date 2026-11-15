@@ -11,6 +11,12 @@ pub const QEMU: &str = "qemu-system-x86_64";
 pub const OVMF_CODE: &str = "/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2";
 pub const OVMF_VARS_TEMPLATE: &str = "/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2";
 
+/// The id of the `index`th of [`VmSpec::unpluggable`] in QEMU.
+#[must_use]
+pub fn unpluggable_id(index: usize) -> String {
+    format!("gse-unplug{index}")
+}
+
 /// The CPU a VM shows its guest, from the host's (see
 /// `crate::hardware::Cpu::guest`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +63,12 @@ pub struct VmSpec {
     pub cpu: GuestCpu,
     /// PCI functions handed over whole, all already on vfio-pci.
     pub passthrough: Vec<PciAddress>,
+    /// PCI functions handed over each behind a hot-plug port of its own, as
+    /// the devices [`unpluggable_id`] names, so they can be taken out of the
+    /// running guest before it is killed: the guest's driver then stops the
+    /// device, which matters for one the host cannot reset. All already on
+    /// vfio-pci.
+    pub unpluggable: Vec<PciAddress>,
     pub network: Network,
     /// An emulated display reachable over VNC on localhost, for development:
     /// the passed-through GPU is the environment's real screen.
@@ -230,6 +242,23 @@ impl VmSpec {
         args
     }
 
+    /// The hot-plug port and device of each of [`VmSpec::unpluggable`].
+    fn unpluggable_devices(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        for (index, function) in self.unpluggable.iter().enumerate() {
+            args.extend([
+                "-device".to_owned(),
+                format!("pcie-root-port,id=gse-port{index},chassis={}", 32 + index),
+                "-device".to_owned(),
+                format!(
+                    "vfio-pci,host={function},bus=gse-port{index},id={}",
+                    unpluggable_id(index)
+                ),
+            ]);
+        }
+        args
+    }
+
     /// The command line, program first.
     #[must_use]
     /// QEMU's `-smp`: one socket of cores with the guest CPU's threads
@@ -263,6 +292,8 @@ impl VmSpec {
         push(&["-smp", &self.smp(), "-m", &format!("{}M", self.memory_mib)]);
         let disks = self.disks();
         push(&disks.iter().map(String::as_str).collect::<Vec<_>>());
+        args.extend(self.unpluggable_devices());
+        let mut push = |parts: &[&str]| args.extend(parts.iter().map(|s| (*s).to_owned()));
         for function in &self.passthrough {
             push(&["-device", &format!("vfio-pci,host={function}")]);
         }
@@ -470,6 +501,7 @@ mod tests {
                 "0000:0e:00.0".parse().unwrap(),
                 "0000:0e:00.1".parse().unwrap(),
             ],
+            unpluggable: Vec::new(),
             network: Network::None,
             vnc_display: None,
             screen: None,
@@ -694,6 +726,22 @@ mod tests {
         );
         assert!(
             after(&args, "-device").contains(&"virtio-blk-pci,drive=inbox0,serial=gse-inbox-0")
+        );
+    }
+
+    #[test]
+    fn an_unpluggable_device_sits_behind_a_port_of_its_own() {
+        let mut environment = spec();
+        environment.unpluggable = vec!["0000:0b:00.4".parse().unwrap()];
+        let args = environment.command_line();
+        let devices = after(&args, "-device");
+        let port = devices
+            .iter()
+            .position(|d| *d == "pcie-root-port,id=gse-port0,chassis=32")
+            .unwrap();
+        assert_eq!(
+            devices[port + 1],
+            "vfio-pci,host=0000:0b:00.4,bus=gse-port0,id=gse-unplug0"
         );
     }
 

@@ -311,9 +311,13 @@ The app shows the running environment according to the switch mode:
     bridges and the kernel can reset it. One without a reset method (AMD's
     Matisse HD audio controller) stays with the host unless the sandbox's
     settings ask for it: it has come back with a codec that no longer
-    answers ("No response from codec"), silent until a restart. When a
-    card does come back without an ALSA card, the service binds its
-    driver anew up to three times;
+    answers ("No response from codec"), silent until a restart. A
+    sound card of the board sits behind a PCIe root port of its own in the
+    guest, and before QEMU is killed the service unplugs it through QEMU's
+    monitor (`device_del`, up to 8 s), so the guest's driver stops the
+    controller where a kill would leave it running; a guest that does not
+    let go is killed all the same. When a card does come back without an
+    ALSA card, the service binds its driver anew up to three times;
   - USB devices with a sound or video interface (a USB microphone or
     headset, a webcam) and gamepads, whole, on an xHCI controller of the
     VM's own (`usb-host`, from `qemu-device-usb-host`;

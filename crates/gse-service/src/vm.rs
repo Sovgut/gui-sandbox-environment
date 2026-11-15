@@ -192,6 +192,7 @@ pub fn run(root: &Root, args: &RunArgs, stop: &AtomicBool, dry_run: bool) -> Res
 
 /// Runs `launch` until the guest powers off or `stop` is set, reporting each
 /// stage to `progress` as it is reached.
+#[allow(clippy::too_many_lines)] // one launch, from the GPU's hand-over to its return
 pub fn launch_environment(
     root: &Root,
     launch: &Launch,
@@ -239,6 +240,11 @@ pub fn launch_environment(
     let direct_io = nocow::is_set(&launch.disk) && home.as_deref().is_none_or(nocow::is_set);
     let guest_program = guest_program_disk(dir, dry_run);
     let cpu = host_cpu();
+    // The GPU's own functions stay for the whole run; a sound card of the
+    // board goes behind a port it can be unplugged from.
+    let (passthrough, unpluggable): (Vec<PciAddress>, Vec<PciAddress>) = moved
+        .iter()
+        .partition(|f| attached.functions.iter().any(|g| g.address == **f));
     let spec_for = |socket: PathBuf| VmSpec {
         name: launch.name.clone(),
         disk: launch.disk.clone(),
@@ -249,7 +255,8 @@ pub fn launch_environment(
         memory_mib: launch.memory_mib,
         cpus: guest_cpus(launch.cpus, &cpu),
         cpu: cpu.clone(),
-        passthrough: moved.clone(),
+        passthrough: passthrough.clone(),
+        unpluggable: unpluggable.clone(),
         network: Network::Passt { socket },
         vnc_display: launch.dev_vnc,
         screen: (!single).then(|| Screen {
@@ -671,6 +678,7 @@ fn wait_for_qemu(
             (watch.progress)(Stage::Ready);
         }
         if !stopped && stop.load(Ordering::SeqCst) {
+            unplug(spec);
             warn!("stopping QEMU");
             child.kill().ok();
             stopped = true;
@@ -771,6 +779,90 @@ fn guest_program_disk(dir: &Path, dry_run: bool) -> Option<gse_host::vm::GuestPr
         size: program.len() as u64,
         sha256,
     })
+}
+
+/// How long the guest gets to let go of the devices [`unplug`] asks for.
+const UNPLUG_WITHIN: Duration = Duration::from_secs(8);
+
+/// Takes the unpluggable devices out of the running guest before QEMU is
+/// killed, through QEMU's monitor: the guest's driver then stops each
+/// device (an HD Audio controller halts its link and codecs), where a kill
+/// leaves it running as the guest had it, and a device the host cannot
+/// reset may then come back with a codec that no longer answers. A guest
+/// that does not let go within [`UNPLUG_WITHIN`] is killed all the same.
+fn unplug(spec: &VmSpec) {
+    if spec.unpluggable.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = (0..spec.unpluggable.len())
+        .map(gse_host::vm::unpluggable_id)
+        .collect();
+    let outcome = (|| -> Result<bool> {
+        let mut monitor = Monitor::connect(&spec.monitor_socket)?;
+        for id in &ids {
+            monitor.command(&format!("device_del {id}"))?;
+        }
+        let until = std::time::Instant::now() + UNPLUG_WITHIN;
+        loop {
+            let left = monitor.command("qom-list /machine/peripheral")?;
+            if !ids.iter().any(|id| left.contains(id.as_str())) {
+                return Ok(true);
+            }
+            if std::time::Instant::now() >= until {
+                return Ok(false);
+            }
+            sleep(Duration::from_millis(200));
+        }
+    })();
+    match outcome {
+        Ok(true) => info!("the guest let go of {}", ids.join(", ")),
+        Ok(false) => warn!("the guest did not let go of {} in time", ids.join(", ")),
+        Err(e) => warn!("unplugging {}: {e:#}", ids.join(", ")),
+    }
+}
+
+/// QEMU's human monitor on its socket: a command goes in as a line, and
+/// what it prints ends with the prompt.
+struct Monitor {
+    stream: std::os::unix::net::UnixStream,
+}
+
+impl Monitor {
+    const PROMPT: &'static [u8] = b"(qemu) ";
+
+    fn connect(socket: &Path) -> Result<Self> {
+        let stream = std::os::unix::net::UnixStream::connect(socket)
+            .with_context(|| format!("{}", socket.display()))?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let mut monitor = Self { stream };
+        monitor.until_prompt()?;
+        Ok(monitor)
+    }
+
+    /// Runs `command` and returns what it printed.
+    fn command(&mut self, command: &str) -> Result<String> {
+        use std::io::Write as _;
+        self.stream.write_all(format!("{command}\n").as_bytes())?;
+        self.until_prompt()
+    }
+
+    fn until_prompt(&mut self) -> Result<String> {
+        use std::io::Read as _;
+        let mut seen = Vec::new();
+        let mut buffer = [0; 4096];
+        while !seen.ends_with(Self::PROMPT) {
+            let read = self.stream.read(&mut buffer).context("QEMU's monitor")?;
+            if read == 0 {
+                bail!("QEMU's monitor closed");
+            }
+            seen.extend_from_slice(&buffer[..read]);
+            if seen.len() > 1 << 20 {
+                bail!("QEMU's monitor said too much");
+            }
+        }
+        Ok(String::from_utf8_lossy(&seen).into_owned())
+    }
 }
 
 /// The guest CPU this host gives its VMs (see

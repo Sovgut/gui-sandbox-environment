@@ -28,6 +28,7 @@ fn base(name: &str) -> VmSpec {
         cpus: 2,
         cpu: gse_host::vm::GuestCpu::amd_smt(),
         passthrough: Vec::new(),
+        unpluggable: Vec::new(),
         network: Network::Passt {
             socket: "@PASST@".into(),
         },

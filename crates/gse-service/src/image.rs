@@ -289,6 +289,7 @@ fn build_spec(
         cpus: 8,
         cpu: crate::vm::host_cpu(),
         passthrough: Vec::new(),
+        unpluggable: Vec::new(),
         network: Network::Passt { socket },
         vnc_display: None,
         screen: None,

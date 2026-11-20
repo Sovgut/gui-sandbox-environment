@@ -545,9 +545,11 @@ impl Agent {
             let mut buffer = vec![0; 1 << 20];
             let mut file = &upload.file;
             let mut copied = 0;
+            let mut hash = Sha256::new();
             while copied < entry.size {
                 let part = usize::try_from((entry.size - copied).min(buffer.len() as u64))?;
                 disk.read_exact_at(&mut buffer[..part], entry.offset + copied)?;
+                hash.update(&buffer[..part]);
                 file.write_all(&buffer[..part])?;
                 copied += part as u64;
                 done.fetch_add(part as u64, Ordering::SeqCst);
@@ -558,6 +560,13 @@ impl Agent {
             // One sync a file: the kernel writes back as the copy goes, and
             // a sync every few megabytes costs a slow disk most of its speed.
             file.sync_all()?;
+            // What the host read when it wrote the carrier is what was read
+            // back from the disk, or the file does not count as arrived.
+            if let Some(expected) = &entry.sha256
+                && *expected != hex(&hash.finalize())
+            {
+                bail!("it arrived damaged: its checksum is not the one the host wrote");
+            }
             // Its own name, or a numbered one when another file has it.
             for n in 0..100 {
                 match rustix::fs::renameat_with(

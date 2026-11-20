@@ -706,6 +706,10 @@ pub mod carrier {
         pub executable: bool,
         /// Where its bytes start.
         pub offset: u64,
+        /// The SHA-256 of its bytes in hex, when the host read them as it
+        /// wrote the carrier; the guest checks what it copies against it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub sha256: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -791,6 +795,7 @@ pub mod carrier {
                 size,
                 executable: false,
                 offset,
+                sha256: None,
             };
             let good = Index {
                 files: vec![entry(0, 5000), entry(8192, 10)],

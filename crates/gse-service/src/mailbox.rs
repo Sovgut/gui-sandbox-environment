@@ -100,6 +100,21 @@ pub fn queue(
 /// The extension of a carrier's file.
 const CARRIER: &str = "carrier";
 
+/// A reader that hashes what is read through it.
+struct Hashed<R> {
+    inner: R,
+    hash: sha2::Sha256,
+}
+
+impl<R: io::Read> io::Read for Hashed<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        use sha2::Digest as _;
+        let read = self.inner.read(buffer)?;
+        self.hash.update(&buffer[..read]);
+        Ok(read)
+    }
+}
+
 /// Writes a carrier: each file from the next aligned offset, then, at
 /// [`CarrierWriter::finish`], the index and the trailer.
 struct CarrierWriter {
@@ -127,14 +142,29 @@ impl CarrierWriter {
 
     /// Copies `from` in as the Inbox file `path`.
     fn add(&mut self, path: &str, executable: bool, from: &mut impl io::Read) -> io::Result<()> {
+        use sha2::Digest as _;
         use std::io::Seek as _;
         self.file.seek(io::SeekFrom::Start(self.end))?;
-        let size = paced_copy(from, &mut self.file)?;
+        let mut hashed = Hashed {
+            inner: from,
+            hash: sha2::Sha256::new(),
+        };
+        let size = paced_copy(&mut hashed, &mut self.file)?;
+        let sha256 = hashed
+            .hash
+            .finalize()
+            .iter()
+            .fold(String::new(), |mut hex, b| {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{b:02x}");
+                hex
+            });
         self.files.push(Entry {
             path: path.to_owned(),
             size,
             executable,
             offset: self.end,
+            sha256: Some(sha256),
         });
         self.end = carrier::align(self.end + size);
         Ok(())
@@ -165,6 +195,8 @@ impl CarrierWriter {
             size: read,
             executable,
             offset: self.end,
+            // Copied within the kernel, so never read here.
+            sha256: None,
         });
         self.end = carrier::align(self.end + read);
         Ok(())
@@ -929,6 +961,11 @@ mod tests {
                 .map(|f| (f.path.as_str(), f.size, f.offset))
                 .collect::<Vec<_>>(),
             [("Game/a.txt", 5, 0), ("Game/b.bin", 5000, 4096)]
+        );
+        // sha256 of "first".
+        assert_eq!(
+            index.files[0].sha256.as_deref(),
+            Some("a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e")
         );
         let file = File::open(carrier).unwrap();
         let mut bytes = [0_u8; 5];

@@ -666,7 +666,9 @@ version. A preset installs it as an `appimage` entry.
   files wait in its folder (`inbox-waiting/`) as carriers
   (`gse_protocol::carrier`), one for each send: the files back to back from
   4 KiB-aligned offsets, a JSON index and a trailer block that says where
-  the index is. The next start attaches up to 8 carriers as read-only
+  the index is. The index holds the SHA-256 of each file the service read
+  as it wrote the carrier, and the agent checks what it copies out against
+  it: a file that differs does not arrive. The next start attaches up to 8 carriers as read-only
   virtio disks (serials `gse-inbox-0`...), which QEMU opens as root before
   it drops privileges; once the guest is up the service asks the agent to
   import each (`Import`, agent version 5), and the agent copies the files
